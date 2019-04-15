@@ -1,0 +1,63 @@
+LM:
+- name: GPT-2
+  params:
+    n_positions: 1024
+    n_ctx: 1024
+    n_embd: 768
+    n_layer: 12
+    n_head: 12
+    layer_norm_epsilon: 1e-5
+    initializer_range: 0.02
+    vocab_size_or_config_json_file: 50257
+- name: GPT
+  params:
+    n_special: 0
+    n_positions: 512
+    n_ctx: 512
+    n_embd: 768
+    n_layer: 12
+    n_head: 12
+    afn: gelu
+    resid_pdrop: 0.1
+    embd_pdrop: 0.1
+    attn_pdrop: 0.1
+    layer_norm_epsilon: 1e-5
+    initializer_range: 0.02
+    vocab_size_or_config_json_file: 40478
+- name: TransformXL
+  params:
+    cutoffs: [20000, 40000, 200000]
+    d_model: 1024
+    d_embed: 1024
+    n_head: 16
+    d_head: 64
+    d_inner: 4096
+    div_val: 4
+    pre_lnorm: False
+    n_layer: 18
+    tgt_len: 128
+    ext_len: 0
+    mem_len: 1600
+    clamp_len: 1000
+    same_length: True
+    proj_share_all_but_first: True
+    attn_type: 0
+    sample_softmax: -1
+    adaptive: True
+    tie_weight: True
+    dropout: 0.1
+    dropatt: 0.0
+    untie_r: True
+    init: "normal"
+    init_range: 0.01
+    proj_init_std: 0.01
+    init_std: 0.02
+    vocab_size_or_config_json_file: 40478
+- name: ELMo
+  params:
+    options_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_options.json
+    weights_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_weights_PubMed_only.hdf5
+- name: bioelmo
+  params:
+    options_path: ~/data/lm/elmo/bioelmo/biomed_elmo_options.json
+    weights_path: ~/data/lm/elmo/bioelmo/biomed_elmo_weights.hdf5
