@@ -57,6 +57,12 @@ LM:
   params:
     options_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_options.json
     weights_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_weights_PubMed_only.hdf5
+    # options_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_options.json
+    # weights_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_weights_PubMed_only.hdf5
+    # options_path: ~/data/lm/elmo/bioelmo/biomed_elmo_options.json
+    # weights_path: ~/data/lm/elmo/bioelmo/biomed_elmo_weights.hdf5
+    elmoedim: 1024
+    dropout: 0.5
 - name: bioelmo
   params:
     options_path: ~/data/lm/elmo/bioelmo/biomed_elmo_options.json
