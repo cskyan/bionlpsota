@@ -1,6 +1,24 @@
 LM:
+- name: BERT
+  params:
+    pretrained_mdl_path: /home/yans2/data/lm/bert/base-uncased/archive.tar.gz
+    pretrained_vocab_path: /home/yans2/data/lm/bert/base-uncased/vocab.txt
+    hidden_size: 768
+    num_hidden_layers: 12
+    num_attention_heads: 12
+    intermediate_size: 3072
+    hidden_act: gelu
+    hidden_dropout_prob: 0.1
+    attention_probs_dropout_prob: 0.1
+    max_position_embeddings: 512
+    type_vocab_size: 2
+    initializer_range: 0.02
+    # layer_norm_eps: 1e-12
+    vocab_size_or_config_json_file: 30522
 - name: GPT-2
   params:
+    pretrained_mdl_path: /home/yans2/data/lm/gpt2/webtext
+    pretrained_vocab_path: /home/yans2/data/lm/gpt2/webtext
     n_positions: 1024
     n_ctx: 1024
     n_embd: 768
@@ -11,6 +29,8 @@ LM:
     vocab_size_or_config_json_file: 50257
 - name: GPT
   params:
+    pretrained_mdl_path: ~/data/lm/gpt/archive.tar.gz
+    pretrained_vocab_path: ~/data/lm/gpt/vocab.txt
     n_special: 0
     n_positions: 512
     n_ctx: 512
@@ -57,13 +77,11 @@ LM:
   params:
     options_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_options.json
     weights_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_weights_PubMed_only.hdf5
-    # options_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_options.json
-    # weights_path: ~/data/lm/elmo/pubmed/elmo_2x4096_512_2048cnn_2xhighway_weights_PubMed_only.hdf5
     # options_path: ~/data/lm/elmo/bioelmo/biomed_elmo_options.json
     # weights_path: ~/data/lm/elmo/bioelmo/biomed_elmo_weights.hdf5
+    # options_path: ~/data/lm/elmo/mimic/elmo_mimic3_20k_options.json
+    # weights_path: ~/data/lm/elmo/mimic/elmo_mimic3_20k_weights.hdf5
+    # options_path: ~/data/lm/elmo/mimic/elmo_mimic3_300k_options.json
+    # weights_path: ~/data/lm/elmo/mimic/elmo_mimic3_300k_weights.hdf5
     elmoedim: 1024
     dropout: 0.5
-- name: bioelmo
-  params:
-    options_path: ~/data/lm/elmo/bioelmo/biomed_elmo_options.json
-    weights_path: ~/data/lm/elmo/bioelmo/biomed_elmo_weights.hdf5
