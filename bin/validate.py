@@ -447,7 +447,7 @@ class TransformXLClfHead(BaseClfHead):
 class EmbeddingClfHead(BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         super(EmbeddingClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
-        self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) is None) else 1 # two or one sentence
+        self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
         self.embed_type = embed_type
         if embed_type == 'w2v':
             from gensim.models import KeyedVectors
@@ -457,7 +457,7 @@ class EmbeddingClfHead(BaseClfHead):
             self.n_embd = self.w2v_model.syn0.shape[1]
         elif embed_type == 'elmo':
             self.vocab_size = 793471
-            self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) is None) else 1 # two or one sentence
+            self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
             self.n_embd = config['elmoedim'] * 2 # two ELMo layer * ELMo embedding dimensions
         elif embed_type == 'elmo_w2v':
             from gensim.models import KeyedVectors
@@ -465,7 +465,7 @@ class EmbeddingClfHead(BaseClfHead):
             self.w2v_model = w2v_path if type(w2v_path) is Word2VecKeyedVectors else (KeyedVectors.load(w2v_path, mmap='r') if w2v_path and os.path.isfile(w2v_path) else None)
             assert(self.w2v_model)
             self.vocab_size = 793471
-            self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) is None) else 1 # two or one sentence
+            self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
             self.n_embd = self.w2v_model.syn0.shape[1] + config['elmoedim'] * 2
         self._int_actvtn = ACTVTN_MAP[iactvtn]
         self._out_actvtn = ACTVTN_MAP[oactvtn]
@@ -514,14 +514,13 @@ class EmbeddingClfHead(BaseClfHead):
         if self.task_type in ['entlmnt', 'sentsim']:
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
-            clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1)) if self.task_type == 'entlmnt' or self.task_params.setdefault('sentsim_func', 'concat') == 'concat' else (F.pairwise_distance(clf_h[0], clf_h[1], 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(clf_h[0], clf_h[1], dim=1, eps=1e-12))
+            clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1)) if (self.task_type == 'entlmnt' or self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else (F.pairwise_distance(clf_h[0], clf_h[1], 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(clf_h[0], clf_h[1], dim=1, eps=1e-12))
             clf_logits = self.linear(clf_h)
-            if self.do_lastdrop: clf_logits = [self.last_dropout(clf_logits[x]) for x in [0,1]]
         else:
             if self.do_norm: clf_h = self.norm(clf_h)
             clf_h = self.dropout(clf_h)
             clf_logits = self.linear(clf_h)
-            if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
+        if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
 
         if (labels is None):
             if self.crf:
@@ -540,7 +539,7 @@ class EmbeddingClfHead(BaseClfHead):
             loss_func = nn.MultiLabelSoftMarginLoss(weight=weights, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
-            loss_func = ContrastiveLoss(reduction='none', x_mode='dist', y_mode='sim') if self.task_params.setdefault('sentsim_func', None) else nn.MSELoss(reduction='none')
+            loss_func = ContrastiveLoss(reduction='none', x_mode='dist', y_mode='sim') if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         return clf_loss, None
 
@@ -606,7 +605,7 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
             # if (seq2vec == 'cnn'): encoder_odim -= int(1.5 * self.dim_mulriple * self.w2v_model.syn0.shape[1])
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         self.norm = NORM_TYPE_MAP[norm_type](encoder_odim)
-        self.linear = (nn.Sequential(nn.Linear(2 * encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(2 * encoder_odim, 2 * encoder_odim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) else [nn.Linear(2 * encoder_odim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(encoder_odim, num_lbs))
+        self.linear = (nn.Sequential(nn.Linear(2 * encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(2 * encoder_odim, 2 * encoder_odim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(2 * encoder_odim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(encoder_odim, num_lbs))
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
@@ -837,7 +836,7 @@ class SentSimDataset(BaseDataset):
         record = self.df.iloc[idx]
         sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or type(sample[0][0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1] / 5.0)
+        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or type(sample[0][0][0]) is str else torch.tensor(sample[0])), torch.tensor(0 if sample[1] is np.nan else float(sample[1]) / 5.0)
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
         lbs = 5.0 * lbs
@@ -1316,26 +1315,42 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
             if (mdl_name in LM_EMBED_MDL_MAP):
                 if task_type in ['entlmnt', 'sentsim']:
                     tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
-                    tkns_tnsr = [[s[:min(len(s), opts.maxlen)] + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
+                    tkns_tnsr = [[s[:min(len(s), opts.maxlen)] for s in tkns_tnsr[x]] for x in [0,1]]
+                    w2v_tnsr = [_batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
                     pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
-                    w2v_tnsr = [_batch2ids_w2v(tkns_tnsr[x], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                    tkns_tnsr = [batch_to_ids(tkns_tnsr[x]) for x in [0,1]]
+                    if mdl_name.startswith('elmo'):
+                        tkns_tnsr = [tkns_tnsr[x] + [[''] * opts.maxlen] for x in [0,1]]
+                        tkns_tnsr = [batch_to_ids(tkns_tnsr[x])[:-1] for x in [0,1]]
+                        pad_val = 0
+                    else:
+                        tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]], (weights if weights is None else weights.to('cuda'))
                 elif task_type == 'nmt':
-                    tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
+                    # tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
+                    tkns_tnsr, lb_tnsr = zip(*[(sx.split(SC), list(map(int, sy.split(SC)))) for sx, sy in zip(tkns_tnsr, lb_tnsr) if ((type(sx) is str and sx != '') or len(sx) > 0) and ((type(sy) is str and sy != '') or len(sy) > 0)])
                     if (len(tkns_tnsr) == 0 or len(lb_tnsr) == 0): continue
-                    tkns_tnsr = [s[:min(len(s), opts.maxlen)] + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                     lb_tnsr = torch.LongTensor([s[:min(len(s), opts.maxlen)] + [pad_val[1]] * (opts.maxlen-len(s)) for s in lb_tnsr])
+                    tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
+                    w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
                     pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
-                    w2v_tnsr = _batch2ids_w2v(tkns_tnsr, clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                    tkns_tnsr = batch_to_ids(tkns_tnsr)
+                    if mdl_name.startswith('elmo'):
+                        tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
+                        tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
+                        pad_val = (0, pad_val[1])
+                    else:
+                        tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
                 else:
                     tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
-                    if clf.seq2vec or clf.pooler: tkns_tnsr = [s[:min(len(s), opts.maxlen)] + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                    tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
+                    w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
                     pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
-                    w2v_tnsr = _batch2ids_w2v(tkns_tnsr, clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                    tkns_tnsr = batch_to_ids(tkns_tnsr)
+                    if mdl_name.startswith('elmo'):
+                        tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
+                        tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
+                        pad_val = 0
+                    else:
+                        tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
                 mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
                 clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights)
@@ -1389,10 +1404,15 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
         if (mdl_name in LM_EMBED_MDL_MAP):
             if task_type in ['entlmnt', 'sentsim']:
                 tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
-                tkns_tnsr = [[s[:min(len(s), opts.maxlen)] + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
-                pool_idx = _pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
-                w2v_tnsr = [_batch2ids_w2v(tkns_tnsr[x], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                tkns_tnsr = [batch_to_ids(tkns_tnsr[x]) for x in [0,1]]
+                tkns_tnsr = [[s[:min(len(s), opts.maxlen)] for s in tkns_tnsr[x]] for x in [0,1]]
+                w2v_tnsr = [_batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
+                if mdl_name.startswith('elmo'):
+                    tkns_tnsr = [tkns_tnsr[x] + [[''] * opts.maxlen] for x in [0,1]]
+                    tkns_tnsr = [batch_to_ids(tkns_tnsr[x])[:-1] for x in [0,1]]
+                    pad_val = 0
+                else:
+                    tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
                 if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx= [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]]
             elif task_type == 'nmt':
                 # tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
@@ -1400,16 +1420,27 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
                 if (len(tkns_tnsr) == 0 or len(lb_tnsr) == 0): continue
                 tkns_tnsr = [s[:min(len(s), opts.maxlen)] + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                 _lb_tnsr = lb_tnsr = torch.LongTensor([s[:min(len(s), opts.maxlen)] + [pad_val[1]] * (opts.maxlen-len(s)) for s in lb_tnsr])
+                tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
+                w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
                 _pool_idx = pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
-                w2v_tnsr = _batch2ids_w2v(tkns_tnsr, clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                tkns_tnsr = batch_to_ids(tkns_tnsr)
+                if mdl_name.startswith('elmo'):
+                    tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
+                    tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
+                    pad_val = (0, pad_val[1])
+                else:
+                    tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                 if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda')
             else:
                 tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
-                if clf.seq2vec or clf.pooler: tkns_tnsr = [s[:min(len(s), opts.maxlen)] + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
+                w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
                 _pool_idx = pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
-                w2v_tnsr = _batch2ids_w2v(tkns_tnsr, clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                tkns_tnsr = batch_to_ids(tkns_tnsr)
+                if mdl_name.startswith('elmo'):
+                    tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
+                    tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
+                    pad_val = 0
+                else:
+                    tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                 if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx= tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda')
             mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
             with torch.no_grad():
