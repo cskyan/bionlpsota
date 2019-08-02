@@ -514,7 +514,8 @@ class EmbeddingClfHead(BaseClfHead):
         if self.task_type in ['entlmnt', 'sentsim']:
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
-            clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1)) if (self.task_type == 'entlmnt' or self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else (F.pairwise_distance(clf_h[0], clf_h[1], 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(clf_h[0], clf_h[1], dim=1, eps=1e-12))
+            # clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1)) if (self.task_type == 'entlmnt' or self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else (F.pairwise_distance(clf_h[0], clf_h[1], 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(clf_h[0], clf_h[1], dim=1, eps=1e-12))
+            clf_h = torch.cat(clf_h, dim=-1) if (self.task_type == 'entlmnt' or self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else (F.pairwise_distance(clf_h[0], clf_h[1], 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(clf_h[0], clf_h[1], dim=1, eps=1e-12))
             clf_logits = self.linear(clf_h)
         else:
             if self.do_norm: clf_h = self.norm(clf_h)
@@ -605,7 +606,8 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
             # if (seq2vec == 'cnn'): encoder_odim -= int(1.5 * self.dim_mulriple * self.w2v_model.syn0.shape[1])
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         self.norm = NORM_TYPE_MAP[norm_type](encoder_odim)
-        self.linear = (nn.Sequential(nn.Linear(2 * encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(2 * encoder_odim, 2 * encoder_odim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(2 * encoder_odim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(encoder_odim, num_lbs))
+        # self.linear = (nn.Sequential(nn.Linear(2 * encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(2 * encoder_odim, 2 * encoder_odim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(2 * encoder_odim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(encoder_odim, num_lbs))
+        self.linear = (nn.Sequential(nn.Linear(self.dim_mulriple * encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(encoder_odim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.dim_mulriple * encoder_odim, self.dim_mulriple * encoder_odim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.dim_mulriple * encoder_odim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(encoder_odim, num_lbs))
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
@@ -1163,7 +1165,7 @@ SEQ2VEC_MDL_PARAMS = { \
 SEQ2VEC_TASK_PARAMS = {}
 SEQ2VEC_LM_PARAMS_MAP = {'boe':[('hdim','embedding_dim')], 'pytorch':[('hdim', 'hidden_size')], 'cnn':[], 'cnn_highway':[]}
 SEQ2SEQ_DIM_INFER = {'pytorch-lstm':lambda x: x[1] * x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[1] * x[2]['hidden_size'], 'pytorch-gru':lambda x: x[1] * x[2]['hidden_size'], 'cnn':lambda x: 2 * x[0], 'isa':lambda x: x[0]}
-SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[1] * x[2]['hidden_size'], 'pytorch-gru':lambda x: x[1] * x[2]['hidden_size'], 'cnn':lambda x: int(1.5 * x[1] * x[2]['embedding_dim']), 'cnn_highway':lambda x: x[0]}
+SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[2]['hidden_size'], 'pytorch-gru':lambda x: x[2]['hidden_size'], 'cnn':lambda x: int(1.5 * x[2]['embedding_dim']), 'cnn_highway':lambda x: x[0]}
 NORM_TYPE_MAP = {'batch':nn.BatchNorm1d, 'layer':nn.LayerNorm}
 ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid}
 
@@ -1323,7 +1325,8 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                         tkns_tnsr = [batch_to_ids(tkns_tnsr[x])[:-1] for x in [0,1]]
                         pad_val = 0
                     else:
-                        tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
+                        # tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
+                        tkns_tnsr = [torch.tensor([[1]*len(s) + [pad_val[0]] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]]) for x in [0,1]]
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]], (weights if weights is None else weights.to('cuda'))
                 elif task_type == 'nmt':
                     # tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
@@ -1338,7 +1341,8 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                         tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
                         pad_val = (0, pad_val[1])
                     else:
-                        tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                        # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                        tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
                 else:
                     tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
@@ -1350,7 +1354,8 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                         tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
                         pad_val = 0
                     else:
-                        tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                        # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                        tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
                 mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
                 clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights)
