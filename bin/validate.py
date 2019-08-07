@@ -35,7 +35,15 @@ from pytorch_pretrained_bert import BertConfig, BertTokenizer, BertModel, BertAd
 from pytorch_pretrained_bert.modeling import BertPreTrainingHeads
 
 import ftfy, spacy
-nlp = spacy.load("en_core_web_sm")
+try:
+    nlp = spacy.load('en_core_sci_md')
+except Exception as e:
+    print(e)
+    try:
+        nlp = spacy.load('en_core_web_sm')
+    except Exception as e:
+        print(e)
+        nlp = spacy.load('en_core_web_sm')
 
 from bionlp.util import io, system
 
@@ -449,24 +457,24 @@ class EmbeddingClfHead(BaseClfHead):
         super(EmbeddingClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
         self.embed_type = embed_type
-        if embed_type == 'w2v':
+        if embed_type.startswith('w2v'):
             from gensim.models import KeyedVectors
             from gensim.models.keyedvectors import Word2VecKeyedVectors
             self.w2v_model = w2v_path if type(w2v_path) is Word2VecKeyedVectors else (KeyedVectors.load(w2v_path, mmap='r') if w2v_path and os.path.isfile(w2v_path) else None)
             assert(self.w2v_model)
-            self.n_embd = self.w2v_model.syn0.shape[1]
-        elif embed_type == 'elmo':
+            self.n_embd = self.w2v_model.syn0.shape[1] + (self.n_embd if hasattr(self, 'n_embd') else 0)
+        elif embed_type.startswith('elmo'):
             self.vocab_size = 793471
             self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
-            self.n_embd = config['elmoedim'] * 2 # two ELMo layer * ELMo embedding dimensions
-        elif embed_type == 'elmo_w2v':
+            self.n_embd = config['elmoedim'] * 2 + (self.n_embd if hasattr(self, 'n_embd') else 0) # two ELMo layer * ELMo embedding dimensions
+        elif embed_type.startswith('elmo_w2v'):
             from gensim.models import KeyedVectors
             from gensim.models.keyedvectors import Word2VecKeyedVectors
             self.w2v_model = w2v_path if type(w2v_path) is Word2VecKeyedVectors else (KeyedVectors.load(w2v_path, mmap='r') if w2v_path and os.path.isfile(w2v_path) else None)
             assert(self.w2v_model)
             self.vocab_size = 793471
             self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
-            self.n_embd = self.w2v_model.syn0.shape[1] + config['elmoedim'] * 2
+            self.n_embd = self.w2v_model.syn0.shape[1] + config['elmoedim'] * 2 + (self.n_embd if hasattr(self, 'n_embd') else 0)
         self._int_actvtn = ACTVTN_MAP[iactvtn]
         self._out_actvtn = ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
@@ -476,15 +484,15 @@ class EmbeddingClfHead(BaseClfHead):
         use_gpu = next(self.parameters()).is_cuda
         if self.task_type in ['entlmnt', 'sentsim']:
             mask = [torch.arange(input_ids[x].size()[1]).to('cuda').unsqueeze(0).expand(input_ids[x].size()[:2]) <= pool_idx[x].unsqueeze(1).expand(input_ids[x].size()[:2]) if use_gpu else torch.arange(input_ids[x].size()[1]).unsqueeze(0).expand(input_ids[x].size()[:2]) <= pool_idx[x].unsqueeze(1).expand(input_ids[x].size()[:2]) for x in [0,1]]
-            if (self.embed_type == 'w2v'):
+            if (self.embed_type.startswith('w2v')):
                 assert(w2v_ids is not None and self.w2v_model is not None)
                 wembd_tnsr = [torch.tensor([self.w2v_model.syn0[s] for s in w2v_ids[x]]) for x in [0,1]]
                 if use_gpu: wembd_tnsr = [x.to('cuda') for x in wembd_tnsr]
                 clf_h = wembd_tnsr
-            elif (self.embed_type == 'elmo'):
+            elif (self.embed_type.startswith('elmo')):
                 embeddings = (self.lm_model(input_ids[0]), self.lm_model(input_ids[1]))
                 clf_h = torch.cat(embeddings[0]['elmo_representations'], dim=-1), torch.cat(embeddings[1]['elmo_representations'], dim=-1)
-            elif (self.embed_type == 'elmo_w2v'):
+            elif (self.embed_type.startswith('elmo_w2v')):
                 assert(w2v_ids is not None and self.w2v_model is not None)
                 wembd_tnsr = [torch.tensor([self.w2v_model.syn0[s] for s in w2v_ids[x]]) for x in [0,1]]
                 if use_gpu: wembd_tnsr = [x.to('cuda') for x in wembd_tnsr]
@@ -493,15 +501,15 @@ class EmbeddingClfHead(BaseClfHead):
                 clf_h = [torch.cat([elmoembd, wembd], dim=-1) for elmoembd, wembd in zip(elmo_clf_h, wembd_tnsr)]
         else:
             mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
-            if (self.embed_type == 'w2v'):
+            if (self.embed_type.startswith('w2v')):
                 assert(w2v_ids is not None)
                 wembd_tnsr = torch.tensor([self.w2v_model.syn0[s] for s in w2v_ids])
                 if use_gpu: wembd_tnsr = wembd_tnsr.to('cuda')
                 clf_h = wembd_tnsr
-            elif (self.embed_type == 'elmo'):
+            elif (self.embed_type.startswith('elmo')):
                 embeddings = self.lm_model(input_ids)
                 clf_h = torch.cat(embeddings['elmo_representations'], dim=-1)
-            elif (self.embed_type == 'elmo_w2v'):
+            elif (self.embed_type.startswith('elmo_w2v')):
                 assert(w2v_ids is not None)
                 wembd_tnsr = torch.tensor([self.w2v_model.syn0[s] for s in w2v_ids])
                 if use_gpu: wembd_tnsr = wembd_tnsr.to('cuda')
@@ -549,9 +557,9 @@ class EmbeddingClfHead(BaseClfHead):
 
 
 class EmbeddingPool(EmbeddingClfHead):
-    def __init__(self, lm_model, config, task_type, fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, pooler=None, pool_params={'kernel_size':8, 'stride':4}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, pooler=None, pool_params={'kernel_size':8, 'stride':4}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         assert(task_type != 'nmt')
-        super(EmbeddingPool, self).__init__(lm_model, config, task_type, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+        super(EmbeddingPool, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         if pooler:
             self.pooler = nn.MaxPool2d(**pool_params) if pool == 'max' else nn.AvgPool2d(**pool_params)
@@ -575,9 +583,9 @@ class EmbeddingPool(EmbeddingClfHead):
 
 
 class EmbeddingSeq2Vec(EmbeddingClfHead):
-    def __init__(self, lm_model, config, task_type, fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         assert(task_type != 'nmt')
-        super(EmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+        super(EmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         if seq2vec:
             params = {}
             if seq2vec.startswith('pytorch-'):
@@ -620,8 +628,8 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
 
 
 class EmbeddingSeq2Seq(EmbeddingClfHead):
-    def __init__(self, lm_model, config, task_type, fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2seq=None, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(EmbeddingSeq2Seq, self).__init__(lm_model, config, task_type, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2seq=None, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        super(EmbeddingSeq2Seq, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         if seq2seq:
             params = {}
             if seq2seq.startswith('pytorch-'):
@@ -649,6 +657,30 @@ class EmbeddingSeq2Seq(EmbeddingClfHead):
         clf_h, mask = super(EmbeddingSeq2Seq, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
         if self.seq2seq:
             clf_h = self.seq2seq(clf_h, mask=mask)
+        return self._forward(clf_h, labels=labels, weights=weights)
+
+
+class SentVecEmbeddingSeq2Vec(EmbeddingSeq2Vec):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v_sentvec', w2v_path=None, sentvec_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        import sent2vec
+        if type(sentvec_path) is sent2vec.Sent2vecModel:
+            self.sentvec_model = w2v_path
+        elif sentvec_path and os.path.isfile(sentvec_path):
+            self.sentvec_model = sent2vec.Sent2vecModel()
+            self.sentvec_model.load_model(sentvec_path)
+        else:
+            self.sentvec_model = None
+        assert(self.sentvec_model)
+        self.n_embd = self.sentvec_model.get_emb_size()
+        super(SentVecEmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type.replace('_sentvec', ''), w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+
+    def forward(self, input_ids, pool_idx, w2v_ids=None, sentvec_tnsr=None, labels=None, past=None, weights=None):
+        clf_h, mask = EmbeddingClfHead.forward(self, input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
+        if self.seq2vec:
+            clf_h = [self.seq2vec(clf_h[x], mask=mask[x]) for x in [0,1]] if self.task_type in ['entlmnt', 'sentsim'] else self.seq2vec(clf_h, mask=mask)
+        else:
+            clf_h = [clf_h[x].gather(1, pool_idx[x].unsqueeze(-1).unsqueeze(-1).expand(-1, 1, clf_h[x].size(2))).squeeze(1) for x in [0,1]] if self.task_type in ['entlmnt', 'sentsim'] else clf_h.gather(1, pool_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, clf_h.size(2))).squeeze(1)
+        clf_h = [torch.cat([clf_h[x], sentvec_tnsr[x]], dim=-1) for x in [0,1]] if self.task_type in ['entlmnt', 'sentsim'] else torch.cat([clf_h, sentvec_tnsr], dim=-1)
         return self._forward(clf_h, labels=labels, weights=weights)
 
 
@@ -806,8 +838,8 @@ class BaseDataset(Dataset):
             lb_df = self.df[task_cols['y']]
         if (type(lb_df.iloc[0]) is list):
             lb_df[:] = [self._mltl_transform((None, SC.join(lbs)))[1] for lbs in lb_df]
-            max_lb_df = lb_df.loc[[idx for idx, lbs in lb_df.iteritems() if np.sum(map(int, lbs)) == 0]]
-            max_num, avg_num = max_lb_df.shape[0], 1.0 * lb_df[~max_lb_df].shape[0] / len(lb_df.iloc[0])
+            max_lb_df = lb_df.loc[[idx for idx, lbs in lb_df.iteritems() if np.sum(list(map(int, lbs))) == 0]]
+            max_num, avg_num = max_lb_df.shape[0], 1.0 * lb_df[~lb_df.index.isin(max_lb_df.index)].shape[0] / len(lb_df.iloc[0])
         else:
             class_count = np.array([[1 if lb in y else 0 for lb in self.binlb.keys()] for y in lb_df if y is not None]).sum(axis=0)
             max_num, max_lb_bin = class_count.max(), class_count.argmax()
@@ -1072,6 +1104,10 @@ def _batch2ids_w2v(batch_text, w2v_model):
     return [[w2v_model.vocab[w].index if w in w2v_model.vocab else (w2v_model.vocab[w.lower()].index if w.lower() in w2v_model.vocab else 0) for w in line] for line in batch_text]
 
 
+def _batch2ids_sentvec(batch_text, sentvec_model):
+    return torch.tensor(sentvec_model.embed_sentences([' '.join(x) for x in batch_text]))
+
+
 def _onehot(y, size):
     y = torch.LongTensor(y).view(-1, 1)
     y_onehot = torch.FloatTensor(size[0], size[1])
@@ -1108,13 +1144,13 @@ TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'max
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
-ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode, 'trsfmxl':_bert_encode, 'elmo':_tokenize, 'elmo_w2v':_tokenize, 'none':_tokenize}
-LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v'}
+ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode, 'trsfmxl':_bert_encode, 'elmo':_tokenize, 'elmo_w2v':_tokenize, 'none':_tokenize, 'sentvec':_tokenize}
+LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
-CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq}}
-CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
+CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
-TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'elmo_w2v':None, 'none':None}
+TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
 OPTMZR_MAP = {'bert':BertAdam, 'gpt':OpenAIAdam}
 PYTORCH_WRAPPER = {'lstm':nn.LSTM, 'rnn':nn.RNN, 'gru':nn.GRU, 'agmnlstm':AugmentedLstm, 'stkaltlstm':StackedAlternatingLstm}
@@ -1216,24 +1252,25 @@ def gen_mdl(mdl_name, pretrained=True, use_gpu=False, distrb=False, dev_id=None)
 def gen_clf(mdl_name, encoder='pool', use_gpu=False, distrb=False, dev_id=None, **kwargs):
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if not mdl_name.startswith('none') else {}
     for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
         if pname in params: del params[pname]
-    kwargs['config'] = CONFIG_MAP[mdl_name](**params) if mdl_name != 'none' else {}
-    clf = CLF_MAP['embed'][encoder](**kwargs) if mdl_name in LM_EMBED_MDL_MAP else CLF_MAP[mdl_name](**kwargs)
+    kwargs['config'] = CONFIG_MAP[mdl_name](**params) if mdl_name != 'none' and not mdl_name.endswith('sentvec') else {}
+    clf = CLF_MAP['embed'][encoder](**kwargs) if opts.model in LM_EMBED_MDL_MAP else CLF_MAP[opts.model](**kwargs)
     return clf.to('cuda') if use_gpu else clf
 
 
 def classify(dev_id=None):
+    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-    params = pr('LM', LM_PARAMS_MAP[opts.model.split('_')[0]]) if opts.model != 'none' else {}
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
     use_gpu = dev_id is not None
-    encode_func = ENCODE_FUNC_MAP[opts.model]
-    tokenizer = TKNZR_MAP[opts.model].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[opts.model]) if TKNZR_MAP[opts.model] else None
+    encode_func = ENCODE_FUNC_MAP[mdl_name]
+    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
     task_type = TASK_TYPE_MAP[opts.task]
-    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(opts.model, ['_@_', ' _$_', ' _#_'])) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(opts.model, ['_@_', ' _$_', ' _#_'])[:2])
-    special_tknids = _adjust_encoder(opts.model, tokenizer, special_tkns[1], ret_list=True)
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
     special_tknids_args = dict(zip(special_tkns[0], special_tknids))
 
     # Prepare data
@@ -1241,8 +1278,8 @@ def classify(dev_id=None):
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, special_tknids_args, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
 
-    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[opts.model], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs)
-    if opts.model == 'bert': train_ds = MaskedLMDataset(train_ds)
+    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs)
+    if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
     if (not opts.weight_class or task_type == 'sentsim'):
         class_count = None
@@ -1262,37 +1299,36 @@ def classify(dev_id=None):
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
-    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[opts.model], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False))
-    if opts.model == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False))
+    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[opts.model], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False))
-    if opts.model == 'bert': test_ds = MaskedLMDataset(test_ds)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False))
+    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
-    mdl_name = opts.model.lower().replace(' ', '_')
     if (opts.resume):
         # Load model
         clf = load_model(opts.resume)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
     else:
         # Build model
-        lm_model = gen_mdl(opts.model.split('_')[0], pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if opts.model.lower() != 'none' else None
+        lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
         ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
         if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
         task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
         print('Classifier hyper-parameters: %s' % ext_params)
-        clf = gen_clf(opts.model.split('_')[0], opts.encoder, lm_model=lm_model, task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
+        clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
         optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
         print(optimizer)
 
         # Training
-        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=mdl_name, use_gpu=use_gpu, devq=dev_id)
+        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
 
     # Evaluation
-    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=mdl_name, use_gpu=use_gpu)
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=mdl_name, use_gpu=use_gpu, devq=dev_id)
-    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=mdl_name, use_gpu=use_gpu)
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
 
 
 def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None):
@@ -1319,6 +1355,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                     tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
                     tkns_tnsr = [[s[:min(len(s), opts.maxlen)] for s in tkns_tnsr[x]] for x in [0,1]]
                     w2v_tnsr = [_batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                    sentvec_tnsr = [_batch2ids_sentvec(tkns_tnsr[x], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
                     pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
                     if mdl_name.startswith('elmo'):
                         tkns_tnsr = [tkns_tnsr[x] + [[''] * opts.maxlen] for x in [0,1]]
@@ -1335,6 +1372,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                     lb_tnsr = torch.LongTensor([s[:min(len(s), opts.maxlen)] + [pad_val[1]] * (opts.maxlen-len(s)) for s in lb_tnsr])
                     tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
                     w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                    sentvec_tnsr = None
                     pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
                     if mdl_name.startswith('elmo'):
                         tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
@@ -1348,6 +1386,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                     tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
                     tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
                     w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                    sentvec_tnsr = _batch2ids_sentvec(tkns_tnsr, clf.sentvec_model) if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
                     pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
                     if mdl_name.startswith('elmo'):
                         tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
@@ -1358,7 +1397,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                         tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
                 mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-                clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights)
+                clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights, **dict(sentvec_tnsr=sentvec_tnsr) if mdl_name.endswith('sentvec') else {})
             else:
                 valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
                 if (len(valid_idx) == 0): continue
@@ -1411,14 +1450,16 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
                 tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
                 tkns_tnsr = [[s[:min(len(s), opts.maxlen)] for s in tkns_tnsr[x]] for x in [0,1]]
                 w2v_tnsr = [_batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                sentvec_tnsr = [_batch2ids_sentvec(tkns_tnsr[x], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
                 pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
                 if mdl_name.startswith('elmo'):
                     tkns_tnsr = [tkns_tnsr[x] + [[''] * opts.maxlen] for x in [0,1]]
                     tkns_tnsr = [batch_to_ids(tkns_tnsr[x])[:-1] for x in [0,1]]
                     pad_val = 0
                 else:
-                    tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
-                if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx= [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]]
+                    # tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
+                    tkns_tnsr = [torch.tensor([[1]*len(s) + [pad_val[0]] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]]) for x in [0,1]]
+                if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, w2v_tnsr, sentvec_tnsr = [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]], w2v_tnsr if w2v_tnsr is None else [w2v_tnsr[x].to('cuda') for x in [0,1]], sentvec_tnsr if sentvec_tnsr is None else [sentvec_tnsr[x].to('cuda') for x in [0,1]]
             elif task_type == 'nmt':
                 # tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
                 tkns_tnsr, lb_tnsr = zip(*[(sx.split(SC), list(map(int, sy.split(SC)))) for sx, sy in zip(tkns_tnsr, lb_tnsr) if ((type(sx) is str and sx != '') or len(sx) > 0) and ((type(sy) is str and sy != '') or len(sy) > 0)])
@@ -1427,29 +1468,33 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
                 _lb_tnsr = lb_tnsr = torch.LongTensor([s[:min(len(s), opts.maxlen)] + [pad_val[1]] * (opts.maxlen-len(s)) for s in lb_tnsr])
                 tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
                 w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                sentvec_tnsr = None
                 _pool_idx = pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
                 if mdl_name.startswith('elmo'):
                     tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
                     tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
                     pad_val = (0, pad_val[1])
                 else:
-                    tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
-                if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda')
+                    # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                    tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
+                if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, w2v_tnsr, sentvec_tnsr = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (w2v_tnsr if w2v_tnsr is None else w2v_tnsr.to('cuda')), (sentvec_tnsr if sentvec_tnsr is None else sentvec_tnsr.to('cuda'))
             else:
                 tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
                 tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
                 w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                sentvec_tnsr = _batch2ids_sentvec(tkns_tnsr, clf.sentvec_model) if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
                 _pool_idx = pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
                 if mdl_name.startswith('elmo'):
                     tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
                     tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
                     pad_val = 0
                 else:
-                    tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
-                if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx= tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda')
+                    # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                    tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
+                if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, w2v_tnsr, sentvec_tnsr = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (w2v_tnsr if w2v_tnsr is None else w2v_tnsr.to('cuda')), (sentvec_tnsr if sentvec_tnsr is None else sentvec_tnsr.to('cuda'))
             mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
             with torch.no_grad():
-                logits = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=None)
+                logits = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=None, **dict(sentvec_tnsr=sentvec_tnsr) if mdl_name.endswith('sentvec') else {})
         else:
             valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
             if (len(valid_idx) == 0): continue
@@ -1636,6 +1681,7 @@ if __name__ == '__main__':
     op.add_option('--vocab', dest='vocab', help='vocabulary file')
     op.add_option('--bpe', dest='bpe', help='bpe merge file')
     op.add_option('--w2v', dest='w2v_path', help='word2vec model file')
+    op.add_option('--sentvec', dest='sentvec_path', help='sentvec model file')
     op.add_option('--maxlen', default=128, action='store', type='int', dest='maxlen', help='indicate the maximum sequence length for each samples')
     op.add_option('--maxtrial', default=50, action='store', type='int', dest='maxtrial', help='maximum time to try')
     op.add_option('--initln', default=False, action='store_true', dest='initln', help='whether to initialize the linear layer')
