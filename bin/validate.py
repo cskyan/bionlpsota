@@ -1145,10 +1145,10 @@ TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'max
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
 ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode, 'trsfmxl':_bert_encode, 'elmo':_tokenize, 'elmo_w2v':_tokenize, 'none':_tokenize, 'sentvec':_tokenize}
-LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec'}
+LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec', 'elmo_sentvec':'elmo_sentvec', 'elmo_w2v_sentvec':'elmo_w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
 CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
-CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
@@ -1250,12 +1250,13 @@ def gen_mdl(mdl_name, pretrained=True, use_gpu=False, distrb=False, dev_id=None)
 
 
 def gen_clf(mdl_name, encoder='pool', use_gpu=False, distrb=False, dev_id=None, **kwargs):
+    lm_mdl_name = mdl_name.split('_')[0]
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if not mdl_name.startswith('none') else {}
+    params = pr('LM', LM_PARAMS_MAP[lm_mdl_name]) if lm_mdl_name != 'none' else {}
     for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
         if pname in params: del params[pname]
-    kwargs['config'] = CONFIG_MAP[mdl_name](**params) if mdl_name != 'none' and not mdl_name.endswith('sentvec') else {}
+    kwargs['config'] = CONFIG_MAP[lm_mdl_name](**params) if lm_mdl_name != 'none' else {}
     clf = CLF_MAP['embed'][encoder](**kwargs) if opts.model in LM_EMBED_MDL_MAP else CLF_MAP[opts.model](**kwargs)
     return clf.to('cuda') if use_gpu else clf
 
@@ -1567,10 +1568,10 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             print('Predictions contain NaN values! Please try to decrease the learning rate!')
             return
         try:
-            metric_names, metrics_funcs = ['Mean Absolute Error', 'Mean Squared Error', 'Mean Squared Log Error', 'Median Absolute Error', 'R2', 'Pearson Correlation'], [metrics.mean_absolute_error, metrics.mean_squared_error, metrics.mean_squared_log_error, metrics.median_absolute_error, metrics.r2_score, _prsn_cor]
+            metric_names, metrics_funcs = ['Mean Absolute Error', 'Mean Squared Error', 'Mean Squared Log Error', 'Median Absolute Error', 'R2', 'Pearson Correlation', 'Spearman Correlation'], [metrics.mean_absolute_error, metrics.mean_squared_error, metrics.mean_squared_log_error, metrics.median_absolute_error, metrics.r2_score, _prsn_cor, _sprmn_cor]
         except Exception as e:
             print(e)
-            metric_names, metrics_funcs = ['Mean Absolute Error', 'Mean Squared Log Error', 'Median Absolute Error', 'R2', 'Pearson Correlation'], [metrics.mean_absolute_error, metrics.mean_squared_log_error, metrics.median_absolute_error, metrics.r2_score, _prsn_cor]
+            metric_names, metrics_funcs = ['Mean Absolute Error', 'Mean Squared Log Error', 'Median Absolute Error', 'R2', 'Pearson Correlation', 'Spearman Correlation'], [metrics.mean_absolute_error, metrics.mean_squared_log_error, metrics.median_absolute_error, metrics.r2_score, _prsn_cor, _sprmn_cor]
         perf_df = pd.DataFrame(dict([(k, [f(trues, preds)]) for k, f in zip(metric_names, metrics_funcs)]), index=[mdl_name])[metric_names]
     elif task_type == 'mltl-clf':
         labels = list(binlbr.keys())
@@ -1592,7 +1593,11 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
 
 
 def _prsn_cor(trues, preds):
-    return np.corrcoef(trues, preds)[0, 1]
+    return sp.stats.pearsonr(trues, preds)[0]
+
+
+def _sprmn_cor(trues, preds):
+    return sp.stats.spearmanr(trues, preds)[0]
 
 
 def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, **kwargs):
