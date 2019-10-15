@@ -41,7 +41,7 @@ try:
 except Exception as e:
     print(e)
     try:
-        nlp = spacy.load('en_core_web_sm')
+        nlp = spacy.load('en_core_sci_sm')
     except Exception as e:
         print(e)
         nlp = spacy.load('en_core_web_sm')
@@ -62,7 +62,7 @@ cfgr = None
 class BaseClfHead(nn.Module):
     """ Classifier Head for the Basic Language Model """
 
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_lastdrop=True, do_crf=False, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, **kwargs):
         super(BaseClfHead, self).__init__()
         self.task_params = task_params
         self.lm_model = lm_model
@@ -73,6 +73,9 @@ class BaseClfHead(nn.Module):
         self.dropout = nn.Dropout2d(pdrop) if task_type == 'nmt' else nn.Dropout(pdrop)
         self.last_dropout = nn.Dropout(pdrop) if do_lastdrop else None
         self.crf = ConditionalRandomField(num_lbs) if do_crf else None
+        self.thrshlder = ThresholdEstimator(last_hdim=kwargs['last_hdim']) if do_thrshld and 'last_hdim' in kwargs else None
+        self.thrshld = 0.5
+        self.constraints = [cnstrnt_cls(**cnstrnt_params) for cnstrnt_cls, cnstrnt_params in constraints]
         self.lm_logit = self._mlt_lm_logit if mlt_trnsfmr else self._lm_logit
         self.clf_h = self._mlt_clf_h if mlt_trnsfmr else self._clf_h
         self.num_lbs = num_lbs
@@ -96,7 +99,10 @@ class BaseClfHead(nn.Module):
         clf_h, pool_idx = self.clf_h(hidden_states, pool_idx, past=past)
         # print(('after pool', clf_h))
         if self.task_type == 'nmt':
-            clf_h = clf_h
+            if (hasattr(self, 'layer_pooler')):
+                clf_h = self.layer_pooler(clf_h).view(clf_h[0].size())
+            else:
+                clf_h = clf_h
         elif hasattr(self.lm_model, 'pooler'):
             if (hasattr(self, 'pooler')):
                 if (hasattr(self, 'layer_pooler')):
@@ -128,9 +134,12 @@ class BaseClfHead(nn.Module):
             # print(('before dropout:', clf_h))
             clf_h = self.dropout(clf_h)
             # print(('after dropout:', clf_h))
-            clf_logits = self.linear(clf_h)
-            # print(('after linear:', clf_h))
+            clf_logits = self.linear(clf_h.view(-1, self.n_embd) if self.task_type == 'nmt' else clf_h)
+            # print(('after linear:', clf_logits))
+        if self.thrshlder: self.thrshld = self.thrshlder(clf_h)
         if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
+        # print(('after lastdrop:', clf_logits))
+
 
         if (labels is None):
             if self.crf:
@@ -140,11 +149,17 @@ class BaseClfHead(nn.Module):
                 clf_logits = torch.zeros((*tag_seq.size(), self.num_lbs)).to('cuda') if use_gpu else torch.zeros((*tag_seq.size(), self.num_lbs))
                 clf_logits = clf_logits.scatter(-1, tag_seq.unsqueeze(-1), 1)
                 return clf_logits
+            for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
             if (self.task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != self.task_params['ymode']): return 1 - clf_logits.view(-1, self.num_lbs)
             return clf_logits.view(-1, self.num_lbs)
+        # print(clf_logits.size())
+        # print((labels.max(), labels.size()))
         if self.crf:
             clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), pool_idx)
-        elif self.task_type == 'mltc-clf' or self.task_type == 'entlmnt' or self.task_type == 'nmt':
+            return clf_loss, lm_loss
+        else:
+            for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
+        if self.task_type == 'mltc-clf' or self.task_type == 'entlmnt' or self.task_type == 'nmt':
             loss_func = nn.CrossEntropyLoss(weight=weights, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1))
         elif self.task_type == 'mltl-clf':
@@ -153,6 +168,9 @@ class BaseClfHead(nn.Module):
         elif self.task_type == 'sentsim':
             loss_func = ContrastiveLoss(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
+        if self.thrshlder:
+            num_lbs = labels.view(-1, self.num_lbs).sum(1)
+            clf_loss = 0.8 * clf_loss + 0.2 * F.mse_loss(self.thrshld, torch.sigmoid(torch.topk(clf_logits, k=num_lbs.max(), dim=1, sorted=True)[0][:,num_lbs-1]), reduction='mean')
         return clf_loss, lm_loss
 
     def _clf_h(self, hidden_states, pool_idx, past=None):
@@ -182,6 +200,47 @@ class BaseClfHead(nn.Module):
         if not hasattr(self, 'lm_model') or self.lm_model is None: return
         for param in self.lm_model.parameters():
             param.requires_grad = True
+
+    def to(self, *args, **kwargs):
+        super(BaseClfHead, self).to(*args, **kwargs)
+        self.constraints = [cnstrnt.to(*args, **kwargs) for cnstrnt in self.constraints]
+        return self
+
+
+class ThresholdEstimator(nn.Module):
+    def __init__(self, last_hdim, fchdim=100, iactvtn='relu', oactvtn='sigmoid', init_thrshld=0.5):
+        super(ThresholdEstimator, self).__init__()
+        self.thrshld = init_thrshld
+        self.linear = nn.Sequential(nn.Linear(last_hdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, 1), ACTVTN_MAP[oactvtn]()) if fchdim else nn.Sequential(nn.Linear(last_hdim, 1), ACTVTN_MAP[oactvtn]())
+
+    def forward(self, logits):
+        return self.linear(logits)
+
+
+class HrchConstraint(nn.Module):
+    def __init__(self, num_lbs, hrchrel_path='', binlb={}):
+        super(HrchConstraint, self).__init__()
+        with open(hrchrel_path, 'rb') as fd:
+            hrchrel = pickle.load(fd)
+        out_order = binlb.keys()
+        if out_order:
+            hrchrel = hrchrel[out_order]
+            hrchrel = hrchrel.loc[out_order]
+        # np.fill_diagonal(hrchrel.values, 1)
+        self.hrchrel = torch.tensor(hrchrel.values).float()
+        self.linear = nn.Linear(num_lbs, num_lbs)
+
+    def forward(self, logits):
+        out = torch.mm(logits, self.linear(self.hrchrel))
+        out = out / out.sum(0).expand_as(out)
+        out[torch.isnan(out)] = 0
+        return logits + out
+
+    def to(self, *args, **kwargs):
+        super(HrchConstraint, self).to(*args, **kwargs)
+        self.hrchrel = self.hrchrel.to(*args, **kwargs)
+        self.linear = self.linear.to(*args, **kwargs)
+        return self
 
 
 class TransformerLayerMaxPool(nn.MaxPool1d):
@@ -245,14 +304,14 @@ class MaskedReduction(nn.Module):
 
 
 class BERTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
-        super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+        super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
         self.lm_head = BertPreTrainingHeads(config, lm_model.embeddings.word_embeddings.weight)
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.n_embd = config.hidden_size
         self.maxlen = self.task_params.setdefault('maxlen', 128)
-        self.norm = NORM_TYPE_MAP[norm_type](config.hidden_size)
+        self.norm = NORM_TYPE_MAP[norm_type](self.maxlen) if self.task_type == 'nmt' else NORM_TYPE_MAP[norm_type](config.hidden_size)
         self._int_actvtn = nn.ReLU
         self._out_actvtn = nn.Sigmoid
         self.linear = nn.Sequential(nn.Linear(config.hidden_size, num_lbs), nn.Sigmoid()) if task_type == 'sentsim' else nn.Linear(config.hidden_size, num_lbs)
@@ -810,7 +869,15 @@ class BaseDataset(Dataset):
 
     def _nmt_transform(self, sample, options=None, binlb={}):
         if (len(binlb) > 0): self.binlb = binlb
-        return sample[0], [self.binlb.setdefault(y, len(self.binlb)) for y in sample[1]]
+        # if any([y not in self.binlb for y  in sample[1]]): print([y for y  in sample[1] if y not in self.binlb])
+        # return sample[0], [self.binlb.setdefault(y, len(self.binlb)) for y in sample[1]]
+        return sample[0], [self.binlb[y] if y in self.binlb else len(self.binlb) - 1 for y in sample[1]]
+
+    def _mltl_nmt_transform(self, sample, options=None, binlb={}, get_lb=lambda x: x.split(SC)):
+        if (len(binlb) > 0): self.binlb = binlb
+        labels = [get_lb(lb) for lb in sample[1]]
+        # return sample[0], [[self.binlb.setdefault(y, len(self.binlb)) for y in lbs] if type(lbs) is list else self.binlb.setdefault(lbs, len(self.binlb)) for lbs in labels]
+        return sample[0], [[self.binlb[y] if y in self.binlb else len(self.binlb) - 1 for y in lbs] if type(lbs) is list else self.binlb[lbs] if lbs in self.binlb else len(self.binlb) - 1 for lbs in labels]
 
     def _mltc_transform(self, sample, options=None, binlb={}):
         if (len(binlb) > 0): self.binlb = binlb
@@ -909,10 +976,15 @@ class EntlmntDataset(BaseDataset):
 class NERDataset(BaseDataset):
     """NER task dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
-        super(NERDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, header=None, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], lb_coding='IOB', **kwargs):
+        super(NERDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, header=None if csv_file.endswith('tsv') else 0, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+        all_lbs = set([k.split('-')[-1] for k in self.binlb.keys() if k != 'O'])
+        encoded_lbs = ['%s-%s' % (pre, lb) for lb in all_lbs for pre in set(lb_coding) - set(['O']) if lb and not lb.isspace()] + ['O']
+        self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(encoded_lbs)])
+        self.binlbr = OrderedDict([(i, lb) for i, lb in enumerate(encoded_lbs)])
+        self.num_lbs = len(encoded_lbs)
         sep_selector = self.df[self.text_col].apply(lambda x: True if x=='.' else False)
-        sep_selector.iloc[-1] = True
+        sep_selector.iloc[-1] = False if sep_selector.iloc[-2] else True
         int_idx = pd.DataFrame(np.arange(self.df.shape[0]), index=self.df.index)
         self.boundaries = [0] + list(itertools.chain.from_iterable((int_idx[sep_selector.values].values+1).tolist()))
 
@@ -922,6 +994,7 @@ class NERDataset(BaseDataset):
     def __getitem__(self, idx):
         record = self.df.iloc[self.boundaries[idx]:self.boundaries[idx+1]].dropna()
         sample = self.encode_func(record[self.text_col].values.tolist(), self.tokenizer), record[self.label_col].values.tolist()
+        sample = list(map(list, zip(*[(x, y) for x, y in zip(*sample) if x and y])))
         num_samples = [len(x) for x in sample[0]] if (len(sample[0]) > 0 and type(sample[0][0]) is list) else [1] * len(sample[0])
         record_idx = [0] + np.cumsum(num_samples).tolist()
         is_empty = (type(sample[0]) is list and len(sample[0]) == 0) or (type(sample[0]) is list and len(sample[0]) > 0 and all([type(x) is list and len(x) == 0 for x in sample[0]]))
@@ -966,13 +1039,18 @@ class MaskedLMDataset(BaseDataset):
         self.special_tknids = special_tknids
         self.masked_lm_prob = masked_lm_prob
 
+    def __len__(self):
+        return self._ds.__len__()
+
     def __getitem__(self, idx):
-        record = self.df.iloc[idx]
-        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
-        sample = self._transform_chain(sample)
+        # record = self.df.iloc[idx]
+        # sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
+        # sample = self._transform_chain(sample)
+        orig_sample = self._ds[idx]
+        sample = orig_sample[1], orig_sample[2]
         masked_lm_ids = np.array(sample[0])
-        pad_trnsfm_idx = self.transforms.index(_pad_transform) if len(self.transforms) > 0 else -1
-        pad_trnsfm_kwargs = self.transforms_kwargs[pad_trnsfm_idx] if pad_trnsfm_idx > -1 else {}
+        pad_trnsfm_idx = self.transforms.index(_pad_transform) if len(self.transforms) > 0 and _pad_transform in self.transforms else -1
+        pad_trnsfm_kwargs = self.transforms_kwargs[pad_trnsfm_idx] if pad_trnsfm_idx and pad_trnsfm_idx in self.transforms_kwargs > -1 else {}
         masked_lm_lbs = np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0]])
         valid_idx = np.where(masked_lm_lbs > -1)[0]
         cand_samp_idx = random.sample(range(len(valid_idx)), min(opts.maxlen, max(1, int(round(len(valid_idx) * self.masked_lm_prob)))))
@@ -981,7 +1059,11 @@ class MaskedLMDataset(BaseDataset):
         masked_lm_ids[cand_idx[rndm < 0.8]] = self.special_tknids[-1]
         masked_lm_ids[cand_idx[rndm >= 0.9]] = random.randrange(0, self.vocab_size)
         masked_lm_lbs[list(filter(lambda x: x not in cand_idx, range(len(masked_lm_lbs))))] = -1
-        return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs)
+        return orig_sample + (torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs))
+        # return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs)
+
+    def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
+        return self._ds.fill_labels(lbs=lbs, index=index, saved_path=saved_path, **kwargs)
 
 
 class ConceptREDataset(BaseDataset):
@@ -1145,14 +1227,14 @@ def _weights_init(mean=0., std=0.02):
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
     return {'options_file':options_path, 'weight_file':weights_path, 'num_output_representations':2, 'elmoedim':elmoedim, 'dropout':dropout}
 
-TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'copd':'mltl-clf', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
-TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'copd':'copd', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
-TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'copd':BaseDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
-TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
+TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'copd':'mltl-clf', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
+TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'copd':'copd', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
+TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'copd':BaseDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
+TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
-TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan else x.split(';')}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
-TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'maxlen':128}}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':128}}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
+TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'maxlen':128}}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':128}}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
@@ -1160,7 +1242,7 @@ ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode,
 LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec', 'elmo_sentvec':'elmo_sentvec', 'elmo_w2v_sentvec':'elmo_w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
 CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
-CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
@@ -1217,6 +1299,8 @@ SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden
 NORM_TYPE_MAP = {'batch':nn.BatchNorm1d, 'layer':nn.LayerNorm}
 ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid}
 SIM_FUNC_MAP = {'sim':'sim', 'dist':'dist'}
+CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
+CNSTRNTS_MAP = {'hrch':(HrchConstraint, {('num_lbs','num_lbs'):1, ('hrchrel_path','hrchrel_path'):'hpo_ancrels.pkl', ('binlb','binlb'):{}})}
 
 
 def gen_pytorch_wrapper(mdl_type, mdl_name, **kwargs):
@@ -1262,7 +1346,7 @@ def gen_mdl(mdl_name, pretrained=True, use_gpu=False, distrb=False, dev_id=None)
     return model
 
 
-def gen_clf(mdl_name, encoder='pool', use_gpu=False, distrb=False, dev_id=None, **kwargs):
+def gen_clf(mdl_name, encoder='pool', constraints=[], use_gpu=False, distrb=False, dev_id=None, **kwargs):
     lm_mdl_name = mdl_name.split('_')[0]
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
@@ -1270,8 +1354,19 @@ def gen_clf(mdl_name, encoder='pool', use_gpu=False, distrb=False, dev_id=None, 
     for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
         if pname in params: del params[pname]
     kwargs['config'] = CONFIG_MAP[lm_mdl_name](**params) if lm_mdl_name != 'none' else {}
+
+    lvar = locals()
+    for x in constraints:
+        cnstrnt_cls, cnstrnt_params = copy.deepcopy(CNSTRNTS_MAP[x])
+        constraint_params = pr('Constraint', CNSTRNT_PARAMS_MAP[x])
+        cnstrnt_params.update(dict([((k, p), constraint_params[p]) for k, p in cnstrnt_params.keys() if p in constraint_params]))
+        cnstrnt_params.update(dict([((k, p), kwargs[p]) for k, p in cnstrnt_params.keys() if p in kwargs]))
+        cnstrnt_params.update(dict([((k, p), lvar[p]) for k, p in cnstrnt_params.keys() if p in lvar]))
+        kwargs.setdefault('constraints', []).append((cnstrnt_cls, dict([(k, v) for (k, p), v in cnstrnt_params.items()])))
+
     clf = CLF_MAP['embed'][encoder](**kwargs) if opts.model in LM_EMBED_MDL_MAP else CLF_MAP[opts.model](**kwargs)
-    return clf.to('cuda') if use_gpu else clf
+    if use_gpu: clf.to('cuda')
+    return clf
 
 
 def classify(dev_id=None):
@@ -1291,8 +1386,9 @@ def classify(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, special_tknids_args, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    ds_kwargs = {'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')} if task_type=='nmt' else {}
 
-    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs)
+    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
     if (not opts.weight_class or task_type == 'sentsim'):
@@ -1313,12 +1409,13 @@ def classify(dev_id=None):
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
-    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False))
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False))
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
     if (opts.resume):
         # Load model
@@ -1331,7 +1428,7 @@ def classify(dev_id=None):
         if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
         task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
         print('Classifier hyper-parameters: %s' % ext_params)
-        clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
+        clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
         optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
         print(optimizer)
@@ -1352,11 +1449,15 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
     clf.unfreeze_lm()
     for epoch in range(epochs):
         total_loss = 0
-        if task_type not in ['entlmnt', 'sentsim']: dataset.dataset.rebalance()
+        # if task_type not in ['entlmnt', 'sentsim']: dataset.dataset.rebalance()
         for step, batch in enumerate(tqdm(dataset, desc='[%i/%i epoch(s)] Training batches' % (epoch + 1, epochs))):
             optimizer.zero_grad()
             if task_type == 'nmt':
-                idx, tkns_tnsr, lb_tnsr, record_idx = batch
+                if mdl_name == 'bert':
+                    idx, tkns_tnsr, lb_tnsr, record_idx, masked_lm_ids_tnsr, masked_lm_lbs_tnsr = batch
+                    clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
+                else:
+                    idx, tkns_tnsr, lb_tnsr, record_idx = batch
                 record_idx = [list(map(int, x.split(SC))) for x in record_idx]
             else:
                 if mdl_name == 'bert':
@@ -1364,6 +1465,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                     clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
                 else:
                     idx, tkns_tnsr, lb_tnsr = batch
+            if len(idx) < 2: continue
             if (mdl_name in LM_EMBED_MDL_MAP):
                 if task_type in ['entlmnt', 'sentsim']:
                     tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
@@ -1448,7 +1550,11 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
     if task_type not in ['entlmnt', 'sentsim', 'mltl-clf']: dataset.dataset.remove_mostfrqlb()
     for step, batch in enumerate(tqdm(dataset, desc="%s batches" % ds_name.title() if ds_name else 'Evaluation')):
         if task_type == 'nmt':
-            idx, tkns_tnsr, lb_tnsr, record_idx = batch
+            if mdl_name == 'bert':
+                idx, tkns_tnsr, lb_tnsr, record_idx, masked_lm_ids_tnsr, masked_lm_lbs_tnsr = batch
+                clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
+            else:
+                idx, tkns_tnsr, lb_tnsr, record_idx = batch
             record_idx = [list(map(int, x.split(SC))) for x in record_idx]
         else:
             if mdl_name == 'bert':
@@ -1528,7 +1634,7 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             loss_func = nn.BCEWithLogitsLoss(reduction='none')
             loss = loss_func(logits.view(-1, len(binlbr)), lb_tnsr.view(-1, len(binlbr)).float())
             prob = torch.sigmoid(logits).data
-            pred = (prob > opts.pthrshld).int()
+            pred = (prob > clf.thrshld if opts.do_thrshld else opts.pthrshld).int()
             # print(('logits, prob:', logits, prob))
         elif task_type == 'nmt':
             loss_func = nn.CrossEntropyLoss(reduction='none')
@@ -1540,19 +1646,19 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             loss = loss_func(logits.view(-1), lb_tnsr.view(-1))
             prob, pred = logits, logits
         total_loss += loss.mean().item()
-        if task_type == 'nmt':
-            last_tkns = torch.arange(_lb_tnsr.size(0)) * _lb_tnsr.size(1) + _pool_idx
-            flat_tures, flat_preds, flat_probs = _lb_tnsr.view(-1).tolist(), pred.view(-1).detach().cpu().tolist(), prob.view(-1).detach().cpu().tolist()
-            flat_tures_set, flat_preds_set, flat_probs_set = set(flat_tures), set(flat_preds), set(flat_probs)
-            trues.append([[max(flat_tures_set, key=flat_tures[a:b][c[idx]:c[idx+1]].count) for idx in range(len(c)-1)] for a, b, c in zip(range(_lb_tnsr.size(0)), last_tkns, record_idx)])
-            preds.append([[max(flat_preds_set, key=flat_preds[a:b][c[idx]:c[idx+1]].count) for idx in range(len(c)-1)] for a, b, c in zip(range(_lb_tnsr.size(0)), last_tkns, record_idx)])
-            probs.append([[max(flat_probs_set, key=flat_probs[a:b][c[idx]:c[idx+1]].count) for idx in range(len(c)-1)] for a, b, c in zip(range(_lb_tnsr.size(0)), last_tkns, record_idx)])
-            # preds.append([flat_preds[a:b] for a, b in zip(range(_lb_tnsr.size(0)), last_tkns)])
-            # probs.append([flat_probs[a:b] for a, b in zip(range(_lb_tnsr.size(0)), last_tkns)])
-        else:
-            trues.append(_lb_tnsr.view(_lb_tnsr.size(0), -1).numpy() if task_type == 'mltl-clf' else _lb_tnsr.view(-1).detach().cpu().numpy())
-            preds.append(pred.detach().cpu().numpy())
-            probs.append(prob.detach().cpu().numpy())
+        # if task_type == 'nmt':
+        #     last_tkns = torch.arange(_lb_tnsr.size(0)) * _lb_tnsr.size(1) + _pool_idx
+        #     flat_tures, flat_preds, flat_probs = _lb_tnsr.view(-1).tolist(), pred.view(-1).detach().cpu().tolist(), prob.view(-1).detach().cpu().tolist()
+        #     flat_tures_set, flat_preds_set, flat_probs_set = set(flat_tures), set(flat_preds), set(flat_probs)
+        #     trues.append([[max(flat_tures_set, key=flat_tures[a:b][c[idx]:c[idx+1]].count) for idx in range(len(c)-1)] for a, b, c in zip(range(_lb_tnsr.size(0)), last_tkns, record_idx)])
+        #     preds.append([[max(flat_preds_set, key=flat_preds[a:b][c[idx]:c[idx+1]].count) for idx in range(len(c)-1)] for a, b, c in zip(range(_lb_tnsr.size(0)), last_tkns, record_idx)])
+        #     probs.append([[max(flat_probs_set, key=flat_probs[a:b][c[idx]:c[idx+1]].count) for idx in range(len(c)-1)] for a, b, c in zip(range(_lb_tnsr.size(0)), last_tkns, record_idx)])
+        #     # preds.append([flat_preds[a:b] for a, b in zip(range(_lb_tnsr.size(0)), last_tkns)])
+        #     # probs.append([flat_probs[a:b] for a, b in zip(range(_lb_tnsr.size(0)), last_tkns)])
+        # else:
+        trues.append(_lb_tnsr.view(_lb_tnsr.size(0), -1).numpy() if task_type == 'mltl-clf' else _lb_tnsr.view(-1).detach().cpu().numpy())
+        preds.append(pred.detach().cpu().numpy())
+        probs.append(prob.detach().cpu().numpy())
 
         all_logits.append(logits.view(_lb_tnsr.size(0), -1, logits.size(-1)).detach().cpu().numpy())
     total_loss = total_loss / (step + 1)
@@ -1560,9 +1666,17 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
 
     all_logits = np.concatenate(all_logits, axis=0)
     if task_type == 'nmt':
-        trues = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(trues))))
-        preds = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(preds))))
-        probs = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(probs))))
+        if (type(indices[0]) is str and SC in indices[0]):
+            # with open('test.pkl', 'wb') as fd:
+            #     pickle.dump((indices, trues, preds, probs), fd)
+            # indices = list(itertools.chain.from_iterable([list(idx.split(SC)) for idx in indices if idx]))
+            indices = [list(idx.split(SC)) for idx in indices if idx]
+            indices, preds, probs, trues = zip(*[(idx, pred, prob, true_lb) for bz_idx, bz_pred, bz_prob, bz_true in zip(indices, preds, probs, trues) for idx, pred, prob, true_lb in zip(*[bz_idx[:min(len(bz_idx), len(bz_pred))], bz_pred[:min(len(bz_idx), len(bz_pred))], bz_prob[:min(len(bz_idx), len(bz_prob))], bz_true[:min(len(bz_idx), len(bz_true))]])])
+            indices = map(int, indices) if indices[0].isdigit() else indices
+        else:
+            preds = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(preds))))
+            probs = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(probs))))
+            trues = list(itertools.chain.from_iterable(list(itertools.chain.from_iterable(trues))))
     else:
         trues = np.concatenate(trues, axis=0)
         preds = np.concatenate(preds, axis=0)
@@ -1597,8 +1711,7 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
         perf_df = pd.DataFrame(metrics.classification_report(trues, preds, labels=labels, target_names=[binlbr[x] for x in labels], output_dict=True)).T[['precision', 'recall', 'f1-score', 'support']]
     print('Results for %s dataset is:\n%s' % (ds_name.title(), perf_df))
     perf_df.to_excel('perf_%s.xlsx' % resf_prefix)
-    if (type(indices[0]) is str and SC in indices[0]):
-        indices = list(itertools.chain.from_iterable([list(map(int, idx.split(SC))) for idx in indices if idx]))
+
     try:
         dataset.dataset.fill_labels(preds, saved_path='pred_%s.csv' % resf_prefix, index=indices)
     except Exception as e:
@@ -1654,7 +1767,7 @@ def _handle_model(model, dev_id=None, distrb=False):
 
 
 def main():
-    if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'ddi', 'chemprot', 'i2b2', 'hoc', 'copd', 'phenochf', 'toxic', 'mednli', 'biosses', 'clnclsts', 'cncpt-ddi']):
+    if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'copd', 'phenochf', 'toxic', 'mednli', 'biosses', 'clnclsts', 'cncpt-ddi']):
         main_func = classify
     else:
         return
@@ -1713,13 +1826,14 @@ if __name__ == '__main__':
     op.add_option('--do_lastdrop', default=False, action='store_true', dest='do_lastdrop', help='whether to apply dropout to the last layer')
     op.add_option('--lm_loss', default=False, action='store_true', dest='lm_loss', help='whether to apply dropout to the last layer')
     op.add_option('--do_crf', default=False, action='store_true', dest='do_crf', help='whether to apply CRF layer')
-    # op.add_option('--elmohdim', default=0, action='store', type='int', dest='elmohdim', help='indicate the dimensions of the hidden layers in the ELMo-based classifier, 0 means using only one linear layer')
+    op.add_option('--do_thrshld', default=False, action='store_true', dest='do_thrshld', help='whether to apply ThresholdEstimator layer')
     op.add_option('--fchdim', default=0, action='store', type='int', dest='fchdim', help='indicate the dimensions of the hidden layers in the Embedding-based classifier, 0 means using only one linear layer')
     op.add_option('--bert_outlayer', default='-1', action='store', type='str', dest='output_layer', help='indicate which layer to be the output of BERT model')
     op.add_option('--pooler', dest='pooler', help='indicate the pooling strategy when selecting features: max or avg')
     op.add_option('--seq2seq', dest='seq2seq', help='indicate the seq2seq strategy when converting sequences of embeddings into a vector')
     op.add_option('--seq2vec', dest='seq2vec', help='indicate the seq2vec strategy when converting sequences of embeddings into a vector: pytorch-lstm, cnn, or cnn_highway')
     op.add_option('--ssfunc', dest='sentsim_func', help='indicate the sentence similarity metric')
+    op.add_option('--cnstrnts', dest='cnstrnts', help='indicate the constraint scheme')
     op.add_option('--lr', default=float(1e-3), action='store', type='float', dest='lr', help='indicate the learning rate of the optimizer')
     op.add_option('--wdecay', default=float(1e-5), action='store', type='float', dest='wdecay', help='indicate the weight decay of the optimizer')
     op.add_option('--lmcoef', default=0.5, action='store', type='float', dest='lmcoef', help='indicate the coefficient of the language model loss when fine tuning')
