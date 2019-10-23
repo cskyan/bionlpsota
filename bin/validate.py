@@ -305,7 +305,7 @@ class MaskedReduction(nn.Module):
 
 
 class BERTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
         super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
         self.lm_head = BertPreTrainingHeads(config, lm_model.embeddings.word_embeddings.weight)
         self.vocab_size = config.vocab_size
@@ -313,10 +313,12 @@ class BERTClfHead(BaseClfHead):
         self.n_embd = config.hidden_size
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         self.norm = NORM_TYPE_MAP[norm_type](self.maxlen) if self.task_type == 'nmt' else NORM_TYPE_MAP[norm_type](config.hidden_size)
-        self._int_actvtn = nn.ReLU
-        self._out_actvtn = nn.Sigmoid
-        self.linear = nn.Sequential(nn.Linear(config.hidden_size, num_lbs), nn.Sigmoid()) if task_type == 'sentsim' else nn.Linear(config.hidden_size, num_lbs)
-        # if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+        self._int_actvtn = ACTVTN_MAP[iactvtn]
+        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self.fchdim = fchdim
+        # self.linear = nn.Sequential(nn.Linear(config.hidden_size, num_lbs), nn.Sigmoid()) if task_type == 'sentsim' else nn.Linear(config.hidden_size, num_lbs)
+        self.linear = (nn.Sequential(nn.Linear(config.hidden_size, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(config.hidden_size, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(config.hidden_size, config.hidden_size), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(config.hidden_size, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(config.hidden_size, num_lbs))
+        if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
         if (initln): self.apply(self.lm_model.init_bert_weights)
         if (type(output_layer) is int):
             self.output_layer = output_layer if (output_layer >= -self.num_hidden_layers and output_layer < self.num_hidden_layers) else -1
@@ -350,25 +352,29 @@ class BERTClfHead(BaseClfHead):
 
 
 class GPTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         super(GPTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         if type(lm_model) is GPT2LMHeadModel:self.kwprop['past_paramname'] = 'past'
         self.vocab_size = config.vocab_size
         self.n_embd = config.n_embd
         self.norm = NORM_TYPE_MAP[norm_type](config.n_embd)
-        self._int_actvtn = nn.ReLU
-        self._out_actvtn = nn.Sigmoid
+        self._int_actvtn = ACTVTN_MAP[iactvtn]
+        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self.fchdim = fchdim
         self.linear = nn.Sequential(nn.Linear(config.n_embd, num_lbs), nn.Sigmoid()) if task_type == 'sentsim' else nn.Linear(config.n_embd, num_lbs)
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
 
 class TransformXLClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         super(TransformXLClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         self.kwprop['past_paramname'] = 'mems'
         self.vocab_size = config.n_token
         self.n_embd = config.d_embed
         self.norm = NORM_TYPE_MAP[norm_type](config.n_embd)
+        self._int_actvtn = ACTVTN_MAP[iactvtn]
+        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self.fchdim = fchdim
         self.linear = nn.Linear(config.d_embed, num_lbs)
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
@@ -1253,7 +1259,7 @@ ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode,
 LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec', 'elmo_sentvec':'elmo_sentvec', 'elmo_w2v_sentvec':'elmo_w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
 CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
-CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
@@ -1839,6 +1845,8 @@ if __name__ == '__main__':
     op.add_option('--do_crf', default=False, action='store_true', dest='do_crf', help='whether to apply CRF layer')
     op.add_option('--do_thrshld', default=False, action='store_true', dest='do_thrshld', help='whether to apply ThresholdEstimator layer')
     op.add_option('--fchdim', default=0, action='store', type='int', dest='fchdim', help='indicate the dimensions of the hidden layers in the Embedding-based classifier, 0 means using only one linear layer')
+    op.add_option('--iactvtn', default='relu', action='store', dest='iactvtn', help='indicate the internal activation function')
+    op.add_option('--oactvtn', default='sigmoid', action='store', dest='oactvtn', help='indicate the output activation function')
     op.add_option('--bert_outlayer', default='-1', action='store', type='str', dest='output_layer', help='indicate which layer to be the output of BERT model')
     op.add_option('--pooler', dest='pooler', help='indicate the pooling strategy when selecting features: max or avg')
     op.add_option('--seq2seq', dest='seq2seq', help='indicate the seq2seq strategy when converting sequences of embeddings into a vector')
