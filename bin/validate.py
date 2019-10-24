@@ -84,6 +84,9 @@ class BaseClfHead(nn.Module):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
+    def __init_linear__(self):
+        raise NotImplementedError
+
     def forward(self, input_ids, pool_idx, labels=None, past=None, weights=None, lm_logit_kwargs={}):
         use_gpu = next(self.parameters()).is_cuda
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
@@ -317,8 +320,8 @@ class BERTClfHead(BaseClfHead):
         self._out_actvtn = ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = config.hidden_size
-        # self.linear = nn.Sequential(nn.Linear(self.hdim, num_lbs), nn.Sigmoid()) if task_type == 'sentsim' else nn.Linear(self.hdim, num_lbs)
-        self.linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, num_lbs))
+        # self.linear = nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.task_type == 'sentsim' else nn.Linear(self.hdim, self.num_lbs)
+        self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
         if (initln): self.apply(self.lm_model.init_bert_weights)
         if (type(output_layer) is int):
@@ -327,6 +330,9 @@ class BERTClfHead(BaseClfHead):
             self.output_layer = [x for x in output_layer if (x >= -self.num_hidden_layers and x < self.num_hidden_layers)]
             self.layer_pooler = TransformerLayerMaxPool(kernel_size=self.num_hidden_layers) if layer_pooler == 'max' else TransformerLayerAvgPool(kernel_size=self.num_hidden_layers)
         if pooler is not None: self.pooler = MaskedReduction(reduction=pooler, dim=1)
+
+    def __init_linear__(self):
+        return (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
 
 
     def _clf_h(self, hidden_states, pool_idx, past=None):
@@ -363,8 +369,11 @@ class GPTClfHead(BaseClfHead):
         self._out_actvtn = ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = config.n_embd
-        self.linear = nn.Sequential(nn.Linear(self.hdim, num_lbs), nn.Sigmoid()) if task_type == 'sentsim' else nn.Linear(self.hdim, num_lbs)
+        self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+
+    def __init_linear__(self):
+        return nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.task_type == 'sentsim' else nn.Linear(self.hdim, self.num_lbs)
 
 
 class TransformXLClfHead(BaseClfHead):
@@ -378,8 +387,11 @@ class TransformXLClfHead(BaseClfHead):
         self._out_actvtn = ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = config.n_embd
-        self.linear = nn.Linear(self.hdim, num_lbs)
+        self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+
+    def __init_linear__(self):
+        return nn.Linear(self.hdim, self.num_lbs)
 
     def _lm_logit(self, input_ids, hidden_states, past=None, pool_idx=None, **kwargs):
         bsz, tgt_len = input_ids.size(0), input_ids.size(1)
@@ -655,8 +667,11 @@ class EmbeddingPool(EmbeddingClfHead):
             self.pooler = None
             self.norm = NORM_TYPE_MAP[norm_type](self.n_embd)
             self.hdim = self.n_embd
-        self.linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, num_lbs))
+        self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+
+    def __init_linear__(self):
+        return (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
         clf_h = super(EmbeddingPool, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights)
@@ -698,8 +713,11 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         self.norm = NORM_TYPE_MAP[norm_type](encoder_odim)
         self.hdim = self.dim_mulriple * encoder_odim if self.task_type in ['entlmnt', 'sentsim'] else encoder_odim
-        self.linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, num_lbs))
+        self.linear = self.__init_linear__()
         if (self.linear and initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+
+    def __init_linear__(self):
+        return (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
         clf_h, mask = super(EmbeddingSeq2Vec, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
@@ -734,8 +752,11 @@ class EmbeddingSeq2Seq(EmbeddingClfHead):
         self.norm = NORM_TYPE_MAP[norm_type](seqlen)
         # self.norm = nn.LayerNorm([128,2048])
         self.hdim = encoder_odim
-        self.linear = nn.Sequential(nn.Linear(self.hdim, fchdim), self._int_actvtn(), nn.Linear(fchdim, fchdim), self._int_actvtn(), nn.Linear(fchdim, num_lbs), self._out_actvtn()) if fchdim else nn.Sequential(nn.Linear(self.hdim, num_lbs), self._out_actvtn())
+        self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+
+    def __init_linear__(self):
+        return nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()) if self.fchdim else nn.Sequential(nn.Linear(self.hdim, self.num_lbs), self._out_actvtn())
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
         clf_h, mask = super(EmbeddingSeq2Seq, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
