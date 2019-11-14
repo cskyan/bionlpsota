@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 import numpy as np
 import scipy as sp
+from scipy.sparse import csc_matrix
 import pandas as pd
 
 import torch
@@ -23,6 +24,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import WeightedRandomSampler
+from torch.nn.parallel import replicate
 
 from sklearn import metrics
 
@@ -68,11 +70,106 @@ class MultiClfHead(nn.Module):
     def forward(self, hidden_states):
         return torch.cat([lnr(hidden_states) for lnr in self.linears], dim=-1)
 
+    def to(self, *args, **kwargs):
+        super(MultiClfHead, self).to(*args, **kwargs)
+        self.linears = [lnr.to(*args, **kwargs) for lnr in self.linears]
+        return self
+
+class SiameseRankHead(nn.Module):
+    def __init__(self, linear, siamese_linear, binlbr, tokenizer, encode_func, trnsfm, special_tknids_args, pad_val, base_model, thrshld_lnr=0.5, thrshld_sim=0.5, topk=None, num_sampling_note=1, lbnotes='lbnotes.csv'):
+        super(SiameseRankHead, self).__init__()
+        self.linear = linear
+        self.siamese_linear = siamese_linear
+        self.base_model = dict(zip(['model', 'tokenizer', 'encode_func', 'special_tknids_args', 'pad_val', 'transforms', 'transforms_args', 'transforms_kwargs'], [base_model, tokenizer, encode_func, special_tknids_args, pad_val]+trnsfm))
+        self.binlbr = binlbr
+        self.thrshld_lnr = thrshld_lnr
+        self.thrshld_sim = thrshld_sim
+        self.topk = topk
+        self.num_sampling_note = num_sampling_note
+        self.lbnotes = lbnotes if type(lbnotes) is pd.DataFrame else pd.read_csv(lbnotes, sep='\t', index_col='id', encoding='utf-8')
+
+    def forward(self, hidden_states):
+        # generate candidates with linear and rank the candidates with siamese_linear
+        use_gpu = next(self.parameters()).is_cuda
+        batch_size = 125
+        logits = self.linear(hidden_states)
+        prob = torch.sigmoid(logits)
+        if self.topk:
+            topk, topk_indices = torch.topk(prob.data, self.topk)
+            prob_topk = torch.zeros(prob.size(), dtype=topk.dtype).scatter_(1, topk_indices.cpu(), topk.cpu())
+            pred = (prob_topk > self.thrshld_lnr).int()
+        else:
+            pred = (prob.data > self.thrshld_lnr).int()
+        pred_csc = csc_matrix(pred.cpu().numpy())
+        pred_scores = [[] for x in range(len(pred_csc.data))]
+        labels = [self.binlbr[i] for i in range(len(self.binlbr))]
+        num_notes = np.array([min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0]) if lb in self.lbnotes.index else 0 for lb in labels])
+        num_samps = pred_csc.indptr[1:] - pred_csc.indptr[:-1]
+        total_num_notes, total_num_pairs = sum(num_notes), sum(num_samps * num_notes)
+        def gen_samples():
+            for i, lb in enumerate(labels):
+                for note in self.lbnotes.loc[lb]['text'].sample(n=min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0])) if lb in self.lbnotes.index else []:
+                    tkns = self._transform_chain((self.base_model['encode_func'](note, self.base_model['tokenizer']), None), self.base_model['transforms'], self.base_model['transforms_args'], self.base_model['transforms_kwargs'])[0]
+                    yield tkns, i, pred_csc.indices[pred_csc.indptr[i]:pred_csc.indptr[i+1]]
+        def gen_pairs():
+            batch_tkns, lb_indices, orig_indices = [[] for x in range(3)]
+            for i, (x, lbidx, orig_idx) in enumerate(gen_samples()):
+                batch_tkns.append(x)
+                lb_indices.append(lbidx)
+                orig_indices.append(orig_idx)
+                if i > 0 and i % batch_size == 0 or i == total_num_notes - 1:
+                    clf_tknids = self.base_model['special_tknids_args']['clf_tknids']
+                    tkns_tnsr = torch.tensor(batch_tkns, dtype=torch.long).to('cuda') if use_gpu else torch.tensor(batch_tkns, dtype=torch.long)
+                    mask_tnsr = (~tkns_tnsr.eq(self.base_model['pad_val'] * torch.ones_like(tkns_tnsr))).long()
+                    pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+                    note_clf_h = self.base_model['model'](tkns_tnsr, mask_tnsr if type(self.base_model['model']) is BERTClfHead else pool_idx, embedding_mode=True)
+                    # note_clf_h = hidden_states[:1]
+                    for j, clf_h in enumerate(note_clf_h):
+                        for orig_id in orig_indices[j]:
+                            yield clf_h, hidden_states[orig_id], lb_indices[j], orig_id
+                    batch_tkns, lb_indices, orig_indices = [[] for x in range(3)]
+        batch_pairs, indices = [[] for x in range(2)]
+        for i, (h1, h2, lbidx, orig_id) in enumerate(tqdm(gen_pairs(), desc='[%i pair(s)] Siamese similarity ranking' % (total_num_pairs))):
+            batch_pairs.append([h1, h2])
+            indices.append([lbidx, orig_id])
+            if i > 0 and i % batch_size == 0 or i == total_num_pairs - 1:
+                clf_h = [torch.stack(x) for x in zip(*batch_pairs)]
+                continue
+                if (self.base_model['model'].task_params.setdefault('sentsim_func', None) is None or self.base_model['model'].task_params['sentsim_func'] == 'concat'):
+                    clf_h = torch.cat(clf_h, dim=-1)
+                    sim_logits = self.siamese_linear(clf_h) if self.siamese_linear else clf_h
+                else:
+                    sim_logits = F.pairwise_distance(self.siamese_linear(clf_h[0]), self.siamese_linear(clf_h[1]), 2, eps=1e-12) if self.base_model['model'].task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.siamese_linear(clf_h[0]), self.siamese_linear(clf_h[1]), dim=1, eps=1e-12)
+                sim_probs = torch.sigmoid(sim_logits).data
+                for idx, sim_prob in zip(indices, sim_probs):
+                    orig_idx = pred_csc.indptr[idx[0]], pred_csc.indptr[idx[0]+1]
+                    pred_scores[orig_idx[0]:orig_idx[1]][np.where(pred_csc.indices[orig_idx[0]:orig_idx[1]]==idx[1])[0][0]].append(sim_prob.cpu().numpy())
+                batch_pairs, indices = [[] for x in range(2)]
+        pred_scores = [np.mean(x) for x in pred_scores]
+        sim_probs_tnsr = torch.tensor(csc_matrix((pred_scores, pred_csc.indices, pred_csc.indptr), shape=pred_csc.shape).todense(), dtype=torch.float)
+        if use_gpu: sim_probs_tnsr = sim_probs_tnsr.to('cuda')
+        logits = sim_probs_tnsr * prob
+        return logits
+
+    def to(self, *args, **kwargs):
+        super(SiameseRankHead, self).to(*args, **kwargs)
+        self.linear = self.linear.to(*args, **kwargs)
+        return self
+
+    def _transform_chain(self, sample, transforms, transforms_args={}, transforms_kwargs={}):
+        if transforms:
+            transforms = transforms if type(transforms) is list else [transforms]
+            transforms_kwargs = transforms_kwargs if type(transforms_kwargs) is list else [transforms_kwargs]
+            for transform, transform_kwargs in zip(transforms, transforms_kwargs):
+                transform_kwargs.update(transforms_args)
+                sample = transform(sample, **transform_kwargs) if callable(transform) else getattr(self, transform)(sample, **transform_kwargs)
+        return sample
+
 
 class BaseClfHead(nn.Module):
     """ Classifier Head for the Basic Language Model """
 
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
         super(BaseClfHead, self).__init__()
         self.task_params = task_params
         self.lm_model = lm_model
@@ -89,14 +186,20 @@ class BaseClfHead(nn.Module):
         self.lm_logit = self._mlt_lm_logit if mlt_trnsfmr else self._lm_logit
         self.clf_h = self._mlt_clf_h if mlt_trnsfmr else self._clf_h
         self.num_lbs = num_lbs
+        self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
         self.kwprop = {}
+        self.binlb = binlb
+        self.global_binlb = copy.deepcopy(binlb)
+        self.binlbr = binlbr
+        self.global_binlbr = copy.deepcopy(binlbr)
         for k, v in kwargs.items():
             setattr(self, k, v)
+        self.mode = 'clf'
 
     def __init_linear__(self):
         raise NotImplementedError
 
-    def forward(self, input_ids, pool_idx, labels=None, past=None, weights=None, lm_logit_kwargs={}):
+    def forward(self, input_ids, pool_idx, labels=None, past=None, weights=None, embedding_mode=False, lm_logit_kwargs={}):
         use_gpu = next(self.parameters()).is_cuda
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
         trnsfm_output = self.transformer(input_ids, pool_idx=pool_idx)
@@ -117,14 +220,24 @@ class BaseClfHead(nn.Module):
             else:
                 clf_h = clf_h
         elif hasattr(self.lm_model, 'pooler'):
-            if (hasattr(self, 'pooler')):
-                if (hasattr(self, 'layer_pooler')):
-                    lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
-                    clf_h = self.layer_pooler(lyr_h).view(lyr_h[0].size())
+            if self.task_type in ['entlmnt', 'sentsim']:
+                if (hasattr(self, 'pooler')):
+                    if (hasattr(self, 'layer_pooler')):
+                        lyr_h = [[self.pooler(h, pool_idx[x]) for h in clf_h[x]] for x in [0,1]]
+                        clf_h = [self.layer_pooler(lyr_h[x]).view(lyr_h[x][0].size()) for x in [0,1]]
+                    else:
+                        clf_h = [self.pooler(clf_h[x], pool_idx[x]) for x in [0,1]]
                 else:
-                    clf_h = self.pooler(clf_h, pool_idx)
+                    clf_h = [self.lm_model.pooler(clf_h[x]) for x in [0,1]]
             else:
-                clf_h = self.lm_model.pooler(clf_h)
+                if (hasattr(self, 'pooler')):
+                    if (hasattr(self, 'layer_pooler')):
+                        lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
+                        clf_h = self.layer_pooler(lyr_h).view(lyr_h[0].size())
+                    else:
+                        clf_h = self.pooler(clf_h, pool_idx)
+                else:
+                    clf_h = self.lm_model.pooler(clf_h)
         else:
             pool_idx = pool_idx.to('cuda') if (use_gpu) else pool_idx
             smp_offset = torch.arange(input_ids.size(0))
@@ -136,6 +249,7 @@ class BaseClfHead(nn.Module):
         if self.task_type in ['entlmnt', 'sentsim']:
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
+            if embedding_mode: return clf_h
             if (self.task_type == 'entlmnt' or self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat'):
                 # clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
                 clf_h = torch.cat(clf_h, dim=-1)
@@ -146,7 +260,9 @@ class BaseClfHead(nn.Module):
             if self.do_norm: clf_h = self.norm(clf_h)
             # print(('before dropout:', clf_h))
             clf_h = self.dropout(clf_h)
+            if embedding_mode: return clf_h
             # print(('after dropout:', clf_h))
+            # print(('linear', self.linear, len(self.binlb), len(self.global_binlb)))
             clf_logits = self.linear(clf_h.view(-1, self.n_embd) if self.task_type == 'nmt' else clf_h)
             # print(('after linear:', clf_logits))
         if self.thrshlder: self.thrshld = self.thrshlder(clf_h)
@@ -165,7 +281,6 @@ class BaseClfHead(nn.Module):
             for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
             if (self.task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != self.task_params['ymode']): return 1 - clf_logits.view(-1, self.num_lbs)
             return clf_logits.view(-1, self.num_lbs)
-        # print(clf_logits.size())
         # print((labels.max(), labels.size()))
         if self.crf:
             clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), pool_idx)
@@ -176,7 +291,7 @@ class BaseClfHead(nn.Module):
             loss_func = nn.CrossEntropyLoss(weight=weights, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1))
         elif self.task_type == 'mltl-clf':
-            loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights, reduction='none')
+            loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
             loss_func = ContrastiveLoss(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
@@ -217,24 +332,78 @@ class BaseClfHead(nn.Module):
     def to(self, *args, **kwargs):
         super(BaseClfHead, self).to(*args, **kwargs)
         self.constraints = [cnstrnt.to(*args, **kwargs) for cnstrnt in self.constraints]
+        if hasattr(self, 'linears'): self.linears = [lnr.to(*args, **kwargs) for lnr in self.linears]
         return self
 
     def add_linear(self, num_lbs, idx=0):
+        use_gpu = next(self.parameters()).is_cuda
         self.num_lbs = num_lbs
         self._total_num_lbs = num_lbs if idx==0 else self._total_num_lbs + num_lbs
         self.linear = self.__init_linear__()
         if not hasattr(self, 'linears'): self.linears = []
         self.linears.append(self.linear)
 
-    def merge_linear(self):
-        use_gpu = next(self.parameters()).is_cuda
-        self.linear = MultiClfHead(self.linears)
-        self.linear = self.linear.to('cuda') if use_gpu else self.linear
-        self.num_lbs = self._total_num_lbs
+    def _update_global_binlb(self, binlb):
+        if not hasattr(self, 'global_binlb'): setattr(self, 'global_binlb', copy.deepcopy(binlb))
+        if not hasattr(self, 'global_binlbr'): setattr(self, 'global_binlbr', dict([(v, k) for k, v in binlb.items()]))
+        new_lbs = [lb for lb in binlb.keys() if lb not in self.global_binlb]
+        self.global_binlb.update(dict([(k, i) for i, k in zip(range(len(self.global_binlb), len(self.global_binlb)+len(new_lbs)), new_lbs)]))
+        self.global_binlbr = dict([(v, k) for k, v in self.global_binlb.items()])
 
-    def to_siamese(self):
+    def reset_global_binlb(self):
+        delattr(self, 'global_binlb')
+        delattr(self, 'global_binlbr')
+
+    def get_linear(self, binlb, idx=0):
+        use_gpu = next(self.parameters()).is_cuda
+        self.num_lbs = len(binlb)
+        self.binlb = binlb
+        self.binlbr = dict([(v, k) for k, v in self.binlb.items()])
+        self._update_global_binlb(binlb)
+        self._total_num_lbs = len(self.global_binlb)
+        if not hasattr(self, 'linears'): self.linears = []
+        if len(self.linears) <= idx:
+            self.linear = self.__init_linear__()
+            self.linears.append(self.linear)
+            return self.linears[-1]
+        else:
+            self.linear = self.linears[idx]
+            return self.linears[idx]
+
+    def merge_linear(self, num_linear=-1):
+        use_gpu = next(self.parameters()).is_cuda
+        self.linear = MultiClfHead(self.linears if num_linear <=0 else self.linears[:num_linear])
+        # self.linear = self.linear.to('cuda') if use_gpu else self.linear
+        # self.linear = _handle_model(self.linear)
+        self.num_lbs = self._total_num_lbs
+        self.binlb = self.global_binlb
+        self.binlbr = self.global_binlb
+
+    def to_siamese(self, from_scratch=False):
+        self.clf_task_type = self.task_type
         self.task_type = 'sentsim'
-        self.linear = self.__init_linear__()
+        self.num_lbs = 1
+        self.dim_mulriple = 2
+        self.clf_linear = self.linear
+        self.linear = self.siamese_linear if hasattr(self, 'siamese_linear') and not from_scratch else self.__init_linear__()
+        self.mode = 'siamese'
+
+    def to_clf(self, from_scratch=False):
+        self.task_type = self.clf_task_type
+        if self.mode == 'siamese':
+            self.dim_mulriple = 1
+            self.siamese_linear = self.linear
+        else:
+            self.prv_linear = self.linear
+        self.linear = self.clf_linear if hasattr(self, 'clf_linear') and not from_scratch else self.__init_linear__()
+        self.mode = 'clf'
+
+    def merge_siamese(self, tokenizer, encode_func, trnsfm, special_tknids_args, pad_val=0, thrshld_lnr=0.5, thrshld_sim=0.5, topk=None, lbnotes='lbnotes.csv'):
+        use_gpu = next(self.parameters()).is_cuda
+        self.task_type = self.clf_task_type
+        self.linear = SiameseRankHead(self.clf_linear, self.linear, self.binlbr, tokenizer=tokenizer, encode_func=encode_func, trnsfm=trnsfm, special_tknids_args=special_tknids_args, pad_val=pad_val, base_model=self, thrshld_lnr=thrshld_lnr, thrshld_sim=thrshld_sim, topk=topk, lbnotes=lbnotes)
+        self.linear = self.linear.to('cuda') if use_gpu else self.linear
+        self.mode = 'clf'
 
 
 class ThresholdEstimator(nn.Module):
@@ -306,6 +475,13 @@ class MaskedReduction(nn.Module):
         self.dim = dim
 
     def forward(self, hidden_states, mask):
+        if type(hidden_states) is list and len(hidden_states) == 2:
+            return [self._forward(hidden_states[x], mask[x]) for x in [0,1]]
+        else:
+            return self._forward(hidden_states, mask)
+
+
+    def _forward(self, hidden_states, mask):
         hidden_states_size, mask_size = hidden_states.size(), mask.size()
         missed_dim = hidden_states_size[len(mask_size):]
         for x, d in zip(missed_dim, range(len(mask_size), len(hidden_states_size))):
@@ -355,10 +531,13 @@ class BERTClfHead(BaseClfHead):
         else:
             self.output_layer = [x for x in output_layer if (x >= -self.num_hidden_layers and x < self.num_hidden_layers)]
             self.layer_pooler = TransformerLayerMaxPool(kernel_size=self.num_hidden_layers) if layer_pooler == 'max' else TransformerLayerAvgPool(kernel_size=self.num_hidden_layers)
-        if pooler is not None: self.pooler = MaskedReduction(reduction=pooler, dim=1)
+        if pooler is not None:
+            self.pooler = MaskedReduction(reduction=pooler, dim=1)
+            self.hdim = self.dim_mulriple * self.n_embd if self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
 
     def __init_linear__(self):
         use_gpu = next(self.parameters()).is_cuda
+        self.hdim = self.dim_mulriple * self.n_embd if self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
         linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
         return linear.to('cuda') if use_gpu else linear
 
@@ -371,7 +550,11 @@ class BERTClfHead(BaseClfHead):
         if self.task_type in ['entlmnt', 'sentsim']:
             # mask = [torch.arange(input_ids[x].size()[1]).to('cuda').unsqueeze(0).expand(input_ids[x].size()[:2]) <= pool_idx[x].unsqueeze(1).expand(input_ids[x].size()[:2]) if use_gpu else torch.arange(input_ids[x].size()[1]).unsqueeze(0).expand(input_ids[x].size()[:2]) <= pool_idx[x].unsqueeze(1).expand(input_ids[x].size()[:2]) for x in [0,1]]
             segment_ids = [torch.zeros_like(input_ids[0]).to('cuda'), torch.ones_like(input_ids[1]).to('cuda')] if use_gpu else [torch.zeros_like(input_ids[0]), torch.ones_like(input_ids[1])]
-            return [self.lm_model.forward(input_ids=input_ids[x], token_type_ids=segment_ids[x], attention_mask=pool_idx[x], output_all_encoded_layers=False) for x in [0,1]]
+            if (self.output_layer == -1 or self.output_layer == 11):
+                return [self.lm_model.forward(input_ids=input_ids[x], token_type_ids=segment_ids[x], attention_mask=pool_idx[x], output_all_encoded_layers=False) for x in [0,1]]
+            else:
+                all_encoder_layers, pooled_output = zip(*[self.lm_model.forward(input_ids=input_ids[x], token_type_ids=segment_ids[x], attention_mask=pool_idx[x], output_all_encoded_layers=True) for x in [0,1]])
+                return [all_encoder_layers[x][self.output_layer] for x in [0,1]] if type(self.output_layer) is int else [[all_encoder_layers[x][l] for l in self.output_layer] for x in [0,1]], pooled_output
         else:
             # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
             segment_ids = torch.zeros_like(input_ids).to('cuda') if use_gpu else torch.zeros_like(input_ids)
@@ -576,7 +759,6 @@ class TransformXLClfHead(BaseClfHead):
 class EmbeddingClfHead(BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         super(EmbeddingClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
-        self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
         self.embed_type = embed_type
         if embed_type.startswith('w2v'):
             from gensim.models import KeyedVectors
@@ -586,7 +768,6 @@ class EmbeddingClfHead(BaseClfHead):
             self.n_embd = self.w2v_model.syn0.shape[1] + (self.n_embd if hasattr(self, 'n_embd') else 0)
         elif embed_type.startswith('elmo'):
             self.vocab_size = 793471
-            self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
             self.n_embd = config['elmoedim'] * 2 + (self.n_embd if hasattr(self, 'n_embd') else 0) # two ELMo layer * ELMo embedding dimensions
         elif embed_type.startswith('elmo_w2v'):
             from gensim.models import KeyedVectors
@@ -594,7 +775,6 @@ class EmbeddingClfHead(BaseClfHead):
             self.w2v_model = w2v_path if type(w2v_path) is Word2VecKeyedVectors else (KeyedVectors.load(w2v_path, mmap='r') if w2v_path and os.path.isfile(w2v_path) else None)
             assert(self.w2v_model)
             self.vocab_size = 793471
-            self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat')) else 1 # two or one sentence
             self.n_embd = self.w2v_model.syn0.shape[1] + config['elmoedim'] * 2 + (self.n_embd if hasattr(self, 'n_embd') else 0)
         self._int_actvtn = ACTVTN_MAP[iactvtn]
         self._out_actvtn = ACTVTN_MAP[oactvtn]
@@ -670,7 +850,7 @@ class EmbeddingClfHead(BaseClfHead):
             loss_func = nn.CrossEntropyLoss(weight=weights, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1))
         elif self.task_type == 'mltl-clf':
-            loss_func = nn.BCEWithLogitsLoss(pos_weight=weights, reduction='none')
+            loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
             loss_func = ContrastiveLoss(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
@@ -699,7 +879,9 @@ class EmbeddingPool(EmbeddingClfHead):
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
     def __init_linear__(self):
-        return (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
+        use_gpu = next(self.parameters()).is_cuda
+        linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
+        return linear.to('cuda') if use_gpu else linear
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
         clf_h = super(EmbeddingPool, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights)
@@ -745,7 +927,9 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
         if (self.linear and initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
     def __init_linear__(self):
-        return (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
+        use_gpu = next(self.parameters()).is_cuda
+        linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
+        return linear.to('cuda') if use_gpu else linear
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
         clf_h, mask = super(EmbeddingSeq2Vec, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
@@ -784,7 +968,9 @@ class EmbeddingSeq2Seq(EmbeddingClfHead):
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
     def __init_linear__(self):
-        return nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()) if self.fchdim else nn.Sequential(nn.Linear(self.hdim, self.num_lbs), self._out_actvtn())
+        use_gpu = next(self.parameters()).is_cuda
+        linear = nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()) if self.fchdim else nn.Sequential(nn.Linear(self.hdim, self.num_lbs), self._out_actvtn())
+        return linear.to('cuda') if use_gpu else linear
 
     def forward(self, input_ids, pool_idx, w2v_ids=None, labels=None, past=None, weights=None):
         clf_h, mask = super(EmbeddingSeq2Seq, self).forward(input_ids, pool_idx, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
@@ -879,7 +1065,8 @@ class BaseDataset(Dataset):
     def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, **kwargs):
         self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
-        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
         self.df.columns = self.df.columns.astype(str, copy=False)
         self.df = self.df[self.df[self.label_col].notnull()]
         self.mltl = mltl
@@ -1105,22 +1292,31 @@ class MaskedLMDataset(BaseDataset):
         return self._ds.__len__()
 
     def __getitem__(self, idx):
-        # record = self.df.iloc[idx]
-        # sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
-        # sample = self._transform_chain(sample)
         orig_sample = self._ds[idx]
         sample = orig_sample[1], orig_sample[2]
         masked_lm_ids = np.array(sample[0])
         pad_trnsfm_idx = self.transforms.index(_pad_transform) if len(self.transforms) > 0 and _pad_transform in self.transforms else -1
         pad_trnsfm_kwargs = self.transforms_kwargs[pad_trnsfm_idx] if pad_trnsfm_idx and pad_trnsfm_idx in self.transforms_kwargs > -1 else {}
-        masked_lm_lbs = np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0]])
-        valid_idx = np.where(masked_lm_lbs > -1)[0]
-        cand_samp_idx = random.sample(range(len(valid_idx)), min(opts.maxlen, max(1, int(round(len(valid_idx) * self.masked_lm_prob)))))
-        cand_idx = valid_idx[cand_samp_idx]
-        rndm = np.random.uniform(low=0, high=1, size=(len(cand_idx),))
-        masked_lm_ids[cand_idx[rndm < 0.8]] = self.special_tknids[-1]
-        masked_lm_ids[cand_idx[rndm >= 0.9]] = random.randrange(0, self.vocab_size)
-        masked_lm_lbs[list(filter(lambda x: x not in cand_idx, range(len(masked_lm_lbs))))] = -1
+        if type(self._ds) is SentSimDataset:
+            masked_lm_lbs = [np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0][X]]) for X in [0,1]]
+            valid_idx = [np.where(masked_lm_lbs[x] > -1)[0] for x in [0,1]]
+            cand_samp_idx = [random.sample(range(len(valid_idx[x])), min(opts.maxlen, max(1, int(round(len(valid_idx[x]) * self.masked_lm_prob))))) for x in [0,1]]
+            cand_idx = [valid_idx[x][cand_samp_idx[x]] for x in [0,1]]
+            rndm = [np.random.uniform(low=0, high=1, size=(len(cand_idx[x]),)) for x in [0,1]]
+            for x in [0,1]:
+                masked_lm_ids[x][cand_idx[x][rndm[x] < 0.8]] = self.special_tknids[-1]
+                masked_lm_ids[x][cand_idx[x][rndm[x] >= 0.9]] = random.randrange(0, self.vocab_size)
+            for X in [0,1]:
+                masked_lm_lbs[X][list(filter(lambda x: x not in cand_idx[X], range(len(masked_lm_lbs[X]))))] = -1
+        else:
+            masked_lm_lbs = np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0]])
+            valid_idx = np.where(masked_lm_lbs > -1)[0]
+            cand_samp_idx = random.sample(range(len(valid_idx)), min(opts.maxlen, max(1, int(round(len(valid_idx) * self.masked_lm_prob)))))
+            cand_idx = valid_idx[cand_samp_idx]
+            rndm = np.random.uniform(low=0, high=1, size=(len(cand_idx),))
+            masked_lm_ids[cand_idx[rndm < 0.8]] = self.special_tknids[-1]
+            masked_lm_ids[cand_idx[rndm >= 0.9]] = random.randrange(0, self.vocab_size)
+            masked_lm_lbs[list(filter(lambda x: x not in cand_idx, range(len(masked_lm_lbs))))] = -1
         return orig_sample + (torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs))
         # return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs)
 
@@ -1143,54 +1339,62 @@ class ConceptREDataset(BaseDataset):
         return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(cncpt_ids)
 
 
-def _sentclf_transform(sample, options=None, start_tknids=[], clf_tknids=[]):
+def _sentclf_transform(sample, options=None, seqlen=32, start_tknids=[], clf_tknids=[], **kwargs):
     X, y = sample
     X = [start_tknids + x + clf_tknids for x in X] if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else start_tknids + X + clf_tknids
     return X, y
 
 
-def _entlmnt_transform(sample, options=None, start_tknids=[], clf_tknids=[], delim_tknids=[]):
+def _entlmnt_transform(sample, options=None, seqlen=32, start_tknids=[], clf_tknids=[], delim_tknids=[], **kwargs):
     X, y = sample
+    trim_len = int(np.ceil((sum([len(v) for v in [start_tknids, X[0], delim_tknids, X[1], clf_tknids]]) - seqlen) / 2.0))
+    X = [x[:len(x)-trim_len] for x in X]
     X = start_tknids + X[0] + delim_tknids + X[1] + clf_tknids
     return X, y
 
 
-def _sentsim_transform(sample, options=None, start_tknids=[], clf_tknids=[], delim_tknids=[]):
+def _sentsim_transform(sample, options=None, seqlen=32, start_tknids=[], clf_tknids=[], delim_tknids=[], **kwargs):
     X, y = sample
+    trim_len = int(np.ceil((sum([len(v) for v in [start_tknids, X[0], delim_tknids, X[1], clf_tknids]]) - seqlen) / 2.0))
+    X = [x[:len(x)-trim_len] for x in X]
     X = [start_tknids + X[0] + delim_tknids + X[1] + clf_tknids, start_tknids + X[1] + delim_tknids + X[0] + clf_tknids]
     return X, y
 
 
-def _padtrim_transform(sample, options=None, seqlen=32, xpad_val=0, ypad_val=None):
+def _padtrim_transform(sample, options=None, seqlen=32, xpad_val=0, ypad_val=None, **kwargs):
     X, y = sample
     X = [x[:min(seqlen, len(x))] + [xpad_val] * (seqlen - len(x)) for x in X] if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else X[:min(seqlen, len(X))] + [xpad_val] * (seqlen - len(X))
     num_trim_delta = len([1 for x in X if seqlen > len(x)]) if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else 1 if seqlen > len(X) else 0
-    if num_trim_delta > 0:
-        global NUM_TRIM
-        NUM_TRIM += num_trim_delta
-        if NUM_TRIM % 100 == 0: print('Triming too much sentences! Please consider using a larger maxlen parameter!')
+    # if num_trim_delta > 0:
+    #     global NUM_TRIM
+    #     NUM_TRIM += num_trim_delta
+    #     if NUM_TRIM % 100 == 0: print('Triming too much sentences! Please consider using a larger maxlen parameter!')
     if ypad_val is not None: y = [x[:min(seqlen, len(x))] + [ypad_val] * (seqlen - len(x)) for x in y] if hasattr(y, '__iter__') and len(y) > 0 and type(y[0]) is not str and hasattr(y[0], '__iter__') else y[:min(seqlen, len(y))] + [ypad_val] * (seqlen - len(y))
     return X, y
 
 
-def _trim_transform(sample, options=None, seqlen=32, trimlbs=False, special_tkns={}):
+def _trim_transform(sample, options=None, seqlen=32, trimlbs=False, special_tkns={}, **kwargs):
     seqlen -= sum([len(v) for v in special_tkns.values()])
     X, y = sample
     X = [x[:min(seqlen, len(x))] for x in X] if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else X[:min(seqlen, len(X))]
-    num_trim_delta = len([1 for x in X if seqlen > len(x)]) if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else 1 if seqlen > len(X) else 0
-    if num_trim_delta > 0:
-        global NUM_TRIM
-        NUM_TRIM += num_trim_delta
-        if NUM_TRIM % 100 == 0: print('Triming too much sentences! Please consider using a larger maxlen parameter!')
+    # num_trim_delta = len([1 for x in X if seqlen > len(x)]) if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else 1 if seqlen > len(X) else 0
+    # if num_trim_delta > 0:
+    #     global NUM_TRIM
+    #     NUM_TRIM += num_trim_delta
+    #     if NUM_TRIM % 100 == 0: print('Triming too much sentences! Please consider using a larger maxlen parameter!')
     if trimlbs: y = [x[:min(seqlen, len(x))] for x in y] if hasattr(y, '__iter__') and len(y) > 0 and type(y[0]) is not str and hasattr(y[0], '__iter__') else y[:min(seqlen, len(y))]
     return X, y
 
 
-def _pad_transform(sample, options=None, seqlen=32, xpad_val=0, ypad_val=None):
+def _pad_transform(sample, options=None, seqlen=32, xpad_val=0, ypad_val=None, **kwargs):
     X, y = sample
     X = [x + [xpad_val] * (seqlen - len(x)) for x in X] if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else X + [xpad_val] * (seqlen - len(X))
     if ypad_val is not None: y = [x + [ypad_val] * (seqlen - len(x)) for x in y] if hasattr(y, '__iter__') and len(y) > 0 and type(y[0]) is not str and hasattr(y[0], '__iter__') else y + [ypad_val] * (seqlen - len(y))
     return X, y
+
+
+def _dummy_trsfm(sample, **kwargs):
+    return sample
 
 
 def _adjust_encoder(mdl_name, tokenizer, extra_tokens=[], ret_list=False):
@@ -1299,14 +1503,14 @@ def _weights_init(mean=0., std=0.02):
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
     return {'options_file':options_path, 'weight_file':weights_path, 'num_output_representations':2, 'elmoedim':elmoedim, 'dropout':dropout}
 
-TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
-TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
-TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
-TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
+TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'meshpubs_siamese':'sentsim', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
+TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs.smallfull', 'meshpubs_siamese':'meshpubs', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
+TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'meshpubs_siamese':SentSimDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
+TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
-TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
-TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'maxlen':128}}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':128}}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
+TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _dummy_trsfm, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':512}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'maxlen':128}}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':128}}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
@@ -1414,7 +1618,7 @@ def gen_mdl(mdl_name, pretrained=True, use_gpu=False, distrb=False, dev_id=None)
             print(e)
             print('Cannot find the pretrained model file, using online model instead.')
             model = LM_MODEL_MAP[mdl_name].from_pretrained(LM_MDL_NAME_MAP[mdl_name])
-    if (use_gpu): model = _handle_model(model, dev_id=dev_id, distrb=distrb)
+    if (use_gpu): model = model.to('cuda')
     return model
 
 
@@ -1429,7 +1633,7 @@ def gen_clf(mdl_name, encoder='pool', constraints=[], use_gpu=False, distrb=Fals
 
     lvar = locals()
     for x in constraints:
-        cnstrnt_cls, cnstrnt_params = copy.deepcopy(CNSTRNTS_MAP[x])
+        cnstrnt_cls, cnstrnt_params = copy.deepcopy.deepcopy(CNSTRNTS_MAP[x])
         constraint_params = pr('Constraint', CNSTRNT_PARAMS_MAP[x])
         cnstrnt_params.update(dict([((k, p), constraint_params[p]) for k, p in cnstrnt_params.keys() if p in constraint_params]))
         cnstrnt_params.update(dict([((k, p), kwargs[p]) for k, p in cnstrnt_params.keys() if p in kwargs]))
@@ -1437,11 +1641,12 @@ def gen_clf(mdl_name, encoder='pool', constraints=[], use_gpu=False, distrb=Fals
         kwargs.setdefault('constraints', []).append((cnstrnt_cls, dict([(k, v) for (k, p), v in cnstrnt_params.items()])))
 
     clf = CLF_MAP['embed'][encoder](**kwargs) if opts.model in LM_EMBED_MDL_MAP else CLF_MAP[opts.model](**kwargs)
-    if use_gpu: clf.to('cuda')
+    if use_gpu: clf = _handle_model(clf, dev_id=dev_id, distrb=distrb)
     return clf
 
 
 def classify(dev_id=None):
+    # Prepare model related meta data
     mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
@@ -1450,16 +1655,17 @@ def classify(dev_id=None):
     encode_func = ENCODE_FUNC_MAP[mdl_name]
     tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
     task_type = TASK_TYPE_MAP[opts.task]
-    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
     special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
     special_tknids_args = dict(zip(special_tkns[0], special_tknids))
-
-    # Prepare data
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('seqlen',opts.maxlen)])
+    # Prepare task related meta data.
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
-    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, special_tknids_args, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
     ds_kwargs = {'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')} if task_type=='nmt' else {}
 
+    # Prepare data
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
@@ -1478,6 +1684,7 @@ def classify(dev_id=None):
     else:
         class_weights = torch.Tensor(1.0 / class_count)
         class_weights /= class_weights.sum()
+        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
@@ -1491,8 +1698,11 @@ def classify(dev_id=None):
 
     if (opts.resume):
         # Load model
-        clf = load_model(opts.resume)
+        clf, optimizer, resume, chckpnt = load_model(opts.resume)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
+        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
+        print(optimizer)
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
@@ -1506,7 +1716,7 @@ def classify(dev_id=None):
         print(optimizer)
 
         # Training
-        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
 
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
@@ -1514,15 +1724,20 @@ def classify(dev_id=None):
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
 
 
-def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None):
+def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, resume={}, chckpnt_kwargs={}):
     clf_tknids = special_tkns['clf_tknids']
     earlystoper, clf_kwargs = EarlyStopping(mode='min', min_delta=earlystop_delta, patience=earlystop_patience), {}
     clf.train()
     clf.unfreeze_lm()
-    for epoch in range(epochs):
+    killer = system.GracefulKiller()
+    in_wrapper = type(clf) is DataParallel
+    elapsed_batch = resume.setdefault('batch', 0)
+    for epoch in range(resume.setdefault('epoch', 0), epochs):
+        t0 = time.time()
         total_loss = 0
         # if task_type not in ['entlmnt', 'sentsim']: dataset.dataset.rebalance()
         for step, batch in enumerate(tqdm(dataset, desc='[%i/%i epoch(s)] Training batches' % (epoch + 1, epochs))):
+            if epoch == resume['epoch'] and step < elapsed_batch: continue
             optimizer.zero_grad()
             if task_type == 'nmt':
                 if mdl_name == 'bert':
@@ -1584,16 +1799,18 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                         # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
                         tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
                     if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                if mdl_name.endswith('sentvec'): clf_kwargs.update(dict(sentvec_tnsr=sentvec_tnsr))
                 mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-                clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights, **dict(sentvec_tnsr=sentvec_tnsr) if mdl_name.endswith('sentvec') else {})
+                clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
             else:
                 valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
                 if (len(valid_idx) == 0): continue
                 idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], [record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None
-                mask_tnsr = (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-                lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else (mask_tnsr[:, :, 1:].contiguous().view(tkns_tnsr.size(0), -1) if task_type=='sentsim' else mask_tnsr[:, 1:].contiguous())
-                if (use_gpu): tkns_tnsr, lb_tnsr, lm_mask_tnsr, mask_tnsr, weights = tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), (lm_mask_tnsr if lm_mask_tnsr is None else lm_mask_tnsr.to('cuda')), mask_tnsr.to('cuda'), (weights if weights is None else weights.to('cuda'))
-                pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+                tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr
+                mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+                lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, :, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr[:, 1:].contiguous())
+                if (use_gpu): tkns_tnsr, lb_tnsr, lm_mask_tnsr, mask_tnsr, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), (lm_mask_tnsr if lm_mask_tnsr is None else ([lm_mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else lm_mask_tnsr.to('cuda'))), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
                 clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=mask_tnsr if task_type == 'nmt' or mdl_name == 'bert' else pool_idx, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
             clf_loss = ((clf_loss.view(tkns_tnsr.size(0), -1) * mask_tnsr.float()).sum(1) / (1e-12 + mask_tnsr.float().sum(1))).mean() if task_type == 'nmt' and clf.crf is None else clf_loss.mean()
             train_loss = clf_loss if lm_loss is None else (clf_loss + lmcoef * ((lm_loss.view(tkns_tnsr.size(0), -1) * lm_mask_tnsr.float()).sum(1) / (1e-12 + lm_mask_tnsr.float().sum(1))).mean())
@@ -1603,13 +1820,18 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                 torch.nn.utils.clip_grad_value_(clf.lm_model.encoder.layer.parameters() if mdl_name == 'bert' else clf.parameters(), clipmaxn)
                 torch.nn.utils.clip_grad_value_(clf.parameters(), clipmaxn)
             optimizer.step()
+            if (killer.kill_now):
+                train_time = time.time() - t0
+                print('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
+                save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                sys.exit(0)
         avg_loss = total_loss / (step + 1)
         print('Train loss in %i epoch(s): %f' % (epoch + 1, avg_loss))
         if earlystop and earlystoper.step(avg_loss):
             print('Early stop!')
             break
     try:
-        save_model(clf, optimizer, '%s_%s.pth' % (task_name, mdl_name), devq=devq)
+        save_model(clf, optimizer, '%s_%s.pth' % (task_name, mdl_name), devq=devq, distrb=opts.distrb)
     except Exception as e:
         print(e)
 
@@ -1691,9 +1913,15 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
             if (len(valid_idx) == 0): continue
             _, _, _lb_tnsr, _ = idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], ([record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None)
-            mask_tnsr = (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-            _pool_idx = pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-            if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr = tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), pool_idx.to('cuda'), mask_tnsr.to('cuda')
+
+            tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr
+            mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+            # lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, :, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr[:, 1:].contiguous())
+
+            # mask_tnsr = (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+            # _pool_idx = pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+            _pool_idx = pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+            if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else pool_idx.to('cuda'), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr.to('cuda')
             # print(('tkns, lb, pool, mask:', tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr))
 
             with torch.no_grad():
@@ -1705,7 +1933,7 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
         elif task_type == 'mltl-clf':
             loss_func = nn.BCEWithLogitsLoss(reduction='none')
             loss = loss_func(logits.view(-1, len(binlbr)), lb_tnsr.view(-1, len(binlbr)).float())
-            prob = torch.sigmoid(logits).data
+            prob = torch.sigmoid(logits).data.view(-1, len(binlbr))
             pred = (prob > (clf.thrshld if opts.do_thrshld else opts.pthrshld)).int()
             # print(('logits, prob:', logits, prob))
         elif task_type == 'nmt':
@@ -1714,7 +1942,7 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             prob, pred = torch.softmax(logits, -1).max(-1)
         elif task_type == 'sentsim':
             loss_func = nn.MSELoss(reduction='none')
-            print((logits.mean(), lb_tnsr.mean()))
+            # print((logits.mean(), lb_tnsr.mean()))
             loss = loss_func(logits.view(-1), lb_tnsr.view(-1))
             prob, pred = logits, logits
         total_loss += loss.mean().item()
@@ -1728,9 +1956,9 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
         #     # preds.append([flat_preds[a:b] for a, b in zip(range(_lb_tnsr.size(0)), last_tkns)])
         #     # probs.append([flat_probs[a:b] for a, b in zip(range(_lb_tnsr.size(0)), last_tkns)])
         # else:
-        trues.append(_lb_tnsr.view(_lb_tnsr.size(0), -1).numpy() if task_type == 'mltl-clf' else _lb_tnsr.view(-1).detach().cpu().numpy())
-        preds.append(pred.detach().cpu().numpy())
-        probs.append(prob.detach().cpu().numpy())
+        trues.append(_lb_tnsr.view(_lb_tnsr.size(0), -1).detach().cpu().numpy() if task_type == 'mltl-clf' else _lb_tnsr.view(-1).detach().cpu().numpy())
+        preds.append(pred.view(pred.size(0), -1).detach().cpu().numpy() if task_type == 'mltl-clf' else pred.view(-1).detach().cpu().numpy())
+        probs.append(prob.view(prob.size(0), -1).detach().cpu().numpy() if task_type == 'mltl-clf' else prob.view(-1).detach().cpu().numpy())
 
         all_logits.append(logits.view(_lb_tnsr.size(0), -1, logits.size(-1)).detach().cpu().numpy())
     total_loss = total_loss / (step + 1)
@@ -1799,42 +2027,72 @@ def _sprmn_cor(trues, preds):
     return sp.stats.spearmanr(trues, preds)[0]
 
 
-def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, **kwargs):
+def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, distrb=False, **kwargs):
     print('Saving trained model...')
-    if in_wrapper: model = model.module
-    model = model.cpu() if devq and len(devq) > 0 else model
-    checkpoint = {'model': model, 'state_dict': model.state_dict(), 'optimizer':optimizer.state_dict()}
+    use_gpu, multi_gpu = (devq and len(devq) > 0), (devq and len(devq) > 1)
+    if in_wrapper or multi_gpu: model = model.module
+    model = model.cpu() if use_gpu else model
+    checkpoint = {'model': model, 'state_dict': model.state_dict(), 'optimizer':optimizer, 'optimizer_state_dict':optimizer.state_dict()}
     checkpoint.update(kwargs)
     torch.save(checkpoint, fpath)
+    model = _handle_model(model, dev_id=devq, distrb=distrb) if use_gpu else model
 
 
 def load_model(mdl_path):
     print('Loading previously trained model...')
     checkpoint = torch.load(mdl_path, map_location='cpu')
-    model = checkpoint['model']
+    model, optimizer = checkpoint['model'], checkpoint['optimizer']
     model.load_state_dict(checkpoint['state_dict'])
-    return model
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return model, optimizer, checkpoint.setdefault('resume', {}), dict([(k, v) for k, v in checkpoint.items() if k not in ['model', 'state_dict', 'optimizer', 'optimizer_state_dict', 'resume']])
+
+
+class DataParallel(nn.DataParallel):
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+    def replicate(self, module, device_ids):
+        replicas = super().replicate(module, device_ids)
+        for attr in dir(module):
+            attr_obj = getattr(module, attr)
+            if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]):
+                rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in attr_obj])
+                for mdl, rplc in zip(replicas, rplcs):
+                    setattr(mdl, attr, rplc)
+            elif isinstance(attr_obj, nn.Module):
+                for sub_attr in dir(attr_obj):
+                    sub_attr_obj = getattr(attr_obj, sub_attr)
+                    if type(sub_attr_obj) is list and all([isinstance(x, nn.Module) for x in sub_attr_obj]):
+                        rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in sub_attr_obj])
+                        for mdl, rplc in zip(replicas, rplcs):
+                            setattr(getattr(mdl, attr), sub_attr, rplc)
+        return replicas
 
 
 def _handle_model(model, dev_id=None, distrb=False):
     if (distrb):
         if (type(dev_id) is list):
             model.cuda()
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
+            model = nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
         else:
             torch.cuda.set_device(dev_id)
-            model = model.cuda(dev_id)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
+            model = model.to('cuda')
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
             raise NotImplementedError
             # Not implemented, should divide data outside this function and get one portion here, probably with parallel version of `load_data`
     elif (dev_id is not None):
         if (type(dev_id) is list):
-            model.cuda()
-            model = torch.nn.DataParallel(model, device_ids=dev_id)
+            model = model.to('cuda')
+            # for attr in dir(model):
+            #     attr_obj = getattr(model, attr)
+            #     if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]): setattr(model, attr, [DataParallel(x) for x in attr_obj])
+            model = DataParallel(model, device_ids=dev_id)
         else:
             torch.cuda.set_device(dev_id)
-            model = model.cuda(dev_id)
-            # model.lm_model = model.lm_model.cuda(dev_id)
+            model = model.to('cuda')
     return model
 
 
@@ -1845,7 +2103,7 @@ def multi_clf(dev_id=None):
     iflteng = inflect.engine()
 
     print('### Multi Classifier Head Mode ###')
-    # Prepare model related data
+    # Prepare model related meta data
     mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
@@ -1854,19 +2112,39 @@ def multi_clf(dev_id=None):
     encode_func = ENCODE_FUNC_MAP[mdl_name]
     tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
     task_type = TASK_TYPE_MAP[opts.task]
-    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
     special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
     special_tknids_args = dict(zip(special_tkns[0], special_tknids))
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('seqlen',opts.maxlen)])
     # Prepare task related meta data.
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
-    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, special_tknids_args, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')} if task_type=='nmt' else {}
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    ds_kwargs = {}
+    global_all_binlb = {}
 
+    orig_epochs = mltclf_epochs = opts.epochs
+    elapsed_mltclf_epochs, opts.epochs = 0, 1
     if (opts.resume):
         # Load model
-        clf = load_model(opts.resume)
+        clf, optimizer, resume, chckpnt = load_model(opts.resume)
+        # clf, optimizer_state_dict, resume, chckpnt = load_model(opts.resume)
+        elapsed_mltclf_epochs, all_binlb = chckpnt.setdefault('mltclf_epochs', 0), clf.binlb
+        # mltclf_epochs = orig_epochs # to be deleted
+        # clf.lm_model = clf.lm_model.module # to be deleted
+        # with open('../all_binlb.pkl', 'rb') as fd:
+        #     all_binlb = pickle.load(fd)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
+        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
+        # optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+        print(optimizer)
+        if opts.refresh:
+            print('Refreshing and saving the model with newest code...')
+            try:
+                save_model(clf, optimizer, '%s_%s.pth' % (opts.task, opts.model), devq=dev_id, distrb=opts.distrb)
+            except Exception as e:
+                print(e)
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
@@ -1881,53 +2159,77 @@ def multi_clf(dev_id=None):
 
     # Prepare data
     num_clfs = min([len(fs.listf(os.path.join(DATA_PATH, task_path), pattern='%s_\d.csv' % x)) for x in ['train', 'dev', 'test']])
-    all_binlb = {}
-    for i in range(num_clfs):
-        print('Training on the %s sub-dataset...' % iflteng.ordinal(i+1))
-        train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-        new_lbs = [k for k in train_ds.binlb.keys() if k not in all_binlb]
-        all_binlb.update(dict([(k, v) for k, v in zip(new_lbs, range(len(all_binlb), len(all_binlb)+len(new_lbs)))]))
-        if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
-        lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
-        if (not opts.weight_class or task_type == 'sentsim'):
-            class_count = None
-        elif len(lb_trsfm) > 0:
-            lb_df = train_ds.df[task_cols['y']].apply(lb_trsfm[0])
-            class_count = np.array([[1 if lb in y else 0 for lb in train_ds.binlb.keys()] for y in lb_df]).sum(axis=0)
-        else:
-            lb_df = train_ds.df[task_cols['y']]
-            binlb = task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb
-            class_count = lb_df.value_counts()[binlb.keys()].values
-        if (class_count is None):
-            class_weights = None
-            sampler = None
-        else:
-            class_weights = torch.Tensor(1.0 / class_count)
-            class_weights /= class_weights.sum()
-            sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
-            class_weights *= opts.clswfac
-        train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
+    for epoch in range(elapsed_mltclf_epochs, mltclf_epochs):
+        print('Global %i epoch(s)...' % epoch)
+        clf.reset_global_binlb()
+        all_binlb = {}
+        for i in range(num_clfs):
+            print('Training on the %s sub-dataset...' % iflteng.ordinal(i+1))
+            train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+            new_lbs = [k for k in train_ds.binlb.keys() if k not in all_binlb]
+            all_binlb.update(dict([(k, v) for k, v in zip(new_lbs, range(len(all_binlb), len(all_binlb)+len(new_lbs)))]))
+            # with open('all_binlb.pkl', 'wb') as fd:
+            #     pickle.dump(all_binlb, fd)
+            # print(('all_binlb', len(all_binlb)))
+            # sys.exit()
+            # continue
+            if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
+            lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
+            if (not opts.weight_class or task_type == 'sentsim'):
+                class_count = None
+            elif len(lb_trsfm) > 0:
+                lb_df = train_ds.df[task_cols['y']].apply(lb_trsfm[0])
+                class_count = np.array([[1 if lb in y else 0 for lb in train_ds.binlb.keys()] for y in lb_df]).sum(axis=0)
+            else:
+                lb_df = train_ds.df[task_cols['y']]
+                binlb = task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb
+                class_count = lb_df.value_counts()[binlb.keys()].values
+            if (class_count is None):
+                class_weights = None
+                sampler = None
+            else:
+                class_weights = torch.Tensor(1.0 / class_count)
+                class_weights /= class_weights.sum()
+                class_weights *= (opts.clswfac[min(len(opts.clswfac)-1, i)] if type(opts.clswfac) is list else opts.clswfac)
+                if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
+                sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
+            train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
-        dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-        if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
-        dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-        test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-        if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
-        test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-        # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
+            dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+            if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+            dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+            test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+            if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+            test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+            # print((len(train_ds.binlb), len(dev_ds.binlb), len(test_ds.binlb)))
 
-        # Adjust the model
-        clf.add_linear(num_lbs=len(train_ds.binlb), idx=i)
+            # Adjust the model
+            # print(('before get linear', len(clf.global_binlb) if hasattr(clf, 'global_binlb') else None, len(clf.binlb), clf.num_lbs))
+            clf.get_linear(binlb=train_ds.binlb, idx=i)
+            # print(('after get linear', len(clf.global_binlb), len(clf.binlb), clf.num_lbs))
 
-        # Training on splitted datasets
-        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+            # Training on splitted datasets
+            train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {}, chckpnt_kwargs=dict(mltclf_epochs=epoch))
 
-        # Adjust the model
-        clf.merge_linear()
+            # Adjust the model
+            # print(('before merge linear', len(clf.global_binlb), len(clf.binlb), clf.num_lbs))
+            clf.merge_linear(num_linear=i+1)
+            clf.linear = _handle_model(clf.linear, dev_id=dev_id, distrb=opts.distrb)
+            # print(('after merge linear', len(clf.global_binlb), len(clf.binlb), clf.num_lbs))
 
-        # Evaluating on the accumulated dev and test sets
-        eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
-        eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
+            # Evaluating on the accumulated dev and test sets
+            eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
+            eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
+        global_all_binlb.update(all_binlb)
+        # clf.binlb = all_binlb
+        # clf.binlbr = dict([(v, k) for k, v in all_binlb.items()])
+    else:
+        if orig_epochs > 0:
+            try:
+                save_model(clf, optimizer, '%s_%s.pth' % (opts.task, opts.model), devq=dev_id, distrb=opts.distrb)
+            except Exception as e:
+                print(e)
+    opts.epochs = orig_epochs
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
@@ -1938,13 +2240,102 @@ def multi_clf(dev_id=None):
 
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=orig_epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
 
 
 def siamese_rank(dev_id=None):
     '''Predict candidate labels using pre-trained model and rank the predictions using siamese network, assuming that each label has a gold standard sample'''
-    pass
+    print('### Siamese Rank Mode ###')
+    orig_task = opts.task
+    opts.task = opts.task + '_siamese'
+    # Prepare model related meta data
+    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    common_cfg = cfgr('validate', 'common')
+    pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
+    use_gpu = dev_id is not None
+    encode_func = ENCODE_FUNC_MAP[mdl_name]
+    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
+    task_type = TASK_TYPE_MAP[opts.task]
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
+    special_tknids_args = dict(zip(special_tkns[0], special_tknids))
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('seqlen',opts.maxlen)])
+    # Prepare task related meta data
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    ds_kwargs = {}
+
+    # Load model
+    clf, optimizer, resume, chckpnt = load_model(opts.resume)
+    clf.to_siamese()
+    if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+    optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
+    optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+    print(optimizer)
+
+    # Prepare data
+    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
+    lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
+    if (not opts.weight_class or task_type == 'sentsim'):
+        class_count = None
+    elif len(lb_trsfm) > 0:
+        lb_df = train_ds.df[task_cols['y']].apply(lb_trsfm[0])
+        class_count = np.array([[1 if lb in y else 0 for lb in train_ds.binlb.keys()] for y in lb_df]).sum(axis=0)
+    else:
+        lb_df = train_ds.df[task_cols['y']]
+        binlb = task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb
+        class_count = lb_df.value_counts()[binlb.keys()].values
+    if (class_count is None):
+        class_weights = None
+        sampler = None
+    else:
+        class_weights = torch.Tensor(1.0 / class_count)
+        class_weights /= class_weights.sum()
+        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
+        sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
+    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
+
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+
+    # Training on doc/sent-pair datasets
+    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
+
+    # Evaluating on the doc/sent-pair dev and test sets
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev_siamese', mdl_name=opts.model, use_gpu=use_gpu)
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test_siamese', mdl_name=opts.model, use_gpu=use_gpu)
+
+    # Adjust the model
+    clf.merge_siamese(tokenizer=tokenizer, encode_func=encode_func, trnsfm=[trsfms, {}, trsfms_kwargs], special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), topk=128, lbnotes='../lbnotes.csv')
+
+    # Recover the original task
+    opts.task = orig_task
+    # Prepare model related meta data
+    task_type = TASK_TYPE_MAP[opts.task]
+    # Prepare task related meta data
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    # Prepare dev and test sets
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    # Evaluation
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
+
 
 
 def main():
@@ -1953,6 +2344,8 @@ def main():
             main_func = classify
         elif (opts.method == 'multiclf'):
             main_func = multi_clf
+        elif (opts.method == 'simrank'):
+            main_func = siamese_rank
     else:
         return
     if (opts.distrb):
@@ -2004,7 +2397,7 @@ if __name__ == '__main__':
     op.add_option('--initln_mean', default=0., action='store', type='float', dest='initln_mean', help='indicate the mean of the parameters in linear model when Initializing')
     op.add_option('--initln_std', default=0.02, action='store', type='float', dest='initln_std', help='indicate the standard deviation of the parameters in linear model when Initializing')
     op.add_option('--weight_class', default=False, action='store_true', dest='weight_class', help='whether to drop the last incompleted batch')
-    op.add_option('--class_weight_factor', default=1, action='store', type='float', dest='clswfac', help='whether to drop the last incompleted batch')
+    op.add_option('--class_weight_factor', default='1', action='store', type='str', dest='clswfac', help='whether to drop the last incompleted batch')
     op.add_option('--droplast', default=False, action='store_true', dest='droplast', help='whether to drop the last incompleted batch')
     op.add_option('--do_norm', default=False, action='store_true', dest='do_norm', help='whether to do normalization')
     op.add_option('--norm_type', default='batch', action='store', dest='norm_type', help='normalization layer class')
@@ -2028,13 +2421,14 @@ if __name__ == '__main__':
     op.add_option('--pthrshld', default=0.5, action='store', type='float', dest='pthrshld', help='indicate the threshold for predictive probabilitiy')
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
+    op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
     op.add_option('-i', '--input', help='input dataset')
     op.add_option('-w', '--cache', default='.cache', help='the location of cache files')
     op.add_option('-u', '--task', default='ddi', type='str', dest='task', help='the task name [default: %default]')
     op.add_option('--model', default='gpt2', type='str', dest='model', help='the model to be validated')
     op.add_option('--encoder', dest='encoder', help='the encoder to be used after the language model: pool, s2v or s2s')
     op.add_option('--pretrained', dest='pretrained', help='pretrained model file')
-    op.add_option('-m', '--method', help='main method to run')
+    op.add_option('-m', '--method', default='classify', help='main method to run')
     op.add_option('-v', '--verbose', default=False, action='store_true', dest='verbose', help='display detailed information')
 
     (opts, args) = op.parse_args()
@@ -2067,5 +2461,6 @@ if __name__ == '__main__':
 
     opts.output_layer = list(map(int, opts.output_layer.split(',')))
     opts.output_layer = opts.output_layer[0] if len(opts.output_layer) == 1 else opts.output_layer
+    opts.clswfac = list(map(float, opts.clswfac.split(','))) if ',' in opts.clswfac else float(opts.clswfac)
 
     main()
