@@ -14,7 +14,9 @@ from optparse import OptionParser
 from tqdm import tqdm
 
 import numpy as np
+
 import torch
+from torch import nn
 
 from pytorch_pretrained_bert import OpenAIGPTConfig, OpenAIGPTTokenizer, OpenAIGPTLMHeadModel
 from pytorch_pretrained_bert import GPT2Config, GPT2Tokenizer, GPT2LMHeadModel
@@ -83,21 +85,46 @@ def _padtrim(batch_tkns, max_len, pad_val=0):
     return padtrim_X, padtrim_M
 
 
+class DataParallel(nn.DataParallel):
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+    def replicate(self, module, device_ids):
+        replicas = super().replicate(module, device_ids)
+        for attr in dir(module):
+            attr_obj = getattr(module, attr)
+            if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]):
+                rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in attr_obj])
+                for mdl, rplc in zip(replicas, rplcs):
+                    setattr(mdl, attr, rplc)
+            elif isinstance(attr_obj, nn.Module):
+                for sub_attr in dir(attr_obj):
+                    sub_attr_obj = getattr(attr_obj, sub_attr)
+                    if type(sub_attr_obj) is list and all([isinstance(x, nn.Module) for x in sub_attr_obj]):
+                        rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in sub_attr_obj])
+                        for mdl, rplc in zip(replicas, rplcs):
+                            setattr(getattr(mdl, attr), sub_attr, rplc)
+        return replicas
+
+
 def _handle_model(model, dev_id=None, distrb=False):
     if (distrb):
         if (type(dev_id) is list):
             model.cuda()
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
+            model = nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
         else:
             torch.cuda.set_device(dev_id)
             model = model.cuda(dev_id)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
             raise NotImplementedError
             # Not implemented, should divide data outside this function and get one portion here, probably with parallel version of `load_data`
     elif (dev_id is not None):
         if (type(dev_id) is list):
             model.cuda()
-            model = torch.nn.DataParallel(model, device_ids=dev_id)
+            model = DataParallel(model, device_ids=dev_id)
         else:
             torch.cuda.set_device(dev_id)
             model = model.cuda(dev_id)
