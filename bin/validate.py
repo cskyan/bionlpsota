@@ -373,15 +373,15 @@ class BaseClfHead(nn.Module):
     def merge_linear(self, num_linear=-1):
         use_gpu = next(self.parameters()).is_cuda
         self.linear = MultiClfHead(self.linears if num_linear <=0 else self.linears[:num_linear])
-        # self.linear = self.linear.to('cuda') if use_gpu else self.linear
-        # self.linear = _handle_model(self.linear)
+        self.linear = self.linear.to('cuda') if use_gpu else self.linear
         self.num_lbs = self._total_num_lbs
         self.binlb = self.global_binlb
         self.binlbr = self.global_binlb
 
     def to_siamese(self, from_scratch=False):
-        self.clf_task_type = self.task_type
+        if not hasattr(self, 'clf_task_type') and self.task_type != 'sentsim': self.clf_task_type = self.task_type
         self.task_type = 'sentsim'
+        if not hasattr(self, 'clf_num_lbs') and self.task_type != 'sentsim': self.clf_num_lbs = self.num_lbs
         self.num_lbs = 1
         self.dim_mulriple = 2
         self.clf_linear = self.linear
@@ -390,6 +390,7 @@ class BaseClfHead(nn.Module):
 
     def to_clf(self, from_scratch=False):
         self.task_type = self.clf_task_type
+        self.num_lbs = self.clf_num_lbs
         if self.mode == 'siamese':
             self.dim_mulriple = 1
             self.siamese_linear = self.linear
@@ -1062,11 +1063,12 @@ class EarlyStopping(object):
 class BaseDataset(Dataset):
     """Basic dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, **kwargs):
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
         self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
         # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
         self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
         self.df.columns = self.df.columns.astype(str, copy=False)
         self.df = self.df[self.df[self.label_col].notnull()]
         self.mltl = mltl
@@ -1663,7 +1665,7 @@ def classify(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')} if task_type=='nmt' else {}
+    ds_kwargs = {'lb_coding':task_extparms.setdefault('lb_coding', 'IOB'), 'sampfrac':opts.sampfrac} if task_type=='nmt' else {'sampfrac':opts.sampfrac}
 
     # Prepare data
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
@@ -1684,8 +1686,8 @@ def classify(dev_id=None):
     else:
         class_weights = torch.Tensor(1.0 / class_count)
         class_weights /= class_weights.sum()
-        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
+        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
@@ -2120,7 +2122,7 @@ def multi_clf(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {}
+    ds_kwargs = {'sampfrac':opts.sampfrac}
     global_all_binlb = {}
 
     orig_epochs = mltclf_epochs = opts.epochs
@@ -2128,12 +2130,7 @@ def multi_clf(dev_id=None):
     if (opts.resume):
         # Load model
         clf, optimizer, resume, chckpnt = load_model(opts.resume)
-        # clf, optimizer_state_dict, resume, chckpnt = load_model(opts.resume)
         elapsed_mltclf_epochs, all_binlb = chckpnt.setdefault('mltclf_epochs', 0), clf.binlb
-        # mltclf_epochs = orig_epochs # to be deleted
-        # clf.lm_model = clf.lm_model.module # to be deleted
-        # with open('../all_binlb.pkl', 'rb') as fd:
-        #     all_binlb = pickle.load(fd)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
         optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
@@ -2168,11 +2165,6 @@ def multi_clf(dev_id=None):
             train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
             new_lbs = [k for k in train_ds.binlb.keys() if k not in all_binlb]
             all_binlb.update(dict([(k, v) for k, v in zip(new_lbs, range(len(all_binlb), len(all_binlb)+len(new_lbs)))]))
-            # with open('all_binlb.pkl', 'wb') as fd:
-            #     pickle.dump(all_binlb, fd)
-            # print(('all_binlb', len(all_binlb)))
-            # sys.exit()
-            # continue
             if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
             lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
             if (not opts.weight_class or task_type == 'sentsim'):
@@ -2191,8 +2183,8 @@ def multi_clf(dev_id=None):
                 class_weights = torch.Tensor(1.0 / class_count)
                 class_weights /= class_weights.sum()
                 class_weights *= (opts.clswfac[min(len(opts.clswfac)-1, i)] if type(opts.clswfac) is list else opts.clswfac)
-                if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
                 sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
+                if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
             train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
             dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
@@ -2204,18 +2196,14 @@ def multi_clf(dev_id=None):
             # print((len(train_ds.binlb), len(dev_ds.binlb), len(test_ds.binlb)))
 
             # Adjust the model
-            # print(('before get linear', len(clf.global_binlb) if hasattr(clf, 'global_binlb') else None, len(clf.binlb), clf.num_lbs))
             clf.get_linear(binlb=train_ds.binlb, idx=i)
-            # print(('after get linear', len(clf.global_binlb), len(clf.binlb), clf.num_lbs))
 
             # Training on splitted datasets
             train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {}, chckpnt_kwargs=dict(mltclf_epochs=epoch))
 
             # Adjust the model
-            # print(('before merge linear', len(clf.global_binlb), len(clf.binlb), clf.num_lbs))
             clf.merge_linear(num_linear=i+1)
             clf.linear = _handle_model(clf.linear, dev_id=dev_id, distrb=opts.distrb)
-            # print(('after merge linear', len(clf.global_binlb), len(clf.binlb), clf.num_lbs))
 
             # Evaluating on the accumulated dev and test sets
             eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
@@ -2266,14 +2254,15 @@ def siamese_rank(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {}
+    ds_kwargs = {'sampfrac':opts.sampfrac}
 
     # Load model
-    clf, optimizer, resume, chckpnt = load_model(opts.resume)
+    clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
     clf.to_siamese()
     if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
     optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
     optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+    if len(resume) > 0: optimizer = optimizer.load_state_dict(prv_optimizer.state_dict())
     print(optimizer)
 
     # Prepare data
@@ -2295,8 +2284,8 @@ def siamese_rank(dev_id=None):
     else:
         class_weights = torch.Tensor(1.0 / class_count)
         class_weights /= class_weights.sum()
-        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
+        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
@@ -2417,6 +2406,7 @@ if __name__ == '__main__':
     op.add_option('--lr', default=float(1e-3), action='store', type='float', dest='lr', help='indicate the learning rate of the optimizer')
     op.add_option('--wdecay', default=float(1e-5), action='store', type='float', dest='wdecay', help='indicate the weight decay of the optimizer')
     op.add_option('--lmcoef', default=0.5, action='store', type='float', dest='lmcoef', help='indicate the coefficient of the language model loss when fine tuning')
+    op.add_option('--sampfrac', action='store', type='float', dest='sampfrac', help='indicate the sampling fraction for datasets')
     op.add_option('--pdrop', default=0.2, action='store', type='float', dest='pdrop', help='indicate the dropout probabilitiy for all fully connected layers in the embeddings, encoder, and pooler')
     op.add_option('--pthrshld', default=0.5, action='store', type='float', dest='pthrshld', help='indicate the threshold for predictive probabilitiy')
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
