@@ -294,7 +294,8 @@ class BaseClfHead(nn.Module):
             loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
-            loss_func = ContrastiveLoss(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
+            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive')]
+            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         if self.thrshlder:
             num_lbs = labels.view(-1, self.num_lbs).sum(1)
@@ -376,14 +377,14 @@ class BaseClfHead(nn.Module):
         self.linear = self.linear.to('cuda') if use_gpu else self.linear
         self.num_lbs = self._total_num_lbs
         self.binlb = self.global_binlb
-        self.binlbr = self.global_binlb
+        self.binlbr = self.global_binlbr
 
     def to_siamese(self, from_scratch=False):
         if not hasattr(self, 'clf_task_type') and self.task_type != 'sentsim': self.clf_task_type = self.task_type
         self.task_type = 'sentsim'
         if not hasattr(self, 'clf_num_lbs') and self.task_type != 'sentsim': self.clf_num_lbs = self.num_lbs
         self.num_lbs = 1
-        self.dim_mulriple = 2
+        self.dim_mulriple = 2 if self.task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else 1
         self.clf_linear = self.linear
         self.linear = self.siamese_linear if hasattr(self, 'siamese_linear') and not from_scratch else self.__init_linear__()
         self.mode = 'siamese'
@@ -854,7 +855,8 @@ class EmbeddingClfHead(BaseClfHead):
             loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
-            loss_func = ContrastiveLoss(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
+            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive')]
+            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         return clf_loss, None
 
@@ -1004,17 +1006,48 @@ class SentVecEmbeddingSeq2Vec(EmbeddingSeq2Vec):
         return self._forward(clf_h, labels=labels, weights=weights)
 
 
-class ContrastiveLoss(nn.Module):
-    def __init__(self, reduction='none', x_mode='dist', y_mode='dist', margin=2.0):
-        super(ContrastiveLoss, self).__init__()
+class RegressionLoss(nn.Module):
+    def __init__(self, reduction='none', x_mode='dist', y_mode='dist'):
+        super(RegressionLoss, self).__init__()
         self.reduction = reduction
         self.x_mode, self.y_mode = x_mode, y_mode
-        self.labels = (lambda x: x) if x_mode == y_mode else (lambda x: 1 - x)
+        self.ytransform = (lambda x: x) if x_mode == y_mode else (lambda x: 1 - x)
+
+    def forward(self, y_pred, y_true):
+        raise NotImplementedError
+
+
+class ContrastiveLoss(RegressionLoss):
+    def __init__(self, reduction='none', x_mode='dist', y_mode='dist', margin=2.0):
+        super(ContrastiveLoss, self).__init__(reduction=reduction, x_mode=x_mode, y_mode=y_mode)
         self.margin = margin
 
-    def forward(self, X, labels):
-        loss = (1 - self.labels(labels)) * torch.pow(X, 2) + self.labels(labels) * torch.pow(torch.clamp(self.margin - X, min=0.0), 2)
+    def forward(self, y_pred, y_true):
+        loss = (1 - self.ytransform(y_true)) * torch.pow(X, 2) + self.ytransform(y_true) * torch.pow(torch.clamp(self.margin - y_pred, min=0.0), 2)
         return loss if self.reduction == 'none' else torch.mean(loss)
+
+
+class HuberLoss(RegressionLoss):
+    def forward(self, y_pred, y_true):
+        return F.smooth_l1_loss(y_pred, y_true, reduction=self.reduction)
+
+
+class LogCoshLoss(RegressionLoss):
+    def forward(self, y_pred, y_true):
+        ydiff = y_pred - self.ytransform(y_true)
+        return torch.mean(torch.log(torch.cosh(ydiff + 1e-12)))
+
+
+class XTanhLoss(RegressionLoss):
+    def forward(self, y_pred, y_true):
+        ydiff = y_pred - self.ytransform(y_true)
+        return torch.mean(ydiff * torch.tanh(ydiff))
+
+
+class XSigmoidLoss(RegressionLoss):
+    def forward(self, y_pred, y_true):
+        ydiff = y_pred - self.ytransform(y_true)
+        return torch.mean(2 * ydiff / (1 + torch.exp(-ydiff)) - ydiff)
 
 
 class EarlyStopping(object):
@@ -1066,8 +1099,8 @@ class BaseDataset(Dataset):
     def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
         self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
-        # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
-        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
         if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
         self.df.columns = self.df.columns.astype(str, copy=False)
         self.df = self.df[self.df[self.label_col].notnull()]
@@ -1196,14 +1229,18 @@ class BaseDataset(Dataset):
 class SentSimDataset(BaseDataset):
     """Sentence Similarity task dataset class"""
 
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampfrac=None, ynormfunc=None, **kwargs):
+        super(SentSimDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampfrac=sampfrac, **kwargs)
+        self.ynormfunc, self.ynormfuncr = ynormfunc if ynormfunc is not None else (None, None)
+
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
         sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or type(sample[0][0][0]) is str else torch.tensor(sample[0])), torch.tensor(0 if sample[1] is np.nan else float(sample[1]) / 5.0)
+        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or type(sample[0][0][0]) is str else torch.tensor(sample[0])), torch.tensor(0. if sample[1] is np.nan else (float(sample[1]) if self.ynormfunc is None else self.ynormfunc(float(sample[1]))))
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
-        lbs = 5.0 * lbs
+        lbs = lbs if self.ynormfuncr is None else list(map(self.ynormfuncr, lbs))
         filled_df = self._df.copy(deep=True)[~self._df.index.duplicated(keep='first')]
         if index:
             filled_df.loc[index, self.label_col] = lbs
@@ -1227,8 +1264,8 @@ class EntlmntDataset(BaseDataset):
 class NERDataset(BaseDataset):
     """NER task dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], lb_coding='IOB', **kwargs):
-        super(NERDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, header=None if csv_file.endswith('tsv') else 0, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampfrac=None, lb_coding='IOB', **kwargs):
+        super(NERDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, header=None if csv_file.endswith('tsv') else 0, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampfrac=sampfrac, **kwargs)
         all_binlb = set([k.split('-')[-1] for k in self.binlb.keys() if k != 'O'])
         encoded_lbs = ['%s-%s' % (pre, lb) for lb in all_binlb for pre in set(lb_coding) - set(['O']) if lb and not lb.isspace()] + ['O']
         self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(encoded_lbs)])
@@ -1512,7 +1549,7 @@ TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'i
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
 TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
 TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _dummy_trsfm, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':512}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'maxlen':128}}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'maxlen':128}}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'loss':'contrastive', 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
@@ -1576,6 +1613,7 @@ SEQ2SEQ_DIM_INFER = {'pytorch-lstm':lambda x: x[1] * x[2]['hidden_size'], 'pytor
 SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden_size'], 'pytorch-agmnlstm':lambda x: x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[2]['hidden_size'], 'pytorch-stkaltlstm':lambda x: x[2]['hidden_size'], 'pytorch-gru':lambda x: x[2]['hidden_size'], 'cnn':lambda x: int(1.5 * x[2]['embedding_dim']), 'cnn_highway':lambda x: x[0]}
 NORM_TYPE_MAP = {'batch':nn.BatchNorm1d, 'layer':nn.LayerNorm}
 ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid}
+RGRSN_LOSS_MAP = {'contrastive':ContrastiveLoss, 'huber':HuberLoss, 'logcosh':LogCoshLoss, 'xtanh':XTanhLoss, 'xsigmoid':XSigmoidLoss}
 SIM_FUNC_MAP = {'sim':'sim', 'dist':'dist'}
 CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
 CNSTRNTS_MAP = {'hrch':(HrchConstraint, {('num_lbs','num_lbs'):1, ('hrchrel_path','hrchrel_path'):'hpo_ancrels.pkl', ('binlb','binlb'):{}})}
@@ -1665,7 +1703,11 @@ def classify(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {'lb_coding':task_extparms.setdefault('lb_coding', 'IOB'), 'sampfrac':opts.sampfrac} if task_type=='nmt' else {'sampfrac':opts.sampfrac}
+    ds_kwargs = {'sampfrac':opts.sampfrac}
+    if task_type == 'nmt':
+        ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
+    elif task_type == 'sentsim':
+        ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
 
     # Prepare data
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
@@ -2123,6 +2165,10 @@ def multi_clf(dev_id=None):
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
     ds_kwargs = {'sampfrac':opts.sampfrac}
+    if task_type == 'nmt':
+        ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
+    elif task_type == 'sentsim':
+        ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
     global_all_binlb = {}
 
     orig_epochs = mltclf_epochs = opts.epochs
@@ -2254,12 +2300,17 @@ def siamese_rank(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
     ds_kwargs = {'sampfrac':opts.sampfrac}
+    ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
 
     # Load model
     clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
+    prv_task_params = copy.deepcopy(clf.task_params)
+    clf.task_params.update(task_params)
     clf.to_siamese()
     if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+
     optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
     optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
     if len(resume) > 0: optimizer = optimizer.load_state_dict(prv_optimizer.state_dict())
@@ -2307,6 +2358,7 @@ def siamese_rank(dev_id=None):
 
     # Recover the original task
     opts.task = orig_task
+    clf.task_params = prv_task_params
     # Prepare model related meta data
     task_type = TASK_TYPE_MAP[opts.task]
     # Prepare task related meta data
@@ -2314,6 +2366,7 @@ def siamese_rank(dev_id=None):
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
     # Prepare dev and test sets
+    del ds_kwargs['ynormfunc']
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
@@ -2402,6 +2455,7 @@ if __name__ == '__main__':
     op.add_option('--seq2seq', dest='seq2seq', help='indicate the seq2seq strategy when converting sequences of embeddings into a vector')
     op.add_option('--seq2vec', dest='seq2vec', help='indicate the seq2vec strategy when converting sequences of embeddings into a vector: pytorch-lstm, cnn, or cnn_highway')
     op.add_option('--ssfunc', dest='sentsim_func', help='indicate the sentence similarity metric')
+    op.add_option('--loss', dest='loss', help='indicate the loss function')
     op.add_option('--cnstrnts', dest='cnstrnts', help='indicate the constraint scheme')
     op.add_option('--lr', default=float(1e-3), action='store', type='float', dest='lr', help='indicate the learning rate of the optimizer')
     op.add_option('--wdecay', default=float(1e-5), action='store', type='float', dest='wdecay', help='indicate the weight decay of the optimizer')
