@@ -62,110 +62,6 @@ opts, args = {}, []
 cfgr = None
 
 
-class MultiClfHead(nn.Module):
-    def __init__(self, linears):
-        super(MultiClfHead, self).__init__()
-        self.linears = linears
-
-    def forward(self, hidden_states):
-        return torch.cat([lnr(hidden_states) for lnr in self.linears], dim=-1)
-
-    def to(self, *args, **kwargs):
-        super(MultiClfHead, self).to(*args, **kwargs)
-        self.linears = [lnr.to(*args, **kwargs) for lnr in self.linears]
-        return self
-
-class SiameseRankHead(nn.Module):
-    def __init__(self, linear, siamese_linear, binlbr, tokenizer, encode_func, trnsfm, special_tknids_args, pad_val, base_model, thrshld_lnr=0.5, thrshld_sim=0.5, topk=None, num_sampling_note=1, lbnotes='lbnotes.csv'):
-        super(SiameseRankHead, self).__init__()
-        self.linear = linear
-        self.siamese_linear = siamese_linear
-        self.base_model = dict(zip(['model', 'tokenizer', 'encode_func', 'special_tknids_args', 'pad_val', 'transforms', 'transforms_args', 'transforms_kwargs'], [base_model, tokenizer, encode_func, special_tknids_args, pad_val]+trnsfm))
-        self.binlbr = binlbr
-        self.thrshld_lnr = thrshld_lnr
-        self.thrshld_sim = thrshld_sim
-        self.topk = topk
-        self.num_sampling_note = num_sampling_note
-        self.lbnotes = lbnotes if type(lbnotes) is pd.DataFrame else pd.read_csv(lbnotes, sep='\t', index_col='id', encoding='utf-8')
-
-    def forward(self, hidden_states):
-        # generate candidates with linear and rank the candidates with siamese_linear
-        use_gpu = next(self.parameters()).is_cuda
-        batch_size = 125
-        logits = self.linear(hidden_states)
-        prob = torch.sigmoid(logits)
-        if self.topk:
-            topk, topk_indices = torch.topk(prob.data, self.topk)
-            prob_topk = torch.zeros(prob.size(), dtype=topk.dtype).scatter_(1, topk_indices.cpu(), topk.cpu())
-            pred = (prob_topk > self.thrshld_lnr).int()
-        else:
-            pred = (prob.data > self.thrshld_lnr).int()
-        pred_csc = csc_matrix(pred.cpu().numpy())
-        pred_scores = [[] for x in range(len(pred_csc.data))]
-        labels = [self.binlbr[i] for i in range(len(self.binlbr))]
-        num_notes = np.array([min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0]) if lb in self.lbnotes.index else 0 for lb in labels])
-        num_samps = pred_csc.indptr[1:] - pred_csc.indptr[:-1]
-        total_num_notes, total_num_pairs = sum(num_notes), sum(num_samps * num_notes)
-        def gen_samples():
-            for i, lb in enumerate(labels):
-                for note in (self.lbnotes.loc[lb]['text'].sample(n=min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0])) if type(self.lbnotes.loc[lb]['text']) is pd.Series else [self.lbnotes.loc[lb]['text']]) if lb in self.lbnotes.index else []:
-                    tkns = self._transform_chain((self.base_model['encode_func'](note, self.base_model['tokenizer']), None), self.base_model['transforms'], self.base_model['transforms_args'], self.base_model['transforms_kwargs'])[0]
-                    yield tkns, i, pred_csc.indices[pred_csc.indptr[i]:pred_csc.indptr[i+1]]
-        def gen_pairs():
-            batch_tkns, lb_indices, orig_indices = [[] for x in range(3)]
-            for i, (x, lbidx, orig_idx) in enumerate(gen_samples()):
-                batch_tkns.append(x)
-                lb_indices.append(lbidx)
-                orig_indices.append(orig_idx)
-                if i > 0 and i % batch_size == 0 or i == total_num_notes - 1:
-                    clf_tknids = self.base_model['special_tknids_args']['clf_tknids']
-                    tkns_tnsr = torch.tensor(batch_tkns, dtype=torch.long).to('cuda') if use_gpu else torch.tensor(batch_tkns, dtype=torch.long)
-                    mask_tnsr = (~tkns_tnsr.eq(self.base_model['pad_val'] * torch.ones_like(tkns_tnsr))).long()
-                    pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-                    note_clf_h = self.base_model['model'](tkns_tnsr, mask_tnsr if type(self.base_model['model']) is BERTClfHead else pool_idx, embedding_mode=True)
-                    # note_clf_h = hidden_states[:1]
-                    for j, clf_h in enumerate(note_clf_h):
-                        for orig_id in orig_indices[j]:
-                            yield clf_h, hidden_states[orig_id], lb_indices[j], orig_id
-                    batch_tkns, lb_indices, orig_indices = [[] for x in range(3)]
-        batch_pairs, indices = [[] for x in range(2)]
-        for i, (h1, h2, lbidx, orig_id) in enumerate(tqdm(gen_pairs(), desc='[%i pair(s)] Siamese similarity ranking' % (total_num_pairs))):
-            batch_pairs.append([h1, h2])
-            indices.append([lbidx, orig_id])
-            if i > 0 and i % batch_size == 0 or i == total_num_pairs - 1:
-                clf_h = [torch.stack(x) for x in zip(*batch_pairs)]
-                continue
-                if (self.base_model['model'].task_params.setdefault('sentsim_func', None) is None or self.base_model['model'].task_params['sentsim_func'] == 'concat'):
-                    clf_h = torch.cat(clf_h, dim=-1)
-                    sim_logits = self.siamese_linear(clf_h) if self.siamese_linear else clf_h
-                else:
-                    sim_logits = F.pairwise_distance(self.siamese_linear(clf_h[0]), self.siamese_linear(clf_h[1]), 2, eps=1e-12) if self.base_model['model'].task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.siamese_linear(clf_h[0]), self.siamese_linear(clf_h[1]), dim=1, eps=1e-12)
-                sim_probs = torch.sigmoid(sim_logits).data
-                for idx, sim_prob in zip(indices, sim_probs):
-                    orig_idx = pred_csc.indptr[idx[0]], pred_csc.indptr[idx[0]+1]
-                    pred_scores[orig_idx[0]:orig_idx[1]][np.where(pred_csc.indices[orig_idx[0]:orig_idx[1]]==idx[1])[0][0]].append(sim_prob.cpu().numpy())
-                batch_pairs, indices = [[] for x in range(2)]
-        pred_scores = [np.mean(x) for x in pred_scores]
-        sim_probs_tnsr = torch.tensor(csc_matrix((pred_scores, pred_csc.indices, pred_csc.indptr), shape=pred_csc.shape).todense(), dtype=torch.float)
-        if use_gpu: sim_probs_tnsr = sim_probs_tnsr.to('cuda')
-        logits = sim_probs_tnsr * prob
-        return logits
-
-    def to(self, *args, **kwargs):
-        super(SiameseRankHead, self).to(*args, **kwargs)
-        self.linear = self.linear.to(*args, **kwargs)
-        return self
-
-    def _transform_chain(self, sample, transforms, transforms_args={}, transforms_kwargs={}):
-        if transforms:
-            transforms = transforms if type(transforms) is list else [transforms]
-            transforms_kwargs = transforms_kwargs if type(transforms_kwargs) is list else [transforms_kwargs]
-            for transform, transform_kwargs in zip(transforms, transforms_kwargs):
-                transform_kwargs.update(transforms_args)
-                sample = transform(sample, **transform_kwargs) if callable(transform) else getattr(self, transform)(sample, **transform_kwargs)
-        return sample
-
-
 class BaseClfHead(nn.Module):
     """ Classifier Head for the Basic Language Model """
 
@@ -408,109 +304,6 @@ class BaseClfHead(nn.Module):
         self.mode = 'clf'
 
 
-class ThresholdEstimator(nn.Module):
-    def __init__(self, last_hdim, fchdim=100, iactvtn='relu', oactvtn='sigmoid', init_thrshld=0.5):
-        super(ThresholdEstimator, self).__init__()
-        self.thrshld = init_thrshld
-        self.linear = nn.Sequential(nn.Linear(last_hdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, 1), ACTVTN_MAP[oactvtn]()) if fchdim else nn.Sequential(nn.Linear(last_hdim, 1), ACTVTN_MAP[oactvtn]())
-
-    def forward(self, logits):
-        return self.linear(logits)
-
-
-class HrchConstraint(nn.Module):
-    def __init__(self, num_lbs, hrchrel_path='', binlb={}):
-        super(HrchConstraint, self).__init__()
-        with open(hrchrel_path, 'rb') as fd:
-            hrchrel = pickle.load(fd)
-        out_order = binlb.keys()
-        if out_order:
-            hrchrel = hrchrel[out_order]
-            hrchrel = hrchrel.loc[out_order]
-        # np.fill_diagonal(hrchrel.values, 1)
-        self.hrchrel = torch.tensor(hrchrel.values).float()
-        self.linear = nn.Linear(num_lbs, num_lbs)
-
-    def forward(self, logits):
-        out = torch.mm(logits, self.linear(self.hrchrel))
-        out = out / out.sum(0).expand_as(out)
-        out[torch.isnan(out)] = 0
-        return logits + out
-
-    def to(self, *args, **kwargs):
-        super(HrchConstraint, self).to(*args, **kwargs)
-        self.hrchrel = self.hrchrel.to(*args, **kwargs)
-        self.linear = self.linear.to(*args, **kwargs)
-        return self
-
-
-class TransformerLayerMaxPool(nn.MaxPool1d):
-    def forward(self, hidden_states):
-        if type(hidden_states) is list:
-            hidden_states = torch.cat([x.unsqueeze(0) for x in hidden_states], dim=0)
-        hidden_size = hidden_states.size()
-        lyr, bs = hidden_size[:2]
-        hidden_states = hidden_states.view(lyr, bs, np.prod(hidden_size[2:])).permute(1, 2, 0)
-        pooled_hidden_states = F.max_pool1d(hidden_states, self.kernel_size, self.stride, self.padding, self.dilation, self.ceil_mode, self.return_indices)
-        _, _, plyr = pooled_hidden_states.size()
-        pooled_hidden_states = pooled_hidden_states.permute(2, 0, 1)
-        return pooled_hidden_states.view(plyr, bs, *hidden_size[2:])
-
-
-class TransformerLayerAvgPool(nn.AvgPool1d):
-    def forward(self, hidden_states):
-        if type(hidden_states) is list:
-            hidden_states = torch.cat([x.unsqueeze(0) for x in hidden_states], dim=0)
-        hidden_size = hidden_states.size()
-        lyr, bs = hidden_size[:2]
-        hidden_states = hidden_states.view(lyr, bs, np.prod(hidden_size[2:])).permute(1, 2, 0)
-        pooled_hidden_states = F.avg_pool1d(hidden_states, self.kernel_size, self.stride, self.padding, self.ceil_mode, self.count_include_pad)
-        _, _, plyr = pooled_hidden_states.size()
-        pooled_hidden_states = pooled_hidden_states.permute(2, 0, 1)
-        return pooled_hidden_states.view(plyr, bs, *hidden_size[2:])
-
-
-class MaskedReduction(nn.Module):
-    def __init__(self, reduction='mean', dim=-1):
-        super(MaskedReduction, self).__init__()
-        self.reduction = reduction
-        self.dim = dim
-
-    def forward(self, hidden_states, mask):
-        if type(hidden_states) is list and len(hidden_states) == 2:
-            return [self._forward(hidden_states[x], mask[x]) for x in [0,1]]
-        else:
-            return self._forward(hidden_states, mask)
-
-
-    def _forward(self, hidden_states, mask):
-        hidden_states_size, mask_size = hidden_states.size(), mask.size()
-        missed_dim = hidden_states_size[len(mask_size):]
-        for x, d in zip(missed_dim, range(len(mask_size), len(hidden_states_size))):
-            mask = mask.unsqueeze(-1).expand(*([-1] * d), x)
-        if type(self.dim) is list:
-            for d in self.dim:
-                if self.reduction == 'mean':
-                    hidden_states = (hidden_states * mask.float()).mean(dim=d, keepdim=True)
-                elif self.reduction == 'sum':
-                    hidden_states = (hidden_states * mask.float()).sum(dim=d, keepdim=True)
-                elif self.reduction == 'max':
-                    hidden_states = (hidden_states * mask.float()).max(dim=d, keepdim=True)[0]
-                else:
-                    hidden_states = hidden_states[:,0]
-                mask = mask.mean(dim=d, keepdim=True)
-            return hidden_states.view(*[hidden_states_size[x] for x in range(len(hidden_states_size)) if x not in self.dim])
-        else:
-            if self.reduction == 'mean':
-                return (hidden_states * mask.float()).mean(dim=self.dim)
-            elif self.reduction == 'sum':
-                return (hidden_states * mask.float()).sum(dim=self.dim)
-            elif self.reduction == 'max':
-                return (hidden_states * mask.float()).max(dim=self.dim)[0]
-            else:
-                return hidden_states[:,0]
-
-
 class BERTClfHead(BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
         super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
@@ -626,136 +419,6 @@ class TransformXLClfHead(BaseClfHead):
 
     def transformer(self, input_ids, pool_idx=None):
         return self.lm_model.transformer(input_ids=input_ids.view(input_ids.size(0), -1))
-
-
-# class ELMoClfHead(BaseClfHead):
-#     def __init__(self, lm_model, config, task_type, elmohdim=0, w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, pool=None, seq2seq=None, seq2vec=None, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-#         from gensim.models import KeyedVectors
-#         from gensim.models.keyedvectors import Word2VecKeyedVectors
-#         super(ELMoClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, pdrop=pdrop, mlt_trnsfmr=mlt_trnsfmr, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
-#         self.vocab_size = 793471
-#         self.dim_mulriple = 2 if task_type == 'entlmnt' or (task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) is None) else 1 # two or one sentence
-#         self.n_embd = config['elmoedim'] * self.dim_mulriple * 2 # two ELMo layer * sentence number * ELMo embedding dimensions
-#         self.w2v_model = w2v_path if type(w2v_path) is Word2VecKeyedVectors else (KeyedVectors.load(w2v_path, mmap='r') if w2v_path and os.path.isfile(w2v_path) else None)
-#         self._int_actvtn = nn.ReLU
-#         self._out_actvtn = nn.Sigmoid
-#         self.crf = ConditionalRandomField(num_lbs) if do_crf else None
-#         if task_type == 'nmt':
-#             self.pool = None
-#             self.seq2vec = None
-#             if seq2seq:
-#                 params = {}
-#                 if seq2seq.startswith('pytorch-'):
-#                     pth_mdl = '-'.join(seq2seq.split('-')[1:])
-#                     _ = [params.update(x) for x in [SEQ2SEQ_MDL_PARAMS.setdefault('pytorch', {}).setdefault('elmo', {}), SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(task_type, {})]]
-#                     self.seq2seq = gen_pytorch_wrapper('seq2seq', pth_mdl, **params[pth_mdl])
-#                     encoder_odim = SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
-#                 else:
-#                     _ = [params.update(x) for x in [SEQ2SEQ_MDL_PARAMS.setdefault(seq2seq, {}).setdefault('elmo', {}), SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(task_type, {})]]
-#                     self.seq2seq = SEQ2SEQ_MAP[seq2seq](**params)
-#                     encoder_odim = SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params])
-#             else:
-#                 self.seq2seq = None
-#                 encoder_odim = self.n_embd
-#             self.norm = NORM_TYPE_MAP[norm_type](128)
-#             # self.norm = nn.LayerNorm([128,2048])
-#             self.linear = nn.Sequential(nn.Linear(encoder_odim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, num_lbs), self._out_actvtn()) if elmohdim else nn.Sequential(nn.Linear(encoder_odim, num_lbs), self._out_actvtn())
-#         elif seq2vec:
-#             self.pool = None
-#             params = {}
-#             if seq2vec.startswith('pytorch-'):
-#                 pth_mdl = '-'.join(seq2vec.split('-')[1:])
-#                 _ = [params.update(x) for x in [SEQ2VEC_MDL_PARAMS.setdefault('pytorch', {}).setdefault('elmo', {}), SEQ2VEC_TASK_PARAMS.setdefault('pytorch', {}).setdefault(task_type, {})]]
-#                 if (self.w2v_model): params[pth_mdl]['input_size'] = params[pth_mdl]['input_size'] + self.w2v_model.syn0.shape[1]
-#                 self.seq2vec = gen_pytorch_wrapper('seq2vec', pth_mdl, **params[pth_mdl])
-#                 encoder_odim = SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
-#             else:
-#                 _ = [params.update(x) for x in [SEQ2VEC_MDL_PARAMS.setdefault(seq2vec, {}).setdefault('elmo', {}), SEQ2VEC_TASK_PARAMS.setdefault(seq2vec, {}).setdefault(task_type, {})]]
-#                 if (self.w2v_model): params['embedding_dim'] = params['embedding_dim'] + self.w2v_model.syn0.shape[1]
-#                 self.seq2vec = SEQ2VEC_MAP[seq2vec](**params)
-#                 encoder_odim = SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params])
-#             if (self.w2v_model):
-#                 if (seq2vec == 'boe'): encoder_odim += self.w2v_model.syn0.shape[1] * self.dim_mulriple
-#                 # if (seq2vec == 'cnn'): encoder_odim -= int(1.5 * self.dim_mulriple * self.w2v_model.syn0.shape[1])
-#             self.norm = NORM_TYPE_MAP[norm_type](encoder_odim)
-#             self.linear = (nn.Sequential(nn.Linear(encoder_odim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) else [nn.Linear(elmohdim, num_lbs), self._out_actvtn()])) if self.task_type == 'sentsim' else nn.Sequential(nn.Linear(encoder_odim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, num_lbs))) if elmohdim else (nn.Sequential(*([nn.Linear(encoder_odim, encoder_odim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) else [nn.Linear(encoder_odim, num_lbs), self._out_actvtn()])) if self.task_type == 'sentsim' else nn.Linear(encoder_odim, num_lbs))
-#         elif pool:
-#             self.seq2vec = None
-#             self.pool = nn.MaxPool2d(8, stride=4) if pool == 'max' else nn.AvgPool2d(8, stride=4)
-#             self.norm = NORM_TYPE_MAP[norm_type](32130 if self.task_type == 'sentsim' or self.task_type == 'entlmnt' else 16065)
-#             self.linear = (nn.Sequential(nn.Linear(32130, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, num_lbs), self._out_actvtn()) if self.task_type == 'sentsim' else nn.Sequential(nn.Linear(32130 if self.task_type == 'entlmnt' else 16065, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, num_lbs))) if elmohdim else (nn.Sequential(nn.Linear(32130, num_lbs), self._out_actvtn()) if self.task_type == 'sentsim' else nn.Linear(32130 if self.task_type == 'entlmnt' else 16065, num_lbs))
-#         else:
-#             self.pool = None
-#             self.seq2vec = None
-#             self.norm = NORM_TYPE_MAP[norm_type](self.n_embd)
-#             self.linear = (nn.Sequential(nn.Linear(self.n_embd, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, num_lbs), self._out_actvtn()) if self.task_type == 'sentsim' else nn.Sequential(nn.Linear(self.n_embd, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, elmohdim), self._int_actvtn(), nn.Linear(elmohdim, num_lbs))) if elmohdim else nn.Linear(self.n_embd, num_lbs)
-#         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
-#
-#     def forward(self, input_ids, pool_idx, w2v_ids=None, char_ids=None, labels=None, past=None, weights=None):
-#         use_gpu = next(self.parameters()).is_cuda
-#         if self.task_type == 'entlmnt' or self.task_type == 'sentsim':
-#             mask = [torch.arange(input_ids[x].size()[1]).to('cuda').unsqueeze(0).expand(input_ids[x].size()[:2]) <= pool_idx[x].unsqueeze(1).expand(input_ids[x].size()[:2]) if use_gpu else torch.arange(input_ids[x].size()[1]).unsqueeze(0).expand(input_ids[x].size()[:2]) <= pool_idx[x].unsqueeze(1).expand(input_ids[x].size()[:2]) for x in [0,1]]
-#             embeddings = (self.lm_model(input_ids[0]), self.lm_model(input_ids[1]))
-#             clf_h = torch.cat(embeddings[0]['elmo_representations'], dim=-1), torch.cat(embeddings[1]['elmo_representations'], dim=-1)
-#             if (w2v_ids is not None and self.w2v_model):
-#                 wembd_tnsr = [torch.tensor([self.w2v_model.syn0[s] for s in w2v_ids[x]]) for x in [0,1]]
-#                 if use_gpu: wembd_tnsr = [x.to('cuda') for x in wembd_tnsr]
-#                 clf_h = [torch.cat([clf_h[x], wembd_tnsr[x]], dim=-1) for x in [0,1]]
-#             if self.seq2vec:
-#                 clf_h = [self.seq2vec(clf_h[x], mask=mask[x]) for x in [0,1]]
-#             elif self.pool:
-#                 clf_h = [clf_h[x].view(clf_h[x].size(0), 2*clf_h[x].size(1), -1) for x in [0,1]]
-#                 clf_h = [self.pool(clf_h[x]).view(clf_h[x].size(0), -1) for x in [0,1]]
-#             else:
-#                 clf_h = [clf_h[x].gather(1, pool_idx[x].unsqueeze(-1).unsqueeze(-1).expand(-1, 1, clf_h[x].size(2))).squeeze(1) for x in [0,1]]
-#             clf_h = torch.cat(clf_h, dim=-1) if self.task_type == 'entlmnt' else (clf_h if self.task_params.setdefault('sentsim_func', None) else torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
-#         else:
-#             # mask = torch.zeros(input_ids.size()[:2]).byte().to('cuda').scatter(1, pool_idx.unsqueeze(-1), 1) if use_gpu else torch.zeros(input_ids.size()[:2]).byte().scatter(1, pool_idx.unsqueeze(-1), 1)
-#             mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
-#             embeddings = self.lm_model(input_ids)
-#             clf_h = torch.cat(embeddings['elmo_representations'], dim=-1)
-#             if self.task_type == 'nmt':
-#                 clf_h = clf_h
-#                 if (self.seq2seq): clf_h = self.seq2seq(clf_h, mask=mask)
-#             elif self.seq2vec:
-#                 clf_h = self.seq2vec(clf_h, mask=mask)
-#             elif self.pool:
-#                 clf_h = clf_h.view(clf_h.size(0), 2*clf_h.size(1), -1)
-#                 clf_h = self.pool(clf_h).view(clf_h.size(0), -1)
-#             else:
-#                 clf_h = clf_h.gather(1, pool_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, clf_h.size(2))).squeeze(1)
-#         if self.task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None):
-#             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
-#             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
-#             clf_logits = [self.linear(clf_h[x]) for x in [0,1]]
-#             if self.do_lastdrop: clf_logits = [self.last_dropout(clf_logits[x]) for x in [0,1]]
-#             clf_logits = torch.cat(clf_logits, dim=-1) + torch.cat(clf_logits[::-1], dim=-1) if self.task_params['sentsim_func'] == 'concat' else (F.pairwise_distance(clf_logits[0], clf_logits[1], 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(clf_logits[0], clf_logits[1], dim=1, eps=1e-12))
-#         else:
-#             if self.do_norm: clf_h = self.norm(clf_h)
-#             clf_h = self.dropout(clf_h)
-#             clf_logits = self.linear(clf_h)
-#             if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
-#
-#         if (labels is None):
-#             if self.crf:
-#                 tag_seq, score = zip(*self.crf.viterbi_tags(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), torch.ones(*(input_ids.size()[:2])).int()))
-#                 tag_seq = torch.tensor(tag_seq).to('cuda') if use_gpu else torch.tensor(tag_seq)
-#                 clf_logits = torch.zeros((*tag_seq.size(), self.num_lbs)).to('cuda') if use_gpu else torch.zeros((*tag_seq.size(), self.num_lbs))
-#                 clf_logits = clf_logits.scatter(-1, tag_seq.unsqueeze(-1), 1)
-#                 return clf_logits
-#             return clf_logits.view(-1, self.num_lbs)
-#         if self.crf:
-#             clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), mask.long())
-#         elif self.task_type == 'mltc-clf' or self.task_type == 'entlmnt' or self.task_type == 'nmt':
-#             loss_func = nn.CrossEntropyLoss(weight=weights, reduction='none')
-#             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1))
-#         elif self.task_type == 'mltl-clf':
-#             loss_func = nn.MultiLabelSoftMarginLoss(weight=weights, reduction='none')
-#             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
-#         elif self.task_type == 'sentsim':
-#             loss_func = ContrastiveLoss(reduction='none', x_mode='dist', y_mode='sim') if self.task_params.setdefault('sentsim_func', None) else nn.MSELoss(reduction='none')
-#             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
-#         return clf_loss, None
 
 
 class EmbeddingClfHead(BaseClfHead):
@@ -1006,6 +669,214 @@ class SentVecEmbeddingSeq2Vec(EmbeddingSeq2Vec):
         return self._forward(clf_h, labels=labels, weights=weights)
 
 
+class MultiClfHead(nn.Module):
+    def __init__(self, linears):
+        super(MultiClfHead, self).__init__()
+        self.linears = linears
+
+    def forward(self, hidden_states):
+        return torch.cat([lnr(hidden_states) for lnr in self.linears], dim=-1)
+
+    def to(self, *args, **kwargs):
+        super(MultiClfHead, self).to(*args, **kwargs)
+        self.linears = [lnr.to(*args, **kwargs) for lnr in self.linears]
+        return self
+
+
+class SiameseRankHead(nn.Module):
+    def __init__(self, linear, siamese_linear, binlbr, tokenizer, encode_func, trnsfm, special_tknids_args, pad_val, base_model, thrshld_lnr=0.5, thrshld_sim=0.5, topk=None, num_sampling_note=1, lbnotes='lbnotes.csv'):
+        super(SiameseRankHead, self).__init__()
+        self.linear = linear
+        self.siamese_linear = siamese_linear
+        self.base_model = dict(zip(['model', 'tokenizer', 'encode_func', 'special_tknids_args', 'pad_val', 'transforms', 'transforms_args', 'transforms_kwargs'], [base_model, tokenizer, encode_func, special_tknids_args, pad_val]+trnsfm))
+        self.binlbr = binlbr
+        self.thrshld_lnr = thrshld_lnr
+        self.thrshld_sim = thrshld_sim
+        self.topk = topk
+        self.num_sampling_note = num_sampling_note
+        self.lbnotes = lbnotes if type(lbnotes) is pd.DataFrame else pd.read_csv(lbnotes, sep='\t', index_col='id', encoding='utf-8')
+
+    def forward(self, hidden_states):
+        # generate candidates with linear and rank the candidates with siamese_linear
+        use_gpu = next(self.parameters()).is_cuda
+        batch_size = 125
+        logits = self.linear(hidden_states)
+        prob = torch.sigmoid(logits)
+        if self.topk:
+            topk, topk_indices = torch.topk(prob.data, self.topk)
+            prob_topk = torch.zeros(prob.size(), dtype=topk.dtype).scatter_(1, topk_indices.cpu(), topk.cpu())
+            pred = (prob_topk > self.thrshld_lnr).int()
+        else:
+            pred = (prob.data > self.thrshld_lnr).int()
+        pred_csc = csc_matrix(pred.cpu().numpy())
+        pred_scores = [[] for x in range(len(pred_csc.data))]
+        labels = [self.binlbr[i] for i in range(len(self.binlbr))]
+        num_notes = np.array([min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0]) if lb in self.lbnotes.index else 0 for lb in labels])
+        num_samps = pred_csc.indptr[1:] - pred_csc.indptr[:-1]
+        total_num_notes, total_num_pairs = sum(num_notes), sum(num_samps * num_notes)
+        def gen_samples():
+            for i, lb in enumerate(labels):
+                for note in (self.lbnotes.loc[lb]['text'].sample(n=min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0])) if type(self.lbnotes.loc[lb]['text']) is pd.Series else [self.lbnotes.loc[lb]['text']]) if lb in self.lbnotes.index else []:
+                    tkns = self._transform_chain((self.base_model['encode_func'](note, self.base_model['tokenizer']), None), self.base_model['transforms'], self.base_model['transforms_args'], self.base_model['transforms_kwargs'])[0]
+                    yield tkns, i, pred_csc.indices[pred_csc.indptr[i]:pred_csc.indptr[i+1]]
+        def gen_pairs():
+            batch_tkns, lb_indices, orig_indices = [[] for x in range(3)]
+            for i, (x, lbidx, orig_idx) in enumerate(gen_samples()):
+                batch_tkns.append(x)
+                lb_indices.append(lbidx)
+                orig_indices.append(orig_idx)
+                if i > 0 and i % batch_size == 0 or i == total_num_notes - 1:
+                    clf_tknids = self.base_model['special_tknids_args']['clf_tknids']
+                    tkns_tnsr = torch.tensor(batch_tkns, dtype=torch.long).to('cuda') if use_gpu else torch.tensor(batch_tkns, dtype=torch.long)
+                    mask_tnsr = (~tkns_tnsr.eq(self.base_model['pad_val'] * torch.ones_like(tkns_tnsr))).long()
+                    pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+                    note_clf_h = self.base_model['model'](tkns_tnsr, mask_tnsr if type(self.base_model['model']) is BERTClfHead else pool_idx, embedding_mode=True)
+                    # note_clf_h = hidden_states[:1]
+                    for j, clf_h in enumerate(note_clf_h):
+                        for orig_id in orig_indices[j]:
+                            yield clf_h, hidden_states[orig_id], lb_indices[j], orig_id
+                    batch_tkns, lb_indices, orig_indices = [[] for x in range(3)]
+        batch_pairs, indices = [[] for x in range(2)]
+        for i, (h1, h2, lbidx, orig_id) in enumerate(tqdm(gen_pairs(), desc='[%i pair(s)] Siamese similarity ranking' % (total_num_pairs))):
+            batch_pairs.append([h1, h2])
+            indices.append([lbidx, orig_id])
+            if i > 0 and i % batch_size == 0 or i == total_num_pairs - 1:
+                clf_h = [torch.stack(x) for x in zip(*batch_pairs)]
+                continue
+                if (self.base_model['model'].task_params.setdefault('sentsim_func', None) is None or self.base_model['model'].task_params['sentsim_func'] == 'concat'):
+                    clf_h = torch.cat(clf_h, dim=-1)
+                    sim_logits = self.siamese_linear(clf_h) if self.siamese_linear else clf_h
+                else:
+                    sim_logits = F.pairwise_distance(self.siamese_linear(clf_h[0]), self.siamese_linear(clf_h[1]), 2, eps=1e-12) if self.base_model['model'].task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.siamese_linear(clf_h[0]), self.siamese_linear(clf_h[1]), dim=1, eps=1e-12)
+                sim_probs = torch.sigmoid(sim_logits).data
+                for idx, sim_prob in zip(indices, sim_probs):
+                    orig_idx = pred_csc.indptr[idx[0]], pred_csc.indptr[idx[0]+1]
+                    pred_scores[orig_idx[0]:orig_idx[1]][np.where(pred_csc.indices[orig_idx[0]:orig_idx[1]]==idx[1])[0][0]].append(sim_prob.cpu().numpy())
+                batch_pairs, indices = [[] for x in range(2)]
+        pred_scores = [np.mean(x) for x in pred_scores]
+        sim_probs_tnsr = torch.tensor(csc_matrix((pred_scores, pred_csc.indices, pred_csc.indptr), shape=pred_csc.shape).todense(), dtype=torch.float)
+        if use_gpu: sim_probs_tnsr = sim_probs_tnsr.to('cuda')
+        logits = sim_probs_tnsr * prob
+        return logits
+
+    def to(self, *args, **kwargs):
+        super(SiameseRankHead, self).to(*args, **kwargs)
+        self.linear = self.linear.to(*args, **kwargs)
+        return self
+
+    def _transform_chain(self, sample, transforms, transforms_args={}, transforms_kwargs={}):
+        if transforms:
+            transforms = transforms if type(transforms) is list else [transforms]
+            transforms_kwargs = transforms_kwargs if type(transforms_kwargs) is list else [transforms_kwargs]
+            for transform, transform_kwargs in zip(transforms, transforms_kwargs):
+                transform_kwargs.update(transforms_args)
+                sample = transform(sample, **transform_kwargs) if callable(transform) else getattr(self, transform)(sample, **transform_kwargs)
+        return sample
+
+
+class TransformerLayerMaxPool(nn.MaxPool1d):
+    def forward(self, hidden_states):
+        if type(hidden_states) is list:
+            hidden_states = torch.cat([x.unsqueeze(0) for x in hidden_states], dim=0)
+        hidden_size = hidden_states.size()
+        lyr, bs = hidden_size[:2]
+        hidden_states = hidden_states.view(lyr, bs, np.prod(hidden_size[2:])).permute(1, 2, 0)
+        pooled_hidden_states = F.max_pool1d(hidden_states, self.kernel_size, self.stride, self.padding, self.dilation, self.ceil_mode, self.return_indices)
+        _, _, plyr = pooled_hidden_states.size()
+        pooled_hidden_states = pooled_hidden_states.permute(2, 0, 1)
+        return pooled_hidden_states.view(plyr, bs, *hidden_size[2:])
+
+
+class TransformerLayerAvgPool(nn.AvgPool1d):
+    def forward(self, hidden_states):
+        if type(hidden_states) is list:
+            hidden_states = torch.cat([x.unsqueeze(0) for x in hidden_states], dim=0)
+        hidden_size = hidden_states.size()
+        lyr, bs = hidden_size[:2]
+        hidden_states = hidden_states.view(lyr, bs, np.prod(hidden_size[2:])).permute(1, 2, 0)
+        pooled_hidden_states = F.avg_pool1d(hidden_states, self.kernel_size, self.stride, self.padding, self.ceil_mode, self.count_include_pad)
+        _, _, plyr = pooled_hidden_states.size()
+        pooled_hidden_states = pooled_hidden_states.permute(2, 0, 1)
+        return pooled_hidden_states.view(plyr, bs, *hidden_size[2:])
+
+
+class MaskedReduction(nn.Module):
+    def __init__(self, reduction='mean', dim=-1):
+        super(MaskedReduction, self).__init__()
+        self.reduction = reduction
+        self.dim = dim
+
+    def forward(self, hidden_states, mask):
+        if type(hidden_states) is list and len(hidden_states) == 2:
+            return [self._forward(hidden_states[x], mask[x]) for x in [0,1]]
+        else:
+            return self._forward(hidden_states, mask)
+
+
+    def _forward(self, hidden_states, mask):
+        hidden_states_size, mask_size = hidden_states.size(), mask.size()
+        missed_dim = hidden_states_size[len(mask_size):]
+        for x, d in zip(missed_dim, range(len(mask_size), len(hidden_states_size))):
+            mask = mask.unsqueeze(-1).expand(*([-1] * d), x)
+        if type(self.dim) is list:
+            for d in self.dim:
+                if self.reduction == 'mean':
+                    hidden_states = (hidden_states * mask.float()).mean(dim=d, keepdim=True)
+                elif self.reduction == 'sum':
+                    hidden_states = (hidden_states * mask.float()).sum(dim=d, keepdim=True)
+                elif self.reduction == 'max':
+                    hidden_states = (hidden_states * mask.float()).max(dim=d, keepdim=True)[0]
+                else:
+                    hidden_states = hidden_states[:,0]
+                mask = mask.mean(dim=d, keepdim=True)
+            return hidden_states.view(*[hidden_states_size[x] for x in range(len(hidden_states_size)) if x not in self.dim])
+        else:
+            if self.reduction == 'mean':
+                return (hidden_states * mask.float()).mean(dim=self.dim)
+            elif self.reduction == 'sum':
+                return (hidden_states * mask.float()).sum(dim=self.dim)
+            elif self.reduction == 'max':
+                return (hidden_states * mask.float()).max(dim=self.dim)[0]
+            else:
+                return hidden_states[:,0]
+
+
+class ThresholdEstimator(nn.Module):
+    def __init__(self, last_hdim, fchdim=100, iactvtn='relu', oactvtn='sigmoid', init_thrshld=0.5):
+        super(ThresholdEstimator, self).__init__()
+        self.thrshld = init_thrshld
+        self.linear = nn.Sequential(nn.Linear(last_hdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, 1), ACTVTN_MAP[oactvtn]()) if fchdim else nn.Sequential(nn.Linear(last_hdim, 1), ACTVTN_MAP[oactvtn]())
+
+    def forward(self, logits):
+        return self.linear(logits)
+
+
+class HrchConstraint(nn.Module):
+    def __init__(self, num_lbs, hrchrel_path='', binlb={}):
+        super(HrchConstraint, self).__init__()
+        with open(hrchrel_path, 'rb') as fd:
+            hrchrel = pickle.load(fd)
+        out_order = binlb.keys()
+        if out_order:
+            hrchrel = hrchrel[out_order]
+            hrchrel = hrchrel.loc[out_order]
+        # np.fill_diagonal(hrchrel.values, 1)
+        self.hrchrel = torch.tensor(hrchrel.values).float()
+        self.linear = nn.Linear(num_lbs, num_lbs)
+
+    def forward(self, logits):
+        out = torch.mm(logits, self.linear(self.hrchrel))
+        out = out / out.sum(0).expand_as(out)
+        out[torch.isnan(out)] = 0
+        return logits + out
+
+    def to(self, *args, **kwargs):
+        super(HrchConstraint, self).to(*args, **kwargs)
+        self.hrchrel = self.hrchrel.to(*args, **kwargs)
+        self.linear = self.linear.to(*args, **kwargs)
+        return self
+
+
 class RegressionLoss(nn.Module):
     def __init__(self, reduction='none', x_mode='dist', y_mode='dist'):
         super(RegressionLoss, self).__init__()
@@ -1112,6 +983,31 @@ class EarlyStopping(object):
                 self.is_better = lambda a, best: a < best - (best * min_delta / 100)
             if mode == 'max':
                 self.is_better = lambda a, best: a > best + (best * min_delta / 100)
+
+
+class DataParallel(nn.DataParallel):
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+    def replicate(self, module, device_ids):
+        replicas = super().replicate(module, device_ids)
+        for attr in dir(module):
+            attr_obj = getattr(module, attr)
+            if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]):
+                rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in attr_obj])
+                for mdl, rplc in zip(replicas, rplcs):
+                    setattr(mdl, attr, rplc)
+            elif isinstance(attr_obj, nn.Module):
+                for sub_attr in dir(attr_obj):
+                    sub_attr_obj = getattr(attr_obj, sub_attr)
+                    if type(sub_attr_obj) is list and all([isinstance(x, nn.Module) for x in sub_attr_obj]):
+                        rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in sub_attr_obj])
+                        for mdl, rplc in zip(replicas, rplcs):
+                            setattr(getattr(mdl, attr), sub_attr, rplc)
+        return replicas
 
 
 class BaseDataset(Dataset):
@@ -1560,6 +1456,38 @@ def _weights_init(mean=0., std=0.02):
     return _wi
 
 
+def _prsn_cor(trues, preds):
+    return sp.stats.pearsonr(trues, preds)[0]
+
+
+def _sprmn_cor(trues, preds):
+    return sp.stats.spearmanr(trues, preds)[0]
+
+
+def _handle_model(model, dev_id=None, distrb=False):
+    if (distrb):
+        if (type(dev_id) is list):
+            model.cuda()
+            model = nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
+        else:
+            torch.cuda.set_device(dev_id)
+            model = model.to('cuda')
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
+            raise NotImplementedError
+            # Not implemented, should divide data outside this function and get one portion here, probably with parallel version of `load_data`
+    elif (dev_id is not None):
+        if (type(dev_id) is list):
+            model = model.to('cuda')
+            # for attr in dir(model):
+            #     attr_obj = getattr(model, attr)
+            #     if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]): setattr(model, attr, [DataParallel(x) for x in attr_obj])
+            model = DataParallel(model, device_ids=dev_id)
+        else:
+            torch.cuda.set_device(dev_id)
+            model = model.to('cuda')
+    return model
+
+
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
     return {'options_file':options_path, 'weight_file':weights_path, 'num_output_representations':2, 'elmoedim':elmoedim, 'dropout':dropout}
 
@@ -1706,87 +1634,24 @@ def gen_clf(mdl_name, encoder='pool', constraints=[], use_gpu=False, distrb=Fals
     return clf
 
 
-def classify(dev_id=None):
-    # Prepare model related meta data
-    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
-    common_cfg = cfgr('validate', 'common')
-    pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
-    use_gpu = dev_id is not None
-    encode_func = ENCODE_FUNC_MAP[mdl_name]
-    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
-    task_type = TASK_TYPE_MAP[opts.task]
-    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
-    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
-    special_tknids_args = dict(zip(special_tkns[0], special_tknids))
-    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('seqlen',opts.maxlen)])
-    # Prepare task related meta data.
-    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
-    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
-    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {'sampfrac':opts.sampfrac}
-    if task_type == 'nmt':
-        ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
-    elif task_type == 'sentsim':
-        ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
+def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, distrb=False, **kwargs):
+    print('Saving trained model...')
+    use_gpu, multi_gpu = (devq and len(devq) > 0), (devq and len(devq) > 1)
+    if in_wrapper or multi_gpu: model = model.module
+    model = model.cpu() if use_gpu else model
+    checkpoint = {'model': model, 'state_dict': model.state_dict(), 'optimizer':optimizer, 'optimizer_state_dict':optimizer.state_dict()}
+    checkpoint.update(kwargs)
+    torch.save(checkpoint, fpath)
+    model = _handle_model(model, dev_id=devq, distrb=distrb) if use_gpu else model
 
-    # Prepare data
-    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
-    lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
-    if (not opts.weight_class or task_type == 'sentsim'):
-        class_count = None
-    elif len(lb_trsfm) > 0:
-        lb_df = train_ds.df[task_cols['y']].apply(lb_trsfm[0])
-        class_count = np.array([[1 if lb in y else 0 for lb in train_ds.binlb.keys()] for y in lb_df]).sum(axis=0)
-    else:
-        lb_df = train_ds.df[task_cols['y']]
-        binlb = task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb
-        class_count = lb_df.value_counts()[binlb.keys()].values
-    if (class_count is None):
-        class_weights = None
-        sampler = None
-    else:
-        class_weights = torch.Tensor(1.0 / class_count)
-        class_weights /= class_weights.sum()
-        sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
-        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
-    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
-    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
-    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
-    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-    # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
-
-    if (opts.resume):
-        # Load model
-        clf, optimizer, resume, chckpnt = load_model(opts.resume)
-        if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
-        print(optimizer)
-    else:
-        # Build model
-        lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
-        ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
-        if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
-        task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-        print('Classifier hyper-parameters: %s' % ext_params)
-        clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
-        print(optimizer)
-
-        # Training
-        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
-
-    # Evaluation
-    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
-    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
+def load_model(mdl_path):
+    print('Loading previously trained model...')
+    checkpoint = torch.load(mdl_path, map_location='cpu')
+    model, optimizer = checkpoint['model'], checkpoint['optimizer']
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return model, optimizer, checkpoint.setdefault('resume', {}), dict([(k, v) for k, v in checkpoint.items() if k not in ['model', 'state_dict', 'optimizer', 'optimizer_state_dict', 'resume']])
 
 
 def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, resume={}, chckpnt_kwargs={}):
@@ -2084,81 +1949,87 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
         print(e)
 
 
-def _prsn_cor(trues, preds):
-    return sp.stats.pearsonr(trues, preds)[0]
+def classify(dev_id=None):
+    # Prepare model related meta data
+    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    common_cfg = cfgr('validate', 'common')
+    pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
+    use_gpu = dev_id is not None
+    encode_func = ENCODE_FUNC_MAP[mdl_name]
+    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
+    task_type = TASK_TYPE_MAP[opts.task]
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
+    special_tknids_args = dict(zip(special_tkns[0], special_tknids))
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('seqlen',opts.maxlen)])
+    # Prepare task related meta data.
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    ds_kwargs = {'sampfrac':opts.sampfrac}
+    if task_type == 'nmt':
+        ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
+    elif task_type == 'sentsim':
+        ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
 
+    # Prepare data
+    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
+    lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
+    if (not opts.weight_class or task_type == 'sentsim'):
+        class_count = None
+    elif len(lb_trsfm) > 0:
+        lb_df = train_ds.df[task_cols['y']].apply(lb_trsfm[0])
+        class_count = np.array([[1 if lb in y else 0 for lb in train_ds.binlb.keys()] for y in lb_df]).sum(axis=0)
+    else:
+        lb_df = train_ds.df[task_cols['y']]
+        binlb = task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb
+        class_count = lb_df.value_counts()[binlb.keys()].values
+    if (class_count is None):
+        class_weights = None
+        sampler = None
+    else:
+        class_weights = torch.Tensor(1.0 / class_count)
+        class_weights /= class_weights.sum()
+        sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
+        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
+    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
-def _sprmn_cor(trues, preds):
-    return sp.stats.spearmanr(trues, preds)[0]
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
+    if (opts.resume):
+        # Load model
+        clf, optimizer, resume, chckpnt = load_model(opts.resume)
+        if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
+        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
+        print(optimizer)
+    else:
+        # Build model
+        lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
+        ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
+        if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
+        task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+        print('Classifier hyper-parameters: %s' % ext_params)
+        clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
+        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+        print(optimizer)
 
-def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, distrb=False, **kwargs):
-    print('Saving trained model...')
-    use_gpu, multi_gpu = (devq and len(devq) > 0), (devq and len(devq) > 1)
-    if in_wrapper or multi_gpu: model = model.module
-    model = model.cpu() if use_gpu else model
-    checkpoint = {'model': model, 'state_dict': model.state_dict(), 'optimizer':optimizer, 'optimizer_state_dict':optimizer.state_dict()}
-    checkpoint.update(kwargs)
-    torch.save(checkpoint, fpath)
-    model = _handle_model(model, dev_id=devq, distrb=distrb) if use_gpu else model
+        # Training
+        train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
 
-
-def load_model(mdl_path):
-    print('Loading previously trained model...')
-    checkpoint = torch.load(mdl_path, map_location='cpu')
-    model, optimizer = checkpoint['model'], checkpoint['optimizer']
-    model.load_state_dict(checkpoint['state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return model, optimizer, checkpoint.setdefault('resume', {}), dict([(k, v) for k, v in checkpoint.items() if k not in ['model', 'state_dict', 'optimizer', 'optimizer_state_dict', 'resume']])
-
-
-class DataParallel(nn.DataParallel):
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.module, name)
-
-    def replicate(self, module, device_ids):
-        replicas = super().replicate(module, device_ids)
-        for attr in dir(module):
-            attr_obj = getattr(module, attr)
-            if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]):
-                rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in attr_obj])
-                for mdl, rplc in zip(replicas, rplcs):
-                    setattr(mdl, attr, rplc)
-            elif isinstance(attr_obj, nn.Module):
-                for sub_attr in dir(attr_obj):
-                    sub_attr_obj = getattr(attr_obj, sub_attr)
-                    if type(sub_attr_obj) is list and all([isinstance(x, nn.Module) for x in sub_attr_obj]):
-                        rplcs = zip(*[replicate(x, device_ids, not torch.is_grad_enabled()) for x in sub_attr_obj])
-                        for mdl, rplc in zip(replicas, rplcs):
-                            setattr(getattr(mdl, attr), sub_attr, rplc)
-        return replicas
-
-
-def _handle_model(model, dev_id=None, distrb=False):
-    if (distrb):
-        if (type(dev_id) is list):
-            model.cuda()
-            model = nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
-        else:
-            torch.cuda.set_device(dev_id)
-            model = model.to('cuda')
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
-            raise NotImplementedError
-            # Not implemented, should divide data outside this function and get one portion here, probably with parallel version of `load_data`
-    elif (dev_id is not None):
-        if (type(dev_id) is list):
-            model = model.to('cuda')
-            # for attr in dir(model):
-            #     attr_obj = getattr(model, attr)
-            #     if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]): setattr(model, attr, [DataParallel(x) for x in attr_obj])
-            model = DataParallel(model, device_ids=dev_id)
-        else:
-            torch.cuda.set_device(dev_id)
-            model = model.to('cuda')
-    return model
+    # Evaluation
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
 
 
 def multi_clf(dev_id=None):
