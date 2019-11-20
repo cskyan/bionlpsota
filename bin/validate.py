@@ -108,7 +108,7 @@ class SiameseRankHead(nn.Module):
         total_num_notes, total_num_pairs = sum(num_notes), sum(num_samps * num_notes)
         def gen_samples():
             for i, lb in enumerate(labels):
-                for note in self.lbnotes.loc[lb]['text'].sample(n=min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0])) if lb in self.lbnotes.index else []:
+                for note in (self.lbnotes.loc[lb]['text'].sample(n=min(self.num_sampling_note, self.lbnotes.loc[lb].shape[0])) if type(self.lbnotes.loc[lb]['text']) is pd.Series else [self.lbnotes.loc[lb]['text']]) if lb in self.lbnotes.index else []:
                     tkns = self._transform_chain((self.base_model['encode_func'](note, self.base_model['tokenizer']), None), self.base_model['transforms'], self.base_model['transforms_args'], self.base_model['transforms_kwargs'])[0]
                     yield tkns, i, pred_csc.indices[pred_csc.indptr[i]:pred_csc.indptr[i+1]]
         def gen_pairs():
@@ -1035,19 +1035,40 @@ class HuberLoss(RegressionLoss):
 class LogCoshLoss(RegressionLoss):
     def forward(self, y_pred, y_true):
         ydiff = y_pred - self.ytransform(y_true)
-        return torch.mean(torch.log(torch.cosh(ydiff + 1e-12)))
+        loss = torch.log(torch.cosh(ydiff + 1e-12))
+        return loss if self.reduction == 'none' else torch.mean(loss)
 
 
 class XTanhLoss(RegressionLoss):
     def forward(self, y_pred, y_true):
         ydiff = y_pred - self.ytransform(y_true)
-        return torch.mean(ydiff * torch.tanh(ydiff))
+        loss = ydiff * torch.tanh(ydiff)
+        return loss if self.reduction == 'none' else torch.mean(loss)
 
 
 class XSigmoidLoss(RegressionLoss):
     def forward(self, y_pred, y_true):
         ydiff = y_pred - self.ytransform(y_true)
-        return torch.mean(2 * ydiff / (1 + torch.exp(-ydiff)) - ydiff)
+        loss = 2 * ydiff / (1 + torch.exp(-ydiff)) - ydiff
+        return loss if self.reduction == 'none' else torch.mean(loss)
+
+class QuantileLoss(RegressionLoss):
+    def __init__(self, reduction='none', x_mode='dist', y_mode='dist', quantile=0.5):
+        super(QuantileLoss, self).__init__(reduction=reduction, x_mode=x_mode, y_mode=y_mode)
+        self.quantile = 0.5
+
+    def forward(self, y_pred, y_true):
+        ydiff = y_true - y_pred
+        loss = torch.max(self.quantile * ydiff, (self.quantile - 1) * ydiff)
+        return loss if self.reduction == 'none' else torch.mean(loss)
+
+class PearsonCorrelationLoss(RegressionLoss):
+    def forward(self, y_pred, y_true):
+        var_pred = y_pred - torch.mean(y_pred)
+        var_true = y_true - torch.mean(y_true)
+        # loss = torch.sum(var_pred * var_true) / (torch.sqrt(torch.sum(var_pred ** 2)) * torch.sqrt(torch.sum(var_true ** 2)))
+        loss = var_pred * var_true * torch.rsqrt(torch.sum(var_pred ** 2)) * torch.rsqrt(torch.sum(var_true ** 2))
+        return loss if self.reduction == 'none' else torch.mean(loss)
 
 
 class EarlyStopping(object):
@@ -1613,7 +1634,7 @@ SEQ2SEQ_DIM_INFER = {'pytorch-lstm':lambda x: x[1] * x[2]['hidden_size'], 'pytor
 SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden_size'], 'pytorch-agmnlstm':lambda x: x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[2]['hidden_size'], 'pytorch-stkaltlstm':lambda x: x[2]['hidden_size'], 'pytorch-gru':lambda x: x[2]['hidden_size'], 'cnn':lambda x: int(1.5 * x[2]['embedding_dim']), 'cnn_highway':lambda x: x[0]}
 NORM_TYPE_MAP = {'batch':nn.BatchNorm1d, 'layer':nn.LayerNorm}
 ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid}
-RGRSN_LOSS_MAP = {'contrastive':ContrastiveLoss, 'huber':HuberLoss, 'logcosh':LogCoshLoss, 'xtanh':XTanhLoss, 'xsigmoid':XSigmoidLoss}
+RGRSN_LOSS_MAP = {'contrastive':ContrastiveLoss, 'huber':HuberLoss, 'logcosh':LogCoshLoss, 'xtanh':XTanhLoss, 'xsigmoid':XSigmoidLoss, 'quantile':QuantileLoss, 'pearson':PearsonCorrelationLoss}
 SIM_FUNC_MAP = {'sim':'sim', 'dist':'dist'}
 CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
 CNSTRNTS_MAP = {'hrch':(HrchConstraint, {('num_lbs','num_lbs'):1, ('hrchrel_path','hrchrel_path'):'hpo_ancrels.pkl', ('binlb','binlb'):{}})}
@@ -2347,11 +2368,11 @@ def siamese_rank(dev_id=None):
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     # Training on doc/sent-pair datasets
-    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
+    # train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
 
     # Evaluating on the doc/sent-pair dev and test sets
-    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev_siamese', mdl_name=opts.model, use_gpu=use_gpu)
-    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test_siamese', mdl_name=opts.model, use_gpu=use_gpu)
+    # eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev_siamese', mdl_name=opts.model, use_gpu=use_gpu)
+    # eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test_siamese', mdl_name=opts.model, use_gpu=use_gpu)
 
     # Adjust the model
     clf.merge_siamese(tokenizer=tokenizer, encode_func=encode_func, trnsfm=[trsfms, {}, trsfms_kwargs], special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), topk=128, lbnotes='../lbnotes.csv')
