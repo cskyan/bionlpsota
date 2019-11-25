@@ -114,10 +114,9 @@ class BaseClfHead(nn.Module):
         else:
             lm_loss = None
 
-        # print(('hdstat: ', hidden_states.size()))
+        # print(('hdstat: ', [x.size() for x in hidden_states] if type(hidden_states) is list else hidden_states.size()))
         clf_h, pool_idx = self.clf_h(hidden_states, pool_idx, past=past)
-        # print(('after clf_h', clf_h.size()))
-        # print(('after pool', clf_h))
+        # print(('after clf_h', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
         if self.task_type == 'nmt':
             if (hasattr(self, 'layer_pooler')):
                 clf_h = self.layer_pooler(clf_h).view(clf_h[0].size())
@@ -139,10 +138,8 @@ class BaseClfHead(nn.Module):
             pool_offset = smp_offset * (input_ids[0].size(-1) if self.mlt_trnsfmr and self.task_type in ['sentsim'] else input_ids.size(-1)) + pool_idx
             pool_h = pool_offset.unsqueeze(-1).expand(-1, self.n_embd)
             pool_h = pool_h.to('cuda') if use_gpu else pool_h
-            # print(('clf_h', clf_h.size()))
-            # print(('index', pool_h.size()))
             clf_h = [clf_h[x].gather(0, pool_h) for x in [0,1]] if self.mlt_trnsfmr and self.task_type in ['sentsim'] else clf_h.gather(0, pool_h)
-        # print(('after pool', clf_h))
+        # print(('after pool', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
         if self.mlt_trnsfmr and self.task_type in ['sentsim']:
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
@@ -1277,7 +1274,7 @@ class ConceptREDataset(BaseDataset):
 
 def _sentclf_transform(sample, options=None, model=None, seqlen=32, start_tknids=[], clf_tknids=[], **kwargs):
     X, y = sample
-    if model == 'bert':
+    if model == 'bert' and (kwargs.setdefault('sentsim_func', None) is None or kwargs['sentsim_func']=='concat'):
         X = [start_tknids + x for x in X] if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else start_tknids + X
     else: # GPT
         X = [start_tknids + x + clf_tknids for x in X] if hasattr(X, '__iter__') and len(X) > 0 and type(X[0]) is not str and hasattr(X[0], '__iter__') else start_tknids + X + clf_tknids
@@ -1286,7 +1283,7 @@ def _sentclf_transform(sample, options=None, model=None, seqlen=32, start_tknids
 
 def _entlmnt_transform(sample, options=None, model=None, seqlen=32, start_tknids=[], clf_tknids=[], delim_tknids=[], **kwargs):
     X, y = sample
-    if model == 'bert':
+    if model == 'bert' and (kwargs.setdefault('sentsim_func', None) is None or kwargs['sentsim_func']=='concat'):
         trim_len = int(np.ceil((sum([len(v) for v in [start_tknids, X[0], delim_tknids, X[1]]]) - seqlen) / 2.0))
         X = [x[:len(x)-trim_len] for x in X]
         X = start_tknids + X[0] + delim_tknids + X[1]
@@ -1299,7 +1296,7 @@ def _entlmnt_transform(sample, options=None, model=None, seqlen=32, start_tknids
 
 def _sentsim_transform(sample, options=None, model=None, seqlen=32, start_tknids=[], clf_tknids=[], delim_tknids=[], **kwargs):
     X, y = sample
-    if model == 'bert':
+    if model == 'bert' and (kwargs.setdefault('sentsim_func', None) is None or kwargs['sentsim_func']=='concat'):
         trim_len = int(np.ceil((sum([len(v) for v in [start_tknids, X[0], delim_tknids, X[1]]]) - seqlen) / 2.0))
         X = [x[:len(x)-trim_len] for x in X]
         X = start_tknids + X[0] + delim_tknids + X[1]
@@ -1661,89 +1658,96 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
         total_loss = 0
         # if task_type not in ['entlmnt', 'sentsim']: dataset.dataset.rebalance()
         for step, batch in enumerate(tqdm(dataset, desc='[%i/%i epoch(s)] Training batches' % (epoch + 1, epochs))):
-            if epoch == resume['epoch'] and step < elapsed_batch: continue
-            optimizer.zero_grad()
-            if task_type == 'nmt':
-                if mdl_name == 'bert':
-                    idx, tkns_tnsr, lb_tnsr, record_idx, masked_lm_ids_tnsr, masked_lm_lbs_tnsr = batch
-                    clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
-                else:
-                    idx, tkns_tnsr, lb_tnsr, record_idx = batch
-                record_idx = [list(map(int, x.split(SC))) for x in record_idx]
-            else:
-                if mdl_name == 'bert':
-                    idx, tkns_tnsr, lb_tnsr, masked_lm_ids_tnsr, masked_lm_lbs_tnsr = batch
-                    clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
-                else:
-                    idx, tkns_tnsr, lb_tnsr = batch
-            if len(idx) < 2: continue
-            if (mdl_name in LM_EMBED_MDL_MAP):
-                if task_type in ['entlmnt', 'sentsim']:
-                    tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
-                    tkns_tnsr = [[s[:min(len(s), opts.maxlen)] for s in tkns_tnsr[x]] for x in [0,1]]
-                    w2v_tnsr = [_batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                    sentvec_tnsr = [_batch2ids_sentvec(tkns_tnsr[x], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
-                    pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
-                    if mdl_name.startswith('elmo'):
-                        tkns_tnsr = [tkns_tnsr[x] + [[''] * opts.maxlen] for x in [0,1]]
-                        tkns_tnsr = [batch_to_ids(tkns_tnsr[x])[:-1] for x in [0,1]]
-                        pad_val = 0
+            try:
+                if epoch == resume['epoch'] and step < elapsed_batch: continue
+                optimizer.zero_grad()
+                if task_type == 'nmt':
+                    if mdl_name == 'bert':
+                        idx, tkns_tnsr, lb_tnsr, record_idx, masked_lm_ids_tnsr, masked_lm_lbs_tnsr = batch
+                        clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
                     else:
-                        # tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
-                        tkns_tnsr = [torch.tensor([[1]*len(s) + [pad_val[0]] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]]) for x in [0,1]]
-                    if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]], (weights if weights is None else weights.to('cuda'))
-                elif task_type == 'nmt':
-                    # tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
-                    tkns_tnsr, lb_tnsr = zip(*[(sx.split(SC), list(map(int, sy.split(SC)))) for sx, sy in zip(tkns_tnsr, lb_tnsr) if ((type(sx) is str and sx != '') or len(sx) > 0) and ((type(sy) is str and sy != '') or len(sy) > 0)])
-                    if (len(tkns_tnsr) == 0 or len(lb_tnsr) == 0): continue
-                    lb_tnsr = torch.LongTensor([s[:min(len(s), opts.maxlen)] + [pad_val[1]] * (opts.maxlen-len(s)) for s in lb_tnsr])
-                    tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
-                    w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                    sentvec_tnsr = None
-                    pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
-                    if mdl_name.startswith('elmo'):
-                        tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
-                        tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
-                        pad_val = (0, pad_val[1])
-                    else:
-                        # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
-                        tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
-                    if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                        idx, tkns_tnsr, lb_tnsr, record_idx = batch
+                    record_idx = [list(map(int, x.split(SC))) for x in record_idx]
                 else:
-                    tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
-                    tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
-                    w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
-                    sentvec_tnsr = _batch2ids_sentvec(tkns_tnsr, clf.sentvec_model) if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
-                    pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
-                    if mdl_name.startswith('elmo'):
-                        tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
-                        tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
-                        pad_val = 0
+                    if mdl_name == 'bert':
+                        idx, tkns_tnsr, lb_tnsr, masked_lm_ids_tnsr, masked_lm_lbs_tnsr = batch
+                        clf_kwargs = {'lm_logit_kwargs':{'masked_lm_ids':masked_lm_ids_tnsr.to('cuda') if use_gpu else masked_lm_ids_tnsr, 'masked_lm_lbs':masked_lm_lbs_tnsr.to('cuda') if use_gpu else masked_lm_lbs_tnsr}}
                     else:
-                        # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
-                        tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
-                    if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
-                if mdl_name.endswith('sentvec'): clf_kwargs.update(dict(sentvec_tnsr=sentvec_tnsr))
-                mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-                clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
-            else:
-                valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
-                if (len(valid_idx) == 0): continue
-                idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], [record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None
-                tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr
-                mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-                lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else mask_tnsr[:, 1:].contiguous())
-                if (use_gpu): tkns_tnsr, lb_tnsr, lm_mask_tnsr, mask_tnsr, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), (lm_mask_tnsr if lm_mask_tnsr is None else ([lm_mask_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else lm_mask_tnsr.to('cuda'))), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else mask_tnsr.to('cuda'), (weights if weights is None else weights.to('cuda'))
-                pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-                clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=mask_tnsr if task_type == 'nmt' or mdl_name == 'bert' else pool_idx, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
-            clf_loss = ((clf_loss.view(tkns_tnsr.size(0), -1) * mask_tnsr.float()).sum(1) / (1e-12 + mask_tnsr.float().sum(1))).mean() if task_type == 'nmt' and clf.crf is None else clf_loss.mean()
-            train_loss = clf_loss if lm_loss is None else (clf_loss + lmcoef * ((lm_loss.view(tkns_tnsr.size(0), -1) * lm_mask_tnsr.float()).sum(1) / (1e-12 + lm_mask_tnsr.float().sum(1))).mean())
-            total_loss += train_loss.item()
-            train_loss.backward()
-            if (clipmaxn is not None):
-                torch.nn.utils.clip_grad_value_(clf.lm_model.encoder.layer.parameters() if mdl_name == 'bert' else clf.parameters(), clipmaxn)
-                torch.nn.utils.clip_grad_value_(clf.parameters(), clipmaxn)
-            optimizer.step()
+                        idx, tkns_tnsr, lb_tnsr = batch
+                if len(idx) < 2: continue
+                if (mdl_name in LM_EMBED_MDL_MAP):
+                    if task_type in ['entlmnt', 'sentsim']:
+                        tkns_tnsr = [[[w.text for w in nlp(sents)] + special_tkns['delim_tknids'] for sents in tkns_tnsr[x]] for x in [0,1]]
+                        tkns_tnsr = [[s[:min(len(s), opts.maxlen)] for s in tkns_tnsr[x]] for x in [0,1]]
+                        w2v_tnsr = [_batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                        sentvec_tnsr = [_batch2ids_sentvec(tkns_tnsr[x], clf.w2v_model) for x in [0,1]] if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
+                        pool_idx = [torch.LongTensor([len(s) - 1 for s in tkns_tnsr[x]]) for x in [0,1]]
+                        if mdl_name.startswith('elmo'):
+                            tkns_tnsr = [tkns_tnsr[x] + [[''] * opts.maxlen] for x in [0,1]]
+                            tkns_tnsr = [batch_to_ids(tkns_tnsr[x])[:-1] for x in [0,1]]
+                            pad_val = 0
+                        else:
+                            # tkns_tnsr = [[s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]] for x in [0,1]]
+                            tkns_tnsr = [torch.tensor([[1]*len(s) + [pad_val[0]] * (opts.maxlen-len(s)) for s in tkns_tnsr[x]]) for x in [0,1]]
+                        if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] , lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]], (weights if weights is None else weights.to('cuda'))
+                    elif task_type == 'nmt':
+                        # tkns_tnsr, lb_tnsr = [s.split(SC) for s in tkns_tnsr if (type(s) is str and s != '') and len(s) > 0], [list(map(int, s.split(SC))) for s in lb_tnsr if (type(s) is str and s != '') and len(s) > 0]
+                        tkns_tnsr, lb_tnsr = zip(*[(sx.split(SC), list(map(int, sy.split(SC)))) for sx, sy in zip(tkns_tnsr, lb_tnsr) if ((type(sx) is str and sx != '') or len(sx) > 0) and ((type(sy) is str and sy != '') or len(sy) > 0)])
+                        if (len(tkns_tnsr) == 0 or len(lb_tnsr) == 0): continue
+                        lb_tnsr = torch.LongTensor([s[:min(len(s), opts.maxlen)] + [pad_val[1]] * (opts.maxlen-len(s)) for s in lb_tnsr])
+                        tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
+                        w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                        sentvec_tnsr = None
+                        pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
+                        if mdl_name.startswith('elmo'):
+                            tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
+                            tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
+                            pad_val = (0, pad_val[1])
+                        else:
+                            # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                            tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
+                        if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                    else:
+                        tkns_tnsr = [[w.text for w in nlp(text)] for text in tkns_tnsr]
+                        tkns_tnsr = [s[:min(len(s), opts.maxlen)] for s in tkns_tnsr]
+                        w2v_tnsr = _batch2ids_w2v([s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr], clf.w2v_model) if hasattr(clf, 'w2v_model') and clf.w2v_model else None
+                        sentvec_tnsr = _batch2ids_sentvec(tkns_tnsr, clf.sentvec_model) if hasattr(clf, 'sentvec_model') and clf.sentvec_model else None
+                        pool_idx = torch.LongTensor([len(s) - 1 for s in tkns_tnsr])
+                        if mdl_name.startswith('elmo'):
+                            tkns_tnsr = tkns_tnsr + [[''] * opts.maxlen]
+                            tkns_tnsr = batch_to_ids(tkns_tnsr)[:-1]
+                            pad_val = 0
+                        else:
+                            # tkns_tnsr = [s + [''] * (opts.maxlen-len(s)) for s in tkns_tnsr]
+                            tkns_tnsr = torch.tensor([[1]*len(s) + [pad_val] * (opts.maxlen-len(s)) for s in tkns_tnsr])
+                        if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, weights = tkns_tnsr.to('cuda') , lb_tnsr.to('cuda'), pool_idx.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                    if mdl_name.endswith('sentvec'): clf_kwargs.update(dict(sentvec_tnsr=sentvec_tnsr))
+                    mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+                    clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=pool_idx, w2v_ids=w2v_tnsr, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
+                else:
+                    valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
+                    if (len(valid_idx) == 0): continue
+                    idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], [record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None
+                    tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr
+                    mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+                    lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else mask_tnsr[:, 1:].contiguous())
+                    if (use_gpu): tkns_tnsr, lb_tnsr, lm_mask_tnsr, mask_tnsr, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), (lm_mask_tnsr if lm_mask_tnsr is None else ([lm_mask_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else lm_mask_tnsr.to('cuda'))), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else mask_tnsr.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                    pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+                    clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=mask_tnsr if task_type == 'nmt' or mdl_name == 'bert' else pool_idx, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
+                clf_loss = ((clf_loss.view(tkns_tnsr.size(0), -1) * mask_tnsr.float()).sum(1) / (1e-12 + mask_tnsr.float().sum(1))).mean() if task_type == 'nmt' and clf.crf is None else clf_loss.mean()
+                train_loss = clf_loss if lm_loss is None else (clf_loss + lmcoef * ((lm_loss.view(tkns_tnsr.size(0), -1) * lm_mask_tnsr.float()).sum(1) / (1e-12 + lm_mask_tnsr.float().sum(1))).mean())
+                total_loss += train_loss.item()
+                train_loss.backward()
+                if (clipmaxn is not None):
+                    torch.nn.utils.clip_grad_value_(clf.lm_model.encoder.layer.parameters() if mdl_name == 'bert' else clf.parameters(), clipmaxn)
+                    torch.nn.utils.clip_grad_value_(clf.parameters(), clipmaxn)
+                optimizer.step()
+            except Exception as e:
+                print(e)
+                train_time = time.time() - t0
+                print('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
+                save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                sys.exit(0)
             if (killer.kill_now):
                 train_time = time.time() - t0
                 print('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
@@ -1838,14 +1842,14 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             if (len(valid_idx) == 0): continue
             _, _, _lb_tnsr, _ = idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], ([record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None)
 
-            tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr
-            mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+            tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr
+            mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
             # lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, :, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr[:, 1:].contiguous())
 
             # mask_tnsr = (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
             # _pool_idx = pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-            _pool_idx = pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-            if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else pool_idx.to('cuda'), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr.to('cuda')
+            _pool_idx = pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+            if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else pool_idx.to('cuda'), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else mask_tnsr.to('cuda')
             # print(('tkns, lb, pool, mask:', tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr))
 
             with torch.no_grad():
@@ -1956,7 +1960,7 @@ def classify(dev_id=None):
     special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
     special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
     special_tknids_args = dict(zip(special_tkns[0], special_tknids))
-    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('model',opts.model), ('seqlen',opts.maxlen)])
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('model',opts.model), ('sentsim_func', opts.sentsim_func), ('seqlen',opts.maxlen)])
     # Prepare task related meta data.
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
@@ -2233,11 +2237,11 @@ def siamese_rank(dev_id=None):
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     # Training on doc/sent-pair datasets
-    # train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
+    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
 
     # Evaluating on the doc/sent-pair dev and test sets
-    # eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev_siamese', mdl_name=opts.model, use_gpu=use_gpu)
-    # eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test_siamese', mdl_name=opts.model, use_gpu=use_gpu)
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev_siamese', mdl_name=opts.model, use_gpu=use_gpu)
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test_siamese', mdl_name=opts.model, use_gpu=use_gpu)
 
     # Adjust the model
     clf.merge_siamese(tokenizer=tokenizer, encode_func=encode_func, trnsfm=[trsfms, {}, trsfms_kwargs], special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), topk=128, lbnotes='../lbnotes.csv')
@@ -2384,7 +2388,7 @@ if __name__ == '__main__':
         opts.gpuq = []
     if (opts.gpuq and opts.gpunum > 0):
         if opts.verbose: os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, opts.gpuq[:opts.gpunum]))
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(os.environ['CUDA_VISIBLE_DEVICES'].split(',')[:opts.gpunum]) if 'CUDA_VISIBLE_DEVICES' in os.environ and not os.environ['CUDA_VISIBLE_DEVICES'].isspace() else ','.join(map(str, opts.gpuq[:opts.gpunum]))
         setattr(opts, 'devq', list(range(torch.cuda.device_count())))
     else:
         setattr(opts, 'devq', None)
