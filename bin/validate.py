@@ -81,9 +81,9 @@ class BaseClfHead(nn.Module):
         self.constraints = [cnstrnt_cls(**cnstrnt_params) for cnstrnt_cls, cnstrnt_params in constraints]
         self.mlt_trnsfmr = mlt_trnsfmr # accept multiple streams of inputs, each of which will be input into the transformer
         self.lm_logit = self._mlt_lm_logit if mlt_trnsfmr else self._lm_logit
-        self.clf_h = self._mlt_clf_h if mlt_trnsfmr and (task_params.setdefault('sentsim_func', None) is None or task_params['sentsim_func'] == 'concat') else self._clf_h
+        self.clf_h = self._clf_h
         self.num_lbs = num_lbs
-        self.dim_mulriple = 2 if self.mlt_trnsfmr and self.task_type == 'sentsim' and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else 1 # two or one sentence
+        self.dim_mulriple = 2 if self.mlt_trnsfmr and self.task_type in ['sentsim'] and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else 1 # two or one sentence
         self.kwprop = {}
         self.binlb = binlb
         self.global_binlb = copy.deepcopy(binlb)
@@ -99,6 +99,7 @@ class BaseClfHead(nn.Module):
     def forward(self, input_ids, pool_idx, labels=None, past=None, weights=None, embedding_mode=False, lm_logit_kwargs={}):
         use_gpu = next(self.parameters()).is_cuda
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
+        # print(('input_ids', [x.size() for x in input_ids] if type(input_ids) is list else input_ids.size()))
         if self.mlt_trnsfmr and self.task_type in ['sentsim']:
             trnsfm_output = [self.transformer(input_ids=input_ids[x], pool_idx=pool_idx[x]) for x in [0,1]]
             (hidden_states, past) = zip(*[trnsfm_output[x] if type(trnsfm_output[x]) is tuple else (trnsfm_output[x], None) for x in [0,1]])
@@ -123,14 +124,24 @@ class BaseClfHead(nn.Module):
             else:
                 clf_h = clf_h
         elif hasattr(self.lm_model, 'pooler'):
-            if (hasattr(self, 'pooler')):
-                if (hasattr(self, 'layer_pooler')):
-                    lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
-                    clf_h = self.layer_pooler(lyr_h).view(lyr_h[0].size())
+            if self.task_type in ['sentsim'] and self.mlt_trnsfmr:
+                if (hasattr(self, 'pooler')):
+                    if (hasattr(self, 'layer_pooler')):
+                        lyr_h = [[self.pooler(h, pool_idx[x]) for h in clf_h[x]] for x in [0,1]]
+                        clf_h = [self.layer_pooler(lyr_h[x]).view(lyr_h[x][0].size()) for x in [0,1]]
+                    else:
+                        clf_h = [self.pooler(clf_h[x], pool_idx[x]) for x in [0,1]]
                 else:
-                    clf_h = self.pooler(clf_h, pool_idx)
+                    clf_h = [self.lm_model.pooler(clf_h[x]) for x in [0,1]]
             else:
-                clf_h = self.lm_model.pooler(clf_h)
+                if (hasattr(self, 'pooler')):
+                    if (hasattr(self, 'layer_pooler')):
+                        lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
+                        clf_h = self.layer_pooler(lyr_h).view(lyr_h[0].size())
+                    else:
+                        clf_h = self.pooler(clf_h, pool_idx)
+                else:
+                    clf_h = self.lm_model.pooler(clf_h)
         else:
             pool_idx = pool_idx.to('cuda') if (use_gpu) else pool_idx
             smp_offset = torch.arange(input_ids[0].size(0)) if self.mlt_trnsfmr and self.task_type in ['sentsim'] else torch.arange(input_ids.size(0))
@@ -138,13 +149,13 @@ class BaseClfHead(nn.Module):
             pool_offset = smp_offset * (input_ids[0].size(-1) if self.mlt_trnsfmr and self.task_type in ['sentsim'] else input_ids.size(-1)) + pool_idx
             pool_h = pool_offset.unsqueeze(-1).expand(-1, self.n_embd)
             pool_h = pool_h.to('cuda') if use_gpu else pool_h
-            clf_h = [clf_h[x].gather(0, pool_h) for x in [0,1]] if self.mlt_trnsfmr and self.task_type in ['sentsim'] else clf_h.gather(0, pool_h)
+            clf_h = [clf_h[x].gather(0, pool_h) for x in [0,1]] if self.mlt_trnsfmr and self.task_type in ['sentsim'] and (self.task_params.setdefault('sentsim_func', None) is not None) else clf_h.gather(0, pool_h)
         # print(('after pool', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
-        if self.mlt_trnsfmr and self.task_type in ['sentsim']:
+        if self.mlt_trnsfmr and self.task_type in ['sentsim'] and (self.task_params.setdefault('sentsim_func', None) is not None): # default sentsim mode of gpt* is mlt_trnsfmr+_mlt_clf_h
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
             if embedding_mode: return clf_h
-            if (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat'):
+            if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
                 # clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
                 clf_h = torch.cat(clf_h, dim=-1)
                 clf_logits = self.linear(clf_h) if self.linear else clf_h
@@ -152,13 +163,13 @@ class BaseClfHead(nn.Module):
                 clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
         else:
             if self.do_norm: clf_h = self.norm(clf_h)
-            # print(('before dropout:', clf_h))
+            # print(('before dropout:', clf_h.size()))
             clf_h = self.dropout(clf_h)
             if embedding_mode: return clf_h
-            # print(('after dropout:', clf_h))
+            # print(('after dropout:', clf_h.size()))
             # print(('linear', self.linear))
             clf_logits = self.linear(clf_h.view(-1, self.n_embd) if self.task_type == 'nmt' else clf_h)
-            # print(('after linear:', clf_logits))
+            # print(('after linear:', clf_logits.size()))
         if self.thrshlder: self.thrshld = self.thrshlder(clf_h)
         if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
         # print(('after lastdrop:', clf_logits))
@@ -173,7 +184,7 @@ class BaseClfHead(nn.Module):
                 clf_logits = clf_logits.scatter(-1, tag_seq.unsqueeze(-1), 1)
                 return clf_logits
             for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
-            if (self.mlt_trnsfmr and self.task_type == 'sentsim' and self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != self.task_params['ymode']): return 1 - clf_logits.view(-1, self.num_lbs)
+            if (self.mlt_trnsfmr and self.task_type in ['sentsim'] and self.task_params.setdefault('sentsim_func', None) is not None and self.task_params['sentsim_func'] != 'concat' and self.task_params['sentsim_func'] != self.task_params.setdefault('ymode', 'sim')): return 1 - clf_logits.view(-1, self.num_lbs)
             return clf_logits.view(-1, self.num_lbs)
         # print((labels.max(), labels.size()))
         if self.crf:
@@ -305,7 +316,7 @@ class BaseClfHead(nn.Module):
 
 class BERTClfHead(BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
-        super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_params.setdefault('sentsim_func', None) is not None and task_params['sentsim_func'] != 'concat', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
+        super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['sentsim'] and task_params.setdefault('sentsim_func', None) is not None and task_params['sentsim_func'] != 'concat', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
         self.lm_head = BertPreTrainingHeads(config, lm_model.embeddings.word_embeddings.weight)
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -360,6 +371,8 @@ class GPTClfHead(BaseClfHead):
         self.vocab_size = config.vocab_size
         self.n_embd = config.n_embd
         self.norm = NORM_TYPE_MAP[norm_type](config.n_embd)
+        self.clf_h = self._mlt_clf_h if self.task_type in ['sentsim'] and self.mlt_trnsfmr and (task_params.setdefault('sentsim_func', None) is None) else self._clf_h
+        self.dim_mulriple = 2 if self.mlt_trnsfmr and self.task_type in ['sentsim'] and self.task_params.setdefault('sentsim_func', None) is not None and self.task_params['sentsim_func'] == 'concat' else 1
         self._int_actvtn = ACTVTN_MAP[iactvtn]
         self._out_actvtn = ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
@@ -1242,14 +1255,26 @@ class MaskedLMDataset(BaseDataset):
         masked_lm_ids = np.array(sample[0])
         pad_trnsfm_idx = self.transforms.index(_pad_transform) if len(self.transforms) > 0 and _pad_transform in self.transforms else -1
         pad_trnsfm_kwargs = self.transforms_kwargs[pad_trnsfm_idx] if pad_trnsfm_idx and pad_trnsfm_idx in self.transforms_kwargs > -1 else {}
-        masked_lm_lbs = np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0]])
-        valid_idx = np.where(masked_lm_lbs > -1)[0]
-        cand_samp_idx = random.sample(range(len(valid_idx)), min(opts.maxlen, max(1, int(round(len(valid_idx) * self.masked_lm_prob)))))
-        cand_idx = valid_idx[cand_samp_idx]
-        rndm = np.random.uniform(low=0, high=1, size=(len(cand_idx),))
-        masked_lm_ids[cand_idx[rndm < 0.8]] = self.special_tknids[-1]
-        masked_lm_ids[cand_idx[rndm >= 0.9]] = random.randrange(0, self.vocab_size)
-        masked_lm_lbs[list(filter(lambda x: x not in cand_idx, range(len(masked_lm_lbs))))] = -1
+        if type(self._ds) is SentSimDataset and len(self.transforms_kwargs) >= 2 and self.transforms_kwargs[1].setdefault('sentsim_func', None) is not None and self.transforms_kwargs[1]['sentsim_func'] != 'concat':
+            masked_lm_lbs = [np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0][X]]) for X in [0,1]]
+            valid_idx = [np.where(masked_lm_lbs[x] > -1)[0] for x in [0,1]]
+            cand_samp_idx = [random.sample(range(len(valid_idx[x])), min(opts.maxlen, max(1, int(round(len(valid_idx[x]) * self.masked_lm_prob))))) for x in [0,1]]
+            cand_idx = [valid_idx[x][cand_samp_idx[x]] for x in [0,1]]
+            rndm = [np.random.uniform(low=0, high=1, size=(len(cand_idx[x]),)) for x in [0,1]]
+            for x in [0,1]:
+                masked_lm_ids[x][cand_idx[x][rndm[x] < 0.8]] = self.special_tknids[-1]
+                masked_lm_ids[x][cand_idx[x][rndm[x] >= 0.9]] = random.randrange(0, self.vocab_size)
+            for X in [0,1]:
+                masked_lm_lbs[X][list(filter(lambda x: x not in cand_idx[X], range(len(masked_lm_lbs[X]))))] = -1
+        else:
+            masked_lm_lbs = np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0]])
+            valid_idx = np.where(masked_lm_lbs > -1)[0]
+            cand_samp_idx = random.sample(range(len(valid_idx)), min(opts.maxlen, max(1, int(round(len(valid_idx) * self.masked_lm_prob)))))
+            cand_idx = valid_idx[cand_samp_idx]
+            rndm = np.random.uniform(low=0, high=1, size=(len(cand_idx),))
+            masked_lm_ids[cand_idx[rndm < 0.8]] = self.special_tknids[-1]
+            masked_lm_ids[cand_idx[rndm >= 0.9]] = random.randrange(0, self.vocab_size)
+            masked_lm_lbs[list(filter(lambda x: x not in cand_idx, range(len(masked_lm_lbs))))] = -1
         return orig_sample + (torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs))
         # return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs)
 
@@ -1488,7 +1513,7 @@ TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'i
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
 TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
 TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _dummy_trsfm, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'loss':'contrastive', 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'ymode':'sim', 'mdlcfg':{'sentsim_func':None, 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}}, 'chemprot':{'mdlcfg':{'maxlen':128}}, 'i2b2':{'mdlcfg':{'maxlen':128}}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
@@ -1728,11 +1753,11 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                     valid_idx = [x for x in range(tkns_tnsr.size(0)) if x not in np.transpose(np.argwhere(tkns_tnsr == -1))[:,0]]
                     if (len(valid_idx) == 0): continue
                     idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], [record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None
-                    tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr
-                    mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-                    lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else mask_tnsr[:, 1:].contiguous())
-                    if (use_gpu): tkns_tnsr, lb_tnsr, lm_mask_tnsr, mask_tnsr, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), (lm_mask_tnsr if lm_mask_tnsr is None else ([lm_mask_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else lm_mask_tnsr.to('cuda'))), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else mask_tnsr.to('cuda'), (weights if weights is None else weights.to('cuda'))
-                    pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type == 'sentsim' and type(clf.lm_model) not in [BertModel] else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+                    tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else tkns_tnsr
+                    mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type == 'sentsim' and clf.mlt_trnsfmr else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+                    lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else mask_tnsr[:, 1:].contiguous())
+                    if (use_gpu): tkns_tnsr, lb_tnsr, lm_mask_tnsr, mask_tnsr, weights = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), (lm_mask_tnsr if lm_mask_tnsr is None else ([lm_mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else lm_mask_tnsr.to('cuda'))), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else mask_tnsr.to('cuda'), (weights if weights is None else weights.to('cuda'))
+                    pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type == 'sentsim' and clf.mlt_trnsfmr else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
                     clf_loss, lm_loss = clf(input_ids=tkns_tnsr, pool_idx=mask_tnsr if task_type == 'nmt' or mdl_name == 'bert' else pool_idx, labels=lb_tnsr.view(-1), weights=weights, **clf_kwargs)
                 clf_loss = ((clf_loss.view(tkns_tnsr.size(0), -1) * mask_tnsr.float()).sum(1) / (1e-12 + mask_tnsr.float().sum(1))).mean() if task_type == 'nmt' and clf.crf is None else clf_loss.mean()
                 train_loss = clf_loss if lm_loss is None else (clf_loss + lmcoef * ((lm_loss.view(tkns_tnsr.size(0), -1) * lm_mask_tnsr.float()).sum(1) / (1e-12 + lm_mask_tnsr.float().sum(1))).mean())
@@ -1747,7 +1772,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                 train_time = time.time() - t0
                 print('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
                 save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
-                sys.exit(0)
+                raise e
             if (killer.kill_now):
                 train_time = time.time() - t0
                 print('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
@@ -1842,14 +1867,14 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
             if (len(valid_idx) == 0): continue
             _, _, _lb_tnsr, _ = idx, tkns_tnsr, lb_tnsr, record_idx = [idx[x] for x in range(len(idx)) if x in valid_idx], tkns_tnsr[valid_idx], lb_tnsr[valid_idx], ([record_idx[x] for x in range(len(record_idx)) if x in valid_idx] if task_type == 'nmt' else None)
 
-            tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr
-            mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
-            # lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, :, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type in ['entlmnt', 'sentsim'] else mask_tnsr[:, 1:].contiguous())
+            tkns_tnsr = [tkns_tnsr[:,x,:] for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else tkns_tnsr
+            mask_tnsr = [(~tkns_tnsr[x].eq(pad_val * torch.ones_like(tkns_tnsr[x]))).long() for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
+            # lm_mask_tnsr = mask_tnsr if mdl_name in ['bert', 'trsfmxl'] else ([mask_tnsr[x][:, :, 1:].contiguous().view(tkns_tnsr[x].size(0), -1) for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else mask_tnsr[:, 1:].contiguous())
 
             # mask_tnsr = (~tkns_tnsr.eq(pad_val[0] if task_type=='nmt' else pad_val * torch.ones_like(tkns_tnsr))).long()
             # _pool_idx = pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-            _pool_idx = pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-            if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else pool_idx.to('cuda'), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.task_params.setdefault('sentsim_func', None) is not None and clf.task_params['sentsim_func'] != 'concat' else mask_tnsr.to('cuda')
+            _pool_idx = pool_idx = [tkns_tnsr[x].eq(clf_tknids[0] * torch.ones_like(tkns_tnsr[x])).int().argmax(-1) for x in[0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
+            if (use_gpu): tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr = [tkns_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else tkns_tnsr.to('cuda'), lb_tnsr.to('cuda'), [pool_idx[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else pool_idx.to('cuda'), [mask_tnsr[x].to('cuda') for x in [0,1]] if task_type in ['sentsim'] and clf.mlt_trnsfmr else mask_tnsr.to('cuda')
             # print(('tkns, lb, pool, mask:', tkns_tnsr, lb_tnsr, pool_idx, mask_tnsr))
 
             with torch.no_grad():
@@ -2016,6 +2041,7 @@ def classify(dev_id=None):
         if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
         task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
         print('Classifier hyper-parameters: %s' % ext_params)
+        print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
         optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
@@ -2344,7 +2370,8 @@ if __name__ == '__main__':
     op.add_option('--pooler', dest='pooler', help='indicate the pooling strategy when selecting features: max or avg')
     op.add_option('--seq2seq', dest='seq2seq', help='indicate the seq2seq strategy when converting sequences of embeddings into a vector')
     op.add_option('--seq2vec', dest='seq2vec', help='indicate the seq2vec strategy when converting sequences of embeddings into a vector: pytorch-lstm, cnn, or cnn_highway')
-    op.add_option('--ssfunc', dest='sentsim_func', help='indicate the sentence similarity metric')
+    op.add_option('--ssfunc', dest='sentsim_func', help='indicate the sentence similarity metric [dist|sim]')
+    op.add_option('--ymode', default='sim', dest='ymode', help='indicate the sentence similarity metric in gold standard [dist|sim]')
     op.add_option('--loss', dest='loss', help='indicate the loss function')
     op.add_option('--cnstrnts', dest='cnstrnts', help='indicate the constraint scheme')
     op.add_option('--lr', default=float(1e-3), action='store', type='float', dest='lr', help='indicate the learning rate of the optimizer')
