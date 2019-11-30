@@ -100,6 +100,8 @@ class BaseClfHead(nn.Module):
         use_gpu = next(self.parameters()).is_cuda
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
         # print(('input_ids', [x.size() for x in input_ids] if type(input_ids) is list else input_ids.size()))
+        # print(('input_ids', [[','.join(map(str, s.tolist())) for s in x] for x in input_ids] if type(input_ids) is list else [','.join(map(str, s.tolist())) for s in input_ids]))
+        # print(('pool_idx', [x.sum(dim=1).float()/x.size()[1] for x in pool_idx] if type(pool_idx) is list else pool_idx.sum(dim=1).float()/pool_idx.size()[1]))
         if self.mlt_trnsfmr and self.task_type in ['sentsim']:
             trnsfm_output = [self.transformer(input_ids=input_ids[x], pool_idx=pool_idx[x]) for x in [0,1]]
             (hidden_states, past) = zip(*[trnsfm_output[x] if type(trnsfm_output[x]) is tuple else (trnsfm_output[x], None) for x in [0,1]])
@@ -169,7 +171,7 @@ class BaseClfHead(nn.Module):
             # print(('after dropout:', clf_h.size()))
             # print(('linear', self.linear))
             clf_logits = self.linear(clf_h.view(-1, self.n_embd) if self.task_type == 'nmt' else clf_h)
-            # print(('after linear:', clf_logits.size()))
+        # print(('after linear:', clf_logits.size()))
         if self.thrshlder: self.thrshld = self.thrshlder(clf_h)
         if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
         # print(('after lastdrop:', clf_logits))
@@ -200,8 +202,8 @@ class BaseClfHead(nn.Module):
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
             # print((clf_logits.size(), labels.size()))
-            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive')]
-            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
+            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
+            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         if self.thrshlder:
             num_lbs = labels.view(-1, self.num_lbs).sum(1)
@@ -330,7 +332,7 @@ class BERTClfHead(BaseClfHead):
         # self.linear = nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.task_type == 'sentsim' else nn.Linear(self.hdim, self.num_lbs)
         self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
-        if (initln): self.apply(self.lm_model.init_bert_weights)
+        # if (initln): self.lm_model.apply(self.lm_model.init_bert_weights)
         if (type(output_layer) is int):
             self.output_layer = output_layer if (output_layer >= -self.num_hidden_layers and output_layer < self.num_hidden_layers) else -1
         else:
@@ -890,6 +892,11 @@ class RegressionLoss(nn.Module):
         raise NotImplementedError
 
 
+class MSELoss(RegressionLoss):
+    def forward(self, y_pred, y_true):
+        return F.mse_loss(y_pred, self.ytransform(y_true), reduction=self.reduction)
+
+
 class ContrastiveLoss(RegressionLoss):
     def __init__(self, reduction='none', x_mode='dist', y_mode='dist', margin=2.0):
         super(ContrastiveLoss, self).__init__(reduction=reduction, x_mode=x_mode, y_mode=y_mode)
@@ -902,7 +909,7 @@ class ContrastiveLoss(RegressionLoss):
 
 class HuberLoss(RegressionLoss):
     def forward(self, y_pred, y_true):
-        return F.smooth_l1_loss(y_pred, y_true, reduction=self.reduction)
+        return F.smooth_l1_loss(y_pred, self.ytransform(y_true), reduction=self.reduction)
 
 
 class LogCoshLoss(RegressionLoss):
@@ -931,16 +938,16 @@ class QuantileLoss(RegressionLoss):
         self.quantile = 0.5
 
     def forward(self, y_pred, y_true):
-        ydiff = y_true - y_pred
+        ydiff = self.ytransform(y_true) - y_pred
         loss = torch.max(self.quantile * ydiff, (self.quantile - 1) * ydiff)
         return loss if self.reduction == 'none' else torch.mean(loss)
 
 class PearsonCorrelationLoss(RegressionLoss):
     def forward(self, y_pred, y_true):
         var_pred = y_pred - torch.mean(y_pred)
-        var_true = y_true - torch.mean(y_true)
+        var_true = self.ytransform(y_true) - torch.mean(self.ytransform(y_true))
         # loss = torch.sum(var_pred * var_true) / (torch.sqrt(torch.sum(var_pred ** 2)) * torch.sqrt(torch.sum(var_true ** 2)))
-        loss = var_pred * var_true * torch.rsqrt(torch.sum(var_pred ** 2)) * torch.rsqrt(torch.sum(var_true ** 2))
+        loss = -1.0 * var_pred * var_true * torch.rsqrt(torch.sum(var_pred ** 2)) * torch.rsqrt(torch.sum(var_true ** 2))
         return loss if self.reduction == 'none' else torch.mean(loss)
 
 
@@ -1577,7 +1584,7 @@ SEQ2SEQ_DIM_INFER = {'pytorch-lstm':lambda x: x[1] * x[2]['hidden_size'], 'pytor
 SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden_size'], 'pytorch-agmnlstm':lambda x: x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[2]['hidden_size'], 'pytorch-stkaltlstm':lambda x: x[2]['hidden_size'], 'pytorch-gru':lambda x: x[2]['hidden_size'], 'cnn':lambda x: int(1.5 * x[2]['embedding_dim']), 'cnn_highway':lambda x: x[0]}
 NORM_TYPE_MAP = {'batch':nn.BatchNorm1d, 'layer':nn.LayerNorm}
 ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid}
-RGRSN_LOSS_MAP = {'contrastive':ContrastiveLoss, 'huber':HuberLoss, 'logcosh':LogCoshLoss, 'xtanh':XTanhLoss, 'xsigmoid':XSigmoidLoss, 'quantile':QuantileLoss, 'pearson':PearsonCorrelationLoss}
+RGRSN_LOSS_MAP = {'mse':MSELoss, 'contrastive':ContrastiveLoss, 'huber':HuberLoss, 'logcosh':LogCoshLoss, 'xtanh':XTanhLoss, 'xsigmoid':XSigmoidLoss, 'quantile':QuantileLoss, 'pearson':PearsonCorrelationLoss}
 SIM_FUNC_MAP = {'sim':'sim', 'dist':'dist'}
 CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
 CNSTRNTS_MAP = {'hrch':(HrchConstraint, {('num_lbs','num_lbs'):1, ('hrchrel_path','hrchrel_path'):'hpo_ancrels.pkl', ('binlb','binlb'):{}})}
