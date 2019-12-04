@@ -2409,6 +2409,109 @@ def siamese_rank(dev_id=None):
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu)
 
 
+def simsearch(dev_id=None):
+    print('### Search Re-rank Mode ###')
+    orig_task = opts.task
+    opts.task = opts.task + '_simsearch'
+    # Prepare model related meta data
+    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    common_cfg = cfgr('validate', 'common')
+    pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
+    use_gpu = dev_id is not None
+    encode_func = ENCODE_FUNC_MAP[mdl_name]
+    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
+    task_type = 'sentsim' #TASK_TYPE_MAP[opts.task]
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
+    special_tknids_args = dict(zip(special_tkns[0], special_tknids))
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('model',opts.model), ('sentsim_func', opts.sentsim_func), ('seqlen',opts.maxlen)])
+    # Prepare task related meta data
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+    ds_kwargs = {'sampfrac':opts.sampfrac}
+    ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
+
+    # Load model
+    clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
+    if opts.refresh:
+        print('Refreshing and saving the model with newest code...')
+        try:
+            save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
+        except Exception as e:
+            print(e)
+    prv_task_params = copy.deepcopy(clf.task_params)
+    clf.task_params.update(task_params)
+    clf.mlt_trnsfmr = False
+    if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+    model = SHELL_MAP[opts.model](clf, tokenizer=tokenizer, encode_func=encode_func, transforms=trsfms, transforms_kwargs=trsfms_kwargs, special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0))
+
+    # Prepare dev and test sets
+    del ds_kwargs['ynormfunc']
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+
+    lbnotes_fname, lb_embd_fname, lb_embd_raw_fname = 'lbnotes.csv', 'onto_embd.pkl', 'onto_embd_raw.pkl'
+    if os.path.exists(os.path.join(os.path.pardir, lb_embd_fname)):
+        with open(os.path.join(os.path.pardir, lb_embd_fname), 'rb') as fd:
+            lbembd = pickle.load(fd)
+    else:
+        lbnotes = pd.read_csv(os.path.join(os.path.pardir, lbnotes_fname), sep='\t', index_col='id')
+        lb_embd_raw_fname = './onto_embd_raw.pkl'
+        if os.path.exists(os.path.join(os.path.pardir, lb_embd_raw_fname)):
+            with open(os.path.join(os.path.pardir, lb_embd_raw_fname), 'rb') as fd:
+                lbembd_raw = pickle.load(fd)
+        else:
+            lbembd_raw = model(lbnotes['text'].tolist(), embedding_mode=True, bsize=opts.bsize)
+            with open(lb_embd_raw_fname, 'wb') as fd:
+                pickle.dump(lbembd_raw, fd)
+        lbnotes['embedding'] = [x for x in lbembd_raw.numpy()]
+        lbembd = {}
+        # One label may has multiple notes
+        for gid, grp in lbnotes['embedding'].groupby('id'):
+            lbembd[gid] = grp.to_numpy().mean(axis=0) # averaged embedding
+        with open(lb_embd_fname, 'wb') as fd:
+            pickle.dump(lbembd, fd)
+
+    import scipy.spatial.distance as spdist
+    for prefix, df in zip(['dev', 'test'], [dev_ds.df, test_ds.df]):
+        clf_h_cache_fname = '%s_clf_h.pkl' % prefix
+        if os.path.exists(os.path.join(os.path.pardir, clf_h_cache_fname)):
+            with open(os.path.join(os.path.pardir, clf_h_cache_fname), 'rb') as fd:
+                clf_h = pickle.load(fd)
+        else:
+            clf_h = model(df['text'].tolist(), embedding_mode=True, bsize=opts.bsize)
+            with open(clf_h_cache_fname, 'wb') as fd:
+                pickle.dump(clf_h, fd)
+        angular_sim_list, correl_list, plot_data = [[] for x in range(3)]
+        for i in range(df.shape[0]):
+            angular_sims, correls = [], []
+            lbs = df.iloc[i]['labels'].split(';')
+            for lb in lbs:
+                if lb in lbembd:
+                    angular_sim, correlation = 1 - np.arccos(1 - spdist.cosine(clf_h[i], lbembd[lb])) / np.pi, 1 - spdist.correlation(clf_h[i], lbembd[lb])
+                    _, _ = angular_sims.append('%.2f' % angular_sim), correls.append('%.2f' % correlation)
+                    plot_data.append((1, angular_sim, correlation))
+                else:
+                    _, _ = angular_sims.append('N/A'), correls.append('N/A')
+            _, _ = angular_sim_list.append(';'.join(angular_sims)), correl_list.append(';'.join(correls))
+            neg_lbs = list(set(lbembd.keys()) - set(lbs))
+            neg_idx = np.random.choice(range(len(neg_lbs)), len(lbs))
+            for neg_lb in [neg_lbs[idx] for idx in neg_idx]:
+                angular_sim, correlation = 1 - np.arccos(1 - spdist.cosine(clf_h[i], lbembd[neg_lb])) / np.pi, 1 - spdist.correlation(clf_h[i], lbembd[neg_lb])
+                plot_data.append((0, angular_sim, correlation))
+        df['angular_sim'], df['correlation'] = angular_sim_list, correl_list
+        df.to_csv('%s_embd.csv' % prefix, sep='\t')
+        with open('%s_plot_data.pkl' % prefix, 'wb') as fd:
+            pickle.dump(plot_data, fd)
+
+
 def main():
     if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'copd', 'phenopubs', 'meshpubs', 'meshpubs_entilement', 'phenochf', 'toxic', 'mednli', 'biosses', 'clnclsts', 'cncpt-ddi']):
         if (opts.method == 'classify'):
@@ -2417,6 +2520,8 @@ def main():
             main_func = multi_clf
         elif (opts.method == 'simrank'):
             main_func = siamese_rank
+        elif (opts.method == 'simsearch'):
+            main_func = simsearch
     else:
         return
     if (opts.distrb):
