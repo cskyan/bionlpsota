@@ -2607,6 +2607,7 @@ if __name__ == '__main__':
     op.add_option('--model', default='gpt2', type='str', dest='model', help='the model to be validated')
     op.add_option('--encoder', dest='encoder', help='the encoder to be used after the language model: pool, s2v or s2s')
     op.add_option('--pretrained', dest='pretrained', help='pretrained model file')
+    op.add_option('--seed', dest='seed', help='manually set the random seed')
     op.add_option('-m', '--method', default='classify', help='main method to run')
     op.add_option('-v', '--verbose', default=False, action='store_true', dest='verbose', help='display detailed information')
 
@@ -2637,6 +2638,10 @@ if __name__ == '__main__':
         setattr(opts, 'devq', list(range(torch.cuda.device_count())))
     else:
         setattr(opts, 'devq', None)
+
+    if opts.seed is not None:
+        np.random.seed(opts.seed)
+        torch.cuda.manual_seed(opts.seed)
 
     opts.output_layer = list(map(int, opts.output_layer.split(',')))
     opts.output_layer = opts.output_layer[0] if len(opts.output_layer) == 1 else opts.output_layer
