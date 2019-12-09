@@ -727,6 +727,64 @@ class SentVecEmbeddingSeq2Vec(EmbeddingSeq2Vec):
         return self._forward(clf_h, labels=labels, weights=weights)
 
 
+class EmbeddingHead(nn.Module):
+    def __init__(self, base_model):
+        super(EmbeddingHead, self).__init__()
+        self.base_model = dict(zip(['model'], [base_model]))
+        self.linear = self.base_model['model'].linear
+        self.task_type = self.base_model['model'].task_type
+        self.task_params = self.base_model['model'].task_params
+        self.num_lbs = self.base_model['model'].num_lbs
+        self.mlt_trnsfmr = self.base_model['model'].mlt_trnsfmr
+        self.thrshld = self.base_model['model'].thrshld
+        self.thrshlder = self.base_model['model'].thrshlder
+        self.do_lastdrop = self.base_model['model'].do_lastdrop
+        self.crf = self.base_model['model'].crf
+        self.constraints = self.base_model['model'].constraints
+
+    def forward(self, hidden_states, labels=None):
+        use_gpu = next(self.base_model['model'].parameters()).is_cuda
+        clf_h = hidden_states
+        if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
+            clf_h = torch.cat(clf_h, dim=-1)
+            clf_logits = self.linear(clf_h) if self.linear else clf_h
+        else:
+            clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
+        if self.thrshlder: self.thrshld = self.thrshlder(clf_h)
+        if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
+
+        if (labels is None):
+            if self.crf:
+                tag_seq, score = zip(*self.crf.viterbi_tags(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), torch.ones_like(input_ids)))
+                tag_seq = torch.tensor(tag_seq).to('cuda') if use_gpu else torch.tensor(tag_seq)
+                print((tag_seq.min(), tag_seq.max(), score))
+                clf_logits = torch.zeros((*tag_seq.size(), self.num_lbs)).to('cuda') if use_gpu else torch.zeros((*tag_seq.size(), self.num_lbs))
+                clf_logits = clf_logits.scatter(-1, tag_seq.unsqueeze(-1), 1)
+                return clf_logits
+            for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
+            if (self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] and self.task_params.setdefault('sentsim_func', None) is not None and self.task_params['sentsim_func'] != 'concat' and self.task_params['sentsim_func'] != self.task_params.setdefault('ymode', 'sim')): return 1 - clf_logits.view(-1, self.num_lbs)
+            return clf_logits.view(-1, self.num_lbs)
+        if self.crf:
+            clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), pool_idx)
+            return clf_loss, lm_loss
+        else:
+            for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
+        if self.task_type == 'mltc-clf' or (self.task_type == 'entlmnt' and self.num_lbs > 1) or self.task_type == 'nmt':
+            loss_func = nn.CrossEntropyLoss(weight=weights, reduction='none')
+            clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1))
+        elif self.task_type == 'mltl-clf' or (self.task_type == 'entlmnt' and self.num_lbs == 1):
+            loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
+            clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
+        elif self.task_type == 'sentsim':
+            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
+            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
+            clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
+        if self.thrshlder:
+            num_lbs = labels.view(-1, self.num_lbs).sum(1)
+            clf_loss = 0.8 * clf_loss + 0.2 * F.mse_loss(self.thrshld, torch.sigmoid(torch.topk(clf_logits, k=num_lbs.max(), dim=1, sorted=True)[0][:,num_lbs-1]), reduction='mean')
+        return clf_loss, lm_loss
+
+
 class MultiClfHead(nn.Module):
     def __init__(self, linears):
         super(MultiClfHead, self).__init__()
@@ -1382,6 +1440,38 @@ class ShellDataset(BaseDataset):
         sample = self.encode_func(text, self.tokenizer), None
         sample = self._transform_chain(sample)
         return sample[0] if type(sample[0]) is str or (type(sample[0]) is list and type(sample[0][0]) is str) else torch.tensor(sample[0])
+
+
+class EmbeddingDataset(BaseDataset):
+    def __init__(self, embeddings, labels=None):
+        self.embeddings = embeddings
+        self.labels = labels
+        if self.labels is not None: assert(len(self.embeddings)==len(self.labels))
+
+    def __len__(self):
+        return len(self.embeddings)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.embeddings[idx], dtype=torch.float32), self.labels[idx] if self.labels else None
+
+
+class EmbeddingPairDataset(BaseDataset):
+    def __init__(self, embeddings1, embeddings2, pair_indices, labels=None):
+        self.embeddings1 = embeddings1
+        self.embeddings2 = torch.tensor(embeddings2)
+        self.pair_indices = pair_indices
+        self.labels = labels
+        indices1, indices2 = zip(*pair_indices)
+        assert(max(indices1) < len(embeddings1) and max(indices2) < len(embeddings2))
+        if self.labels is not None: assert(len(self.pair_indices)==len(self.labels))
+
+    def __len__(self):
+        return len(self.pair_indices)
+
+    def __getitem__(self, idx):
+        indices = self.pair_indices[idx]
+        sample = torch.stack((self.embeddings1[indices[0]], self.embeddings2[indices[1]])).view(1, 2, -1)
+        return (sample, self.labels[idx]) if self.labels else sample
 
 
 def _sentclf_transform(sample, options=None, model=None, seqlen=32, start_tknids=[], clf_tknids=[], **kwargs):
@@ -2111,7 +2201,7 @@ def classify(dev_id=None):
         class_weights /= class_weights.sum()
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
         if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
-    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
+    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=opts.droplast, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
@@ -2479,8 +2569,26 @@ def simsearch(dev_id=None):
         with open(lb_embd_fname, 'wb') as fd:
             pickle.dump(lbembd, fd)
 
+    # Build label embedding index
+    lb_embd_idx_fname = 'onto_embd_idx.pkl'
+    if os.path.exists(os.path.join(os.path.pardir, lb_embd_idx_fname)):
+        with open(os.path.join(os.path.pardir, lb_embd_idx_fname), 'rb') as fd:
+            lbembd_idx, binlb, binlbr = pickle.load(fd)
+    else:
+        import faiss
+        binlb = dict([(k, i) for i, k in enumerate(lbembd.keys())])
+        binlbr = dict([(v, k) for k, v in binlb.items()])
+        dimension = next(x for x in lbembd.values()).shape[0]
+        lbembd_idx = faiss.IndexFlatL2(dimension)
+        lbembd_idx.add(np.stack(lbembd.values()))
+        # with open(lb_embd_idx_fname, 'wb') as fd:
+        #     pickle.dump((lbembd_idx, binlb, binlbr), fd)
+    lbembd_idx = faiss.index_cpu_to_all_gpus(lbembd_idx)
+
     import scipy.spatial.distance as spdist
+    embd_clf = EmbeddingHead(clf)
     for prefix, df in zip(['dev', 'test'], [dev_ds.df, test_ds.df]):
+        # Calculate the doc/sentence embeddings
         clf_h_cache_fname = '%s_clf_h.pkl' % prefix
         if os.path.exists(os.path.join(os.path.pardir, clf_h_cache_fname)):
             with open(os.path.join(os.path.pardir, clf_h_cache_fname), 'rb') as fd:
@@ -2489,6 +2597,30 @@ def simsearch(dev_id=None):
             clf_h = model(df['text'].tolist(), embedding_mode=True, bsize=opts.bsize)
             with open(clf_h_cache_fname, 'wb') as fd:
                 pickle.dump(clf_h, fd)
+
+        # Search the topk similar labels
+        D, I = lbembd_idx.search(clf_h.numpy(), opts.topk)
+        cand_preds = [[binlbr[idx] for idx in indices] for indices in I]
+        cand_lbs = list(set(itertools.chain.from_iterable(cand_preds)))
+        cand_lbs_idx = dict([(lb, i) for i, lb in enumerate(cand_lbs)])
+        cand_embds = np.stack([lbembd[lb] for lb in cand_lbs])
+        pair_indices = [(i, cand_lbs_idx[lb]) for i, j in zip(range(len(clf_h)), range(len(cand_preds))) for lb in cand_preds[j]]
+        ds = EmbeddingPairDataset(clf_h, cand_embds, pair_indices)
+        ds_loader = DataLoader(ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=False)
+        preds = []
+        for step, batch in enumerate(tqdm(ds_loader, desc='[Totally %i pairs] Predicting pairs of embeddings' % len(ds))):
+            embd_pairs = batch[0].to('cuda') if use_gpu else batch[0]
+            embd_pairs = [embd_pairs[:,x,:] for x in [0,1]]
+            logits = embd_clf(embd_pairs)
+            prob = torch.sigmoid(logits).data.view(-1)
+            pred = (prob > (embd_clf.thrshld if opts.do_thrshld else opts.pthrshld)).int()
+            preds.extend(pred.view(-1).detach().cpu().tolist())
+        orig_idx, pred_lb = zip(*[(pidx[0], cand_lbs[pidx[1]]) for pidx, pred_val in zip(pair_indices, preds) if pred_val > 0])
+        pred_df = pd.DataFrame([(df.index[gid], ';'.join(grp['label'].tolist())) for gid, grp in pd.DataFrame({'index':orig_idx, 'label':pred_lb}).groupby('index')], columns=['id', 'preds']).set_index('id')
+        filled_df = df.merge(pred_df, how='left', left_index=True, right_index=True)
+        filled_df.to_csv('%s_preds.csv' % prefix, sep='\t')
+
+        # Calculate the relations between the doc/sentence embedding and the true label embeddings
         angular_sim_list, correl_list, plot_data = [[] for x in range(3)]
         for i in range(df.shape[0]):
             angular_sims, correls = [], []
@@ -2598,6 +2730,7 @@ if __name__ == '__main__':
     op.add_option('--sampfrac', action='store', type='float', dest='sampfrac', help='indicate the sampling fraction for datasets')
     op.add_option('--pdrop', default=0.2, action='store', type='float', dest='pdrop', help='indicate the dropout probabilitiy for all fully connected layers in the embeddings, encoder, and pooler')
     op.add_option('--pthrshld', default=0.5, action='store', type='float', dest='pthrshld', help='indicate the threshold for predictive probabilitiy')
+    op.add_option('--topk', default=5, action='store', type='int', dest='topk', help='indicate the top k search parameter')
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
     op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
@@ -2638,6 +2771,9 @@ if __name__ == '__main__':
         setattr(opts, 'devq', list(range(torch.cuda.device_count())))
     else:
         setattr(opts, 'devq', None)
+    if opts.distrb:
+        import horovod.torch as hvd
+        hvd.init()
 
     if opts.seed is not None:
         np.random.seed(opts.seed)
