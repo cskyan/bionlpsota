@@ -118,13 +118,14 @@ class BaseShell():
 class BaseClfHead(nn.Module):
     """ Classifier Head for the Basic Language Model """
 
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_extlin=False, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
         super(BaseClfHead, self).__init__()
         self.task_params = task_params
         self.lm_model = lm_model
         self.lm_loss = lm_loss
         self.task_type = task_type
         self.do_norm = do_norm
+        self.do_extlin = do_extlin
         self.do_lastdrop = do_lastdrop
         self.dropout = nn.Dropout2d(pdrop) if task_type == 'nmt' else nn.Dropout(pdrop)
         self.last_dropout = nn.Dropout(pdrop) if do_lastdrop else None
@@ -210,17 +211,19 @@ class BaseClfHead(nn.Module):
         if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] and (self.task_params.setdefault('sentsim_func', None) is not None): # default sentsim mode of gpt* is mlt_trnsfmr+_mlt_clf_h
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
+            if self.do_extlin and hasattr(self, 'extlinear'): clf_h = [self.extlinear(clf_h[x]) for x in [0,1]]
             if embedding_mode: return clf_h
             if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
                 # clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
-                clf_h = torch.cat(clf_h+[clf_h[0]-clf_h[1]], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
+                clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1])], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
                 clf_logits = self.linear(clf_h) if self.linear else clf_h
-            else:
+            elif self.task_type == 'sentsim':
                 clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
         else:
             if self.do_norm: clf_h = self.norm(clf_h)
             # print(('before dropout:', clf_h.size()))
             clf_h = self.dropout(clf_h)
+            if self.do_extlin and hasattr(self, 'extlinear'): clf_h = self.extlinear(clf_h)
             if embedding_mode: return clf_h
             # print(('after dropout:', clf_h.size()))
             # print(('linear', self.linear))
@@ -388,6 +391,9 @@ class BERTClfHead(BaseClfHead):
         self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
         # if (initln): self.lm_model.apply(self.lm_model.init_bert_weights)
+        if self.do_extlin:
+            self.extlinear = nn.Sequential(nn.Linear(self.n_embd, self.n_embd), ACTVTN_MAP['tanh']())
+            if (initln): self.extlinear.apply(_weights_init(mean=initln_mean, std=initln_std))
         if (type(output_layer) is int):
             self.output_layer = output_layer if (output_layer >= -self.num_hidden_layers and output_layer < self.num_hidden_layers) else -1
         else:
@@ -435,6 +441,9 @@ class GPTClfHead(BaseClfHead):
         self.hdim = self.dim_mulriple * self.n_embd if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
         self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+        if self.do_extlin:
+            self.extlinear = nn.Linear(self.n_embd, self.n_embd)
+            if (initln): self.extlinear.apply(_weights_init(mean=initln_mean, std=initln_std))
 
     def __init_linear__(self):
         return nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs)
@@ -1707,7 +1716,7 @@ ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode,
 LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec', 'elmo_sentvec':'elmo_sentvec', 'elmo_w2v_sentvec':'elmo_w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
 CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
-CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
@@ -1762,7 +1771,7 @@ SEQ2VEC_LM_PARAMS_MAP = {'boe':[('hdim','embedding_dim')], 'pytorch':[('hdim', '
 SEQ2SEQ_DIM_INFER = {'pytorch-lstm':lambda x: x[1] * x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[1] * x[2]['hidden_size'], 'pytorch-gru':lambda x: x[1] * x[2]['hidden_size'], 'cnn':lambda x: 2 * x[0], 'isa':lambda x: x[0]}
 SEQ2VEC_DIM_INFER = {'boe':lambda x: x[0], 'pytorch-lstm':lambda x: x[2]['hidden_size'], 'pytorch-agmnlstm':lambda x: x[2]['hidden_size'], 'pytorch-rnn':lambda x: x[2]['hidden_size'], 'pytorch-stkaltlstm':lambda x: x[2]['hidden_size'], 'pytorch-gru':lambda x: x[2]['hidden_size'], 'cnn':lambda x: int(1.5 * x[2]['embedding_dim']), 'cnn_highway':lambda x: x[0]}
 NORM_TYPE_MAP = {'batch':nn.BatchNorm1d, 'layer':nn.LayerNorm}
-ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid}
+ACTVTN_MAP = {'relu':nn.ReLU, 'sigmoid':nn.Sigmoid, 'tanh':nn.Tanh}
 RGRSN_LOSS_MAP = {'mse':MSELoss, 'contrastive':ContrastiveLoss, 'huber':HuberLoss, 'logcosh':LogCoshLoss, 'xtanh':XTanhLoss, 'xsigmoid':XSigmoidLoss, 'quantile':QuantileLoss, 'pearson':PearsonCorrelationLoss}
 SIM_FUNC_MAP = {'sim':'sim', 'dist':'dist'}
 CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
@@ -2565,14 +2574,24 @@ def simsearch(dev_id=None):
             with open(os.path.join(os.path.pardir, lb_embd_raw_fname), 'rb') as fd:
                 lbembd_raw = pickle.load(fd)
         else:
-            lbembd_raw = model(lbnotes['text'].tolist(), embedding_mode=True, bsize=opts.bsize)
+            lb_corpus = lbnotes['text'].tolist()
+            lbembd_raw = model(lb_corpus, embedding_mode=True, bsize=opts.bsize).numpy()
+            if do_tfidf:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                lb_vctrz = TfidfVectorizer()
+                lb_X = lb_vctrz.fit_transform(lb_corpus)
+                lbembd_raw = np.concatenate((lbembd_raw, lb_X), axis=1)
+            if do_bm25:
+                from gensim.summarization.bm25 import get_bm25_weights
+                lb_bm25_X = np.array(get_bm25_weights(lb_corpus, n_jobs=opts.np))
+                lbembd_raw = np.concatenate((lbembd_raw, lb_bm25_X), axis=1)
             with open(lb_embd_raw_fname, 'wb') as fd:
                 pickle.dump(lbembd_raw, fd)
         lbnotes['embedding'] = [x for x in lbembd_raw.numpy()]
         lbembd = {}
         # One label may has multiple notes
         for gid, grp in lbnotes['embedding'].groupby('id'):
-            lbembd[gid] = grp.to_numpy().mean(axis=0) # averaged embedding
+            lbembd[gid] = grp.mean(axis=0) # averaged embedding
         with open(lb_embd_fname, 'wb') as fd:
             pickle.dump(lbembd, fd)
 
@@ -2601,12 +2620,22 @@ def simsearch(dev_id=None):
             with open(os.path.join(os.path.pardir, clf_h_cache_fname), 'rb') as fd:
                 clf_h = pickle.load(fd)
         else:
-            clf_h = model(df['text'].tolist(), embedding_mode=True, bsize=opts.bsize)
+            txt_corpus = df['text'].tolist()
+            clf_h = model(txt_corpus, embedding_mode=True, bsize=opts.bsize).numpy()
+            if do_tfidf:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                txt_vctrz = TfidfVectorizer()
+                txt_X = txt_vctrz.fit_transform(txt_corpus)
+                clf_h = np.concatenate((clf_h, txt_X), axis=1)
+            if do_bm25:
+                from gensim.summarization.bm25 import get_bm25_weights
+                txt_bm25_X = np.array(get_bm25_weights(txt_corpus, n_jobs=opts.np))
+                clf_h = np.concatenate((clf_h, txt_bm25_X), axis=1)
             with open(clf_h_cache_fname, 'wb') as fd:
                 pickle.dump(clf_h, fd)
 
         # Search the topk similar labels
-        D, I = lbembd_idx.search(clf_h.numpy(), opts.topk)
+        D, I = lbembd_idx.search(clf_h, opts.topk)
         cand_preds = [[binlbr[idx] for idx in indices] for indices in I]
         cand_lbs = list(set(itertools.chain.from_iterable(cand_preds)))
         cand_lbs_idx = dict([(lb, i) for i, lb in enumerate(cand_lbs)])
@@ -2716,6 +2745,7 @@ if __name__ == '__main__':
     op.add_option('--droplast', default=False, action='store_true', dest='droplast', help='whether to drop the last incompleted batch')
     op.add_option('--do_norm', default=False, action='store_true', dest='do_norm', help='whether to do normalization')
     op.add_option('--norm_type', default='batch', action='store', dest='norm_type', help='normalization layer class')
+    op.add_option('--do_extlin', default=False, action='store_true', dest='do_extlin', help='whether to apply additional fully-connected layer to the hidden states of the language model')
     op.add_option('--do_lastdrop', default=False, action='store_true', dest='do_lastdrop', help='whether to apply dropout to the last layer')
     op.add_option('--lm_loss', default=False, action='store_true', dest='lm_loss', help='whether to apply dropout to the last layer')
     op.add_option('--do_crf', default=False, action='store_true', dest='do_crf', help='whether to apply CRF layer')
@@ -2739,6 +2769,8 @@ if __name__ == '__main__':
     op.add_option('--pdrop', default=0.2, action='store', type='float', dest='pdrop', help='indicate the dropout probabilitiy for all fully connected layers in the embeddings, encoder, and pooler')
     op.add_option('--pthrshld', default=0.5, action='store', type='float', dest='pthrshld', help='indicate the threshold for predictive probabilitiy')
     op.add_option('--topk', default=5, action='store', type='int', dest='topk', help='indicate the top k search parameter')
+    op.add_option('--do_tfidf', default=False, action='store_true', dest='topk', help='whether to use tfidf as text features')
+    op.add_option('--do_bm25', default=False, action='store_true', dest='topk', help='whether to use bm25 as text features')
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
     op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
