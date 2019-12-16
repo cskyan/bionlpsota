@@ -1976,6 +1976,11 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                 sys.exit(0)
         avg_loss = total_loss / (step + 1)
         print('Train loss in %i epoch(s): %f' % (epoch + 1, avg_loss))
+        if epoch % 5 == 0:
+            try:
+                save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+            except Exception as e:
+                print(e)
         if earlystop and earlystoper.step(avg_loss):
             print('Early stop!')
             break
