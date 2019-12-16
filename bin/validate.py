@@ -755,7 +755,7 @@ class EmbeddingHead(nn.Module):
         use_gpu = next(self.base_model['model'].parameters()).is_cuda
         clf_h = hidden_states
         if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
-            clf_h = torch.cat(clf_h, dim=-1)
+            clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1])], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
             clf_logits = self.linear(clf_h) if self.linear else clf_h
         else:
             clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
@@ -1466,7 +1466,7 @@ class EmbeddingDataset(BaseDataset):
 
 class EmbeddingPairDataset(BaseDataset):
     def __init__(self, embeddings1, embeddings2, pair_indices, labels=None):
-        self.embeddings1 = embeddings1
+        self.embeddings1 = torch.tensor(embeddings1)
         self.embeddings2 = torch.tensor(embeddings2)
         self.pair_indices = pair_indices
         self.labels = labels
@@ -2532,7 +2532,7 @@ def simsearch(dev_id=None):
     special_tknids_args = dict(zip(special_tkns[0], special_tknids))
     task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('model',opts.model), ('sentsim_func', opts.sentsim_func), ('seqlen',opts.maxlen)])
     # Prepare task related meta data
-    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
     task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
@@ -2576,18 +2576,18 @@ def simsearch(dev_id=None):
         else:
             lb_corpus = lbnotes['text'].tolist()
             lbembd_raw = model(lb_corpus, embedding_mode=True, bsize=opts.bsize).numpy()
-            if do_tfidf:
+            if opts.do_tfidf:
                 from sklearn.feature_extraction.text import TfidfVectorizer
                 lb_vctrz = TfidfVectorizer()
                 lb_X = lb_vctrz.fit_transform(lb_corpus)
                 lbembd_raw = np.concatenate((lbembd_raw, lb_X), axis=1)
-            if do_bm25:
+            if opts.do_bm25:
                 from gensim.summarization.bm25 import get_bm25_weights
                 lb_bm25_X = np.array(get_bm25_weights(lb_corpus, n_jobs=opts.np))
                 lbembd_raw = np.concatenate((lbembd_raw, lb_bm25_X), axis=1)
             with open(lb_embd_raw_fname, 'wb') as fd:
                 pickle.dump(lbembd_raw, fd)
-        lbnotes['embedding'] = [x for x in lbembd_raw.numpy()]
+        lbnotes['embedding'] = [x for x in lbembd_raw]
         lbembd = {}
         # One label may has multiple notes
         for gid, grp in lbnotes['embedding'].groupby('id'):
@@ -2622,12 +2622,12 @@ def simsearch(dev_id=None):
         else:
             txt_corpus = df['text'].tolist()
             clf_h = model(txt_corpus, embedding_mode=True, bsize=opts.bsize).numpy()
-            if do_tfidf:
+            if opts.do_tfidf:
                 from sklearn.feature_extraction.text import TfidfVectorizer
                 txt_vctrz = TfidfVectorizer()
                 txt_X = txt_vctrz.fit_transform(txt_corpus)
                 clf_h = np.concatenate((clf_h, txt_X), axis=1)
-            if do_bm25:
+            if opts.do_bm25:
                 from gensim.summarization.bm25 import get_bm25_weights
                 txt_bm25_X = np.array(get_bm25_weights(txt_corpus, n_jobs=opts.np))
                 clf_h = np.concatenate((clf_h, txt_bm25_X), axis=1)
@@ -2769,8 +2769,8 @@ if __name__ == '__main__':
     op.add_option('--pdrop', default=0.2, action='store', type='float', dest='pdrop', help='indicate the dropout probabilitiy for all fully connected layers in the embeddings, encoder, and pooler')
     op.add_option('--pthrshld', default=0.5, action='store', type='float', dest='pthrshld', help='indicate the threshold for predictive probabilitiy')
     op.add_option('--topk', default=5, action='store', type='int', dest='topk', help='indicate the top k search parameter')
-    op.add_option('--do_tfidf', default=False, action='store_true', dest='topk', help='whether to use tfidf as text features')
-    op.add_option('--do_bm25', default=False, action='store_true', dest='topk', help='whether to use bm25 as text features')
+    op.add_option('--do_tfidf', default=False, action='store_true', dest='do_tfidf', help='whether to use tfidf as text features')
+    op.add_option('--do_bm25', default=False, action='store_true', dest='do_bm25', help='whether to use bm25 as text features')
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
     op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
