@@ -1676,21 +1676,10 @@ def _sprmn_cor(trues, preds):
 
 def _handle_model(model, dev_id=None, distrb=False):
     if (distrb):
-        if (type(dev_id) is list):
-            model.cuda()
-            model = nn.parallel.DistributedDataParallel(model, device_ids=dev_id)
-        else:
-            torch.cuda.set_device(dev_id)
-            model = model.to('cuda')
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[dev_id])
-            raise NotImplementedError
-            # Not implemented, should divide data outside this function and get one portion here, probably with parallel version of `load_data`
+        model.cuda()
     elif (dev_id is not None):
         if (type(dev_id) is list):
             model = model.to('cuda')
-            # for attr in dir(model):
-            #     attr_obj = getattr(model, attr)
-            #     if type(attr_obj) is list and all([isinstance(x, nn.Module) for x in attr_obj]): setattr(model, attr, [DataParallel(x) for x in attr_obj])
             model = DataParallel(model, device_ids=dev_id)
         else:
             torch.cuda.set_device(dev_id)
@@ -1788,18 +1777,18 @@ def gen_pytorch_wrapper(mdl_type, mdl_name, **kwargs):
 def gen_mdl(mdl_name, pretrained=True, use_gpu=False, distrb=False, dev_id=None):
     if mdl_name == 'none': return None
     if (type(pretrained) is str):
-        print('Using pretrained model from `%s`' % pretrained)
+        if (not distrb or distrb and hvd.rank() == 0): print('Using pretrained model from `%s`' % pretrained)
         checkpoint = torch.load(pretrained, map_location='cpu')
         model = checkpoint['model']
         model.load_state_dict(checkpoint['state_dict'])
     elif (pretrained):
-        print('Using pretrained model...')
+        if (not distrb or distrb and hvd.rank() == 0): print('Using pretrained model...')
         common_cfg = cfgr('validate', 'common')
         pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
         params = pr('LM', LM_PARAMS_MAP[mdl_name])
         model = LM_MODEL_MAP[mdl_name].from_pretrained(params['pretrained_mdl_path'] if 'pretrained_mdl_path' in params else LM_MDL_NAME_MAP[mdl_name])
     else:
-        print('Using untrained model...')
+        if (not distrb or distrb and hvd.rank() == 0): print('Using untrained model...')
         try:
             common_cfg = cfgr('validate', 'common')
             pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
@@ -1849,9 +1838,9 @@ def gen_clf(mdl_name, encoder='pool', constraints=[], use_gpu=False, distrb=Fals
 def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, distrb=False, **kwargs):
     print('Saving trained model...')
     use_gpu, multi_gpu = (devq and len(devq) > 0), (devq and len(devq) > 1)
-    if in_wrapper or multi_gpu: model = model.module
+    if not distrb and (in_wrapper or multi_gpu): model = model.module
     model = model.cpu() if use_gpu else model
-    checkpoint = {'model': model, 'state_dict': model.state_dict(), 'optimizer':optimizer, 'optimizer_state_dict':optimizer.state_dict()}
+    checkpoint = {'model': model, 'state_dict': model.state_dict(), 'optimizer':optimizer if not distrb else None, 'optimizer_state_dict':optimizer.state_dict()}
     checkpoint.update(kwargs)
     torch.save(checkpoint, fpath)
     model = _handle_model(model, dev_id=devq, distrb=distrb) if use_gpu else model
@@ -1862,11 +1851,12 @@ def load_model(mdl_path):
     checkpoint = torch.load(mdl_path, map_location='cpu')
     model, optimizer = checkpoint['model'], checkpoint['optimizer']
     model.load_state_dict(checkpoint['state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if optimizer: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     return model, optimizer, checkpoint.setdefault('resume', {}), dict([(k, v) for k, v in checkpoint.items() if k not in ['model', 'state_dict', 'optimizer', 'optimizer_state_dict', 'resume']])
 
 
-def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, resume={}, chckpnt_kwargs={}):
+def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, distrb=False, resume={}, chckpnt_kwargs={}):
+    chckpnt_fname, model_fname = '%s_%s_checkpoint.pth' % (task_name, mdl_name), '%s_%s.pth' % (task_name, mdl_name)
     clf_tknids = special_tkns['clf_tknids']
     earlystoper, clf_kwargs = EarlyStopping(mode='min', min_delta=earlystop_delta, patience=earlystop_patience), {}
     clf.train()
@@ -1878,7 +1868,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
         t0 = time.time()
         total_loss = 0
         # if task_type not in ['entlmnt', 'sentsim']: dataset.dataset.rebalance()
-        for step, batch in enumerate(tqdm(dataset, desc='[%i/%i epoch(s)] Training batches' % (epoch + 1, epochs))):
+        for step, batch in enumerate(tqdm(dataset, desc='[%i/%i epoch(s)] Training batches' % (epoch + 1, epochs), disable=distrb and hvd.rank()!=0)):
             try:
                 if epoch == resume['epoch'] and step < elapsed_batch: continue
                 optimizer.zero_grad()
@@ -1967,30 +1957,37 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                 print(e)
                 train_time = time.time() - t0
                 print('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
-                save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 raise e
             if (killer.kill_now):
                 train_time = time.time() - t0
                 print('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
-                save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                if (not distrb or distrb and hvd.rank() == 0):
+                    save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 sys.exit(0)
         avg_loss = total_loss / (step + 1)
         print('Train loss in %i epoch(s): %f' % (epoch + 1, avg_loss))
         if epoch % 5 == 0:
             try:
-                save_model(clf, optimizer, '%s_%s_checkpoint.pth' % (task_name, mdl_name), in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                if (not distrb or distrb and hvd.rank() == 0):
+                    save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
             except Exception as e:
                 print(e)
-        if earlystop and earlystoper.step(avg_loss):
-            print('Early stop!')
-            break
+        if earlystop:
+            do_stop = earlystoper.step(avg_loss)
+            if distrb: do_stop = hvd.broadcast(torch.tensor(do_stop), 0)
+            if do_stop:
+                print('Early stop!')
+                break
     try:
-        save_model(clf, optimizer, '%s_%s.pth' % (task_name, mdl_name), devq=devq, distrb=opts.distrb)
+        if (not distrb or distrb and hvd.rank() == 0):
+            if os.path.exists(chckpnt_fname): os.remove(chckpnt_fname)
+            save_model(clf, optimizer, model_fname, devq=devq, distrb=opts.distrb)
     except Exception as e:
         print(e)
 
 
-def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', task_name='classification', ds_name='', mdl_name='sota', clipmaxn=0.25, use_gpu=False, ignored_label=None):
+def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', task_name='classification', ds_name='', mdl_name='sota', clipmaxn=0.25, use_gpu=False, devq=None, distrb=False, ignored_label=None):
     clf_tknids = special_tkns['clf_tknids']
     clf.eval()
     clf.freeze_lm()
@@ -2196,7 +2193,7 @@ def classify(dev_id=None):
         ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
 
     # Prepare data
-    print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
+    if (not opts.distrb or opts.distrb and hvd.rank() == 0): print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
@@ -2217,7 +2214,12 @@ def classify(dev_id=None):
         class_weights /= class_weights.sum()
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
         if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
-    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=opts.droplast, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
+
+    if opts.distrb:
+        # Partition dataset among workers using DistributedSampler
+        sampler = torch.utils.data.distributed.DistributedSampler(train_ds, num_replicas=hvd.size(), rank=hvd.rank())
+
+    train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=sampler is None and opts.droplast, sampler=sampler, num_workers=opts.np, drop_last=opts.droplast)
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
@@ -2233,27 +2235,40 @@ def classify(dev_id=None):
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
         optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
-        print(optimizer)
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print(optimizer)
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
         ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
         if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
         task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-        print('Classifier hyper-parameters: %s' % ext_params)
-        print('Classifier task-related parameters: %s' % task_params)
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0):
+            print('Classifier hyper-parameters: %s' % ext_params)
+            print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type=='sentsim' else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
         optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
-        print(optimizer)
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print(optimizer)
+
+    if opts.distrb:
+        # Add Horovod Distributed Optimizer
+        optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=clf.named_parameters())
+        # Broadcast parameters from rank 0 to all other processes.
+        hvd.broadcast_parameters(clf.state_dict(), root_rank=0)
 
     # Training
-    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
+    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, resume=resume if opts.resume else {})
+
+    if opts.distrb:
+        if hvd.rank() == 0:
+            clf = _handle_model(clf, dev_id=dev_id, distrb=False)
+        else:
+            return
 
     # Evaluation
-    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
-    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb)
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
 def multi_clf(dev_id=None):
@@ -2696,11 +2711,8 @@ def main():
     else:
         return
     if (opts.distrb):
-        if (opts.np > 1): # Multi-process multiple GPU
-            import torch.multiprocessing as mp
-            mp.spawn(main_func, nprocs=len(opts.devq))
-        else: # Single-process multiple GPU
-            main_func(opts.devq if len(opts.devq) > 1 else opts.devq[0])
+        torch.cuda.set_device(hvd.local_rank())
+        main_func(opts.devq if len(opts.devq) > 1 else opts.devq[0])
     elif (opts.devq): # Single-process
         main_func(opts.devq if len(opts.devq) > 1 else opts.devq[0])
     else:
