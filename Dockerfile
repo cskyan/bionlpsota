@@ -67,15 +67,7 @@ RUN pip install mxnet-cu100==${MXNET_VERSION}
 RUN	pip install tqdm pandas scikit-learn && \
 	pip install nltk ftfy spacy && \
 	pip install allennlp
-#RUN	apt-get install -y python3-venv && \
-#	pip install poetry && \
-#	poetry new nlp && \
-#	cd nlp && \
-#	sed -i 's/python = .*/python = "3.6.9"/g' pyproject.toml && \
-#	for pkg in nltk ftfy allennlp; do poetry add $pkg; done
-#	poetry install && \
-#	ENVPATH=`pwd` && alias python='cd $ENVPATH && poetry run python' && \
-#	cd ..
+RUN pip install pytorch_pretrained_bert
 
 # Install Open MPI
 RUN mkdir /tmp/openmpi && \
