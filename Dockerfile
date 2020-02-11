@@ -15,7 +15,9 @@ ENV PYTHON_VERSION=${python}
 # Set default shell to /bin/bash
 SHELL ["/bin/bash", "-cu"]
 
+# Install the essential packages
 RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
+        apt-utils \
         build-essential \
         cmake \
         g++-4.8 \
@@ -34,14 +36,19 @@ RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-
         librdmacm1 \
         libibverbs1 \
         ibverbs-providers
+
+# Get rid of the debconf messages		
+RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+#RUN dpkg-reconfigure debconf
 		
 # Install and configure locales
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y locales
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     dpkg-reconfigure --frontend=noninteractive locales && \
     update-locale LANG=en_US.UTF-8
-ENV LANG en_US.UTF-8 
+ENV LANG=en_US.UTF-8 
 
+# Install Python
 RUN if [[ "${PYTHON_VERSION}" == "3.6" ]]; then \
         apt-get install -y python${PYTHON_VERSION}-distutils; \
     fi
@@ -50,7 +57,7 @@ RUN ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python
 RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
     python get-pip.py && \
     rm get-pip.py && \
-	pip install --upgrade pip
+    pip install --upgrade pip
 
 # Install TensorFlow, Keras, PyTorch and MXNet
 RUN pip install future typing
@@ -59,14 +66,15 @@ RUN pip install numpy \
         keras \
         h5py
 
-RUN pip install https://download.pytorch.org/whl/cu100/torch-${PYTORCH_VERSION}%2Bcu100-$(python -c "import wheel.pep425tags as w; print('-'.join(w.get_supported()[0][:-1]))")-linux_x86_64.whl \
-        https://download.pytorch.org/whl/cu100/torchvision-${TORCHVISION_VERSION}%2Bcu100-$(python -c "import wheel.pep425tags as w; print('-'.join(w.get_supported()[0][:-1]))")-linux_x86_64.whl
+RUN pip install https://download.pytorch.org/whl/cu100/torch-${PYTORCH_VERSION}%2Bcu100-$(python -c "import wheel.pep425tags as w; print('-'.join(w.get_supported(archive_root=None)[0][:-1]))")-linux_x86_64.whl \
+        https://download.pytorch.org/whl/cu100/torchvision-${TORCHVISION_VERSION}%2Bcu100-$(python -c "import wheel.pep425tags as w; print('-'.join(w.get_supported(archive_root=None)[0][:-1]))")-linux_x86_64.whl
 RUN pip install mxnet-cu100==${MXNET_VERSION}
 
 # Install NLP packages
-RUN	pip install tqdm pandas scikit-learn && \
-	pip install nltk ftfy spacy && \
-	pip install allennlp
+RUN pip install tqdm pandas scikit-learn && \
+    pip install nltk ftfy spacy
+RUN pip install pipgrip && \
+    pipgrip --install allennlp
 RUN pip install pytorch_pretrained_bert
 
 # Install Open MPI
@@ -84,6 +92,7 @@ RUN mkdir /tmp/openmpi && \
 # Install Horovod, temporarily using CUDA stubs
 RUN ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
     HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 \
+    CFLAGS="-O2 -mavx -mfma" \
          pip install --no-cache-dir horovod && \
     ldconfig
 
@@ -98,11 +107,11 @@ RUN cat /etc/ssh/ssh_config | grep -v StrictHostKeyChecking > /etc/ssh/ssh_confi
 
 # Download source code
 RUN mkdir /source && \
-	cd /source && \
-	git clone https://github.com/cskyan/bionlp.git && \
-	git clone https://github.com/cskyan/bionlpsota.git && \
-    rm -rf bionlp/.git bionlpsota/.git && \
-	export PYTHONPATH=/source:$PYTHONPATH
+    cd /source && \
+    git clone https://github.com/cskyan/bionlp.git && \
+    git clone https://github.com/cskyan/bionlpsota.git && \
+    rm -rf bionlp/.git bionlpsota/.git
+ENV PYTHONPATH=/source
 
 # Prepare workspace
 RUN mkdir /workspace
