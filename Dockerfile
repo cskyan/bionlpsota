@@ -1,12 +1,12 @@
-FROM nvidia/cuda:10.0-devel-ubuntu18.04
+FROM nvidia/cuda:10.1-devel-ubuntu18.04
 
 # TensorFlow version is tightly coupled to CUDA and cuDNN so it should be selected carefully
 ENV TENSORFLOW_VERSION=2.0.0
-ENV PYTORCH_VERSION=1.3.0
-ENV TORCHVISION_VERSION=0.4.1
-ENV CUDNN_VERSION=7.6.0.64-1+cuda10.0
-ENV NCCL_VERSION=2.4.7-1+cuda10.0
-ENV MXNET_VERSION=1.5.0
+ENV PYTORCH_VERSION=1.4.0
+ENV TORCHVISION_VERSION=0.5.0
+ENV CUDNN_VERSION=7.6.5.32-1+cuda10.1
+ENV NCCL_VERSION=2.5.6-1+cuda10.1
+ENV MXNET_VERSION=1.5.1
 
 # Python 2.7 or 3.6 is supported by Ubuntu Bionic out of the box
 ARG python=3.6
@@ -39,10 +39,9 @@ RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-
 
 # Get rid of the debconf messages		
 RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
-#RUN dpkg-reconfigure debconf
 		
 # Install and configure locales
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y locales
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y locales
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     dpkg-reconfigure --frontend=noninteractive locales && \
     update-locale LANG=en_US.UTF-8
@@ -53,11 +52,10 @@ RUN if [[ "${PYTHON_VERSION}" == "3.6" ]]; then \
         apt-get install -y python${PYTHON_VERSION}-distutils; \
     fi
 RUN ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python
-
 RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
     python get-pip.py && \
     rm get-pip.py && \
-    pip install --upgrade pip
+    pip install --upgrade pip wheel
 
 # Install TensorFlow, Keras, PyTorch and MXNet
 RUN pip install future typing
@@ -65,16 +63,13 @@ RUN pip install numpy \
         tensorflow-gpu==${TENSORFLOW_VERSION} \
         keras \
         h5py
-
-RUN pip install https://download.pytorch.org/whl/cu100/torch-${PYTORCH_VERSION}%2Bcu100-$(python -c "import wheel.pep425tags as w; print('-'.join(w.get_supported(archive_root=None)[0][:-1]))")-linux_x86_64.whl \
-        https://download.pytorch.org/whl/cu100/torchvision-${TORCHVISION_VERSION}%2Bcu100-$(python -c "import wheel.pep425tags as w; print('-'.join(w.get_supported(archive_root=None)[0][:-1]))")-linux_x86_64.whl
-RUN pip install mxnet-cu100==${MXNET_VERSION}
+RUN pip install torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} -f https://download.pytorch.org/whl/torch_stable.html
+RUN pip install mxnet-cu101==${MXNET_VERSION}
 
 # Install NLP packages
 RUN pip install tqdm pandas scikit-learn && \
     pip install nltk ftfy spacy
-RUN pip install pipgrip && \
-    pipgrip --install allennlp
+RUN pip install allennlp
 RUN pip install pytorch_pretrained_bert
 
 # Install Open MPI
@@ -91,7 +86,7 @@ RUN mkdir /tmp/openmpi && \
 
 # Install Horovod, temporarily using CUDA stubs
 RUN ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
-    HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 \
+    HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL HOROVOD_GPU_ALLGATHER=MPI HOROVOD_ALLOW_MIXED_GPU_IMPL=1 HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 \
     CFLAGS="-O2 -mavx -mfma" \
          pip install --no-cache-dir horovod && \
     ldconfig
