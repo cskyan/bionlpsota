@@ -398,7 +398,7 @@ class BERTClfHead(BaseClfHead):
             self.output_layer = output_layer if (output_layer >= -self.num_hidden_layers and output_layer < self.num_hidden_layers) else -1
         else:
             self.output_layer = [x for x in output_layer if (x >= -self.num_hidden_layers and x < self.num_hidden_layers)]
-            self.layer_pooler = TransformerLayerMaxPool(kernel_size=self.num_hidden_layers) if layer_pooler == 'max' else TransformerLayerAvgPool(kernel_size=self.num_hidden_layers)
+            self.layer_pooler = TransformerLayerMaxPool(kernel_size=len(self.output_layer)) if layer_pooler == 'max' else TransformerLayerAvgPool(kernel_size=len(self.output_layer))
         if pooler is not None:
             self.pooler = MaskedReduction(reduction=pooler, dim=1)
 
@@ -1975,7 +1975,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                 print(e)
         if earlystop:
             do_stop = earlystoper.step(avg_loss)
-            if distrb: do_stop = hvd.broadcast(torch.tensor(do_stop), 0)
+            if distrb: do_stop = hvd.broadcast(torch.tensor(do_stop).type(torch.ByteTensor), 0).type(torch.BoolTensor)
             if do_stop:
                 print('Early stop!')
                 break
@@ -2231,10 +2231,17 @@ def classify(dev_id=None):
 
     if (opts.resume):
         # Load model
-        clf, optimizer, resume, chckpnt = load_model(opts.resume)
+        clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
+        if opts.refresh:
+            print('Refreshing and saving the model with newest code...')
+            try:
+                if (not distrb or distrb and hvd.rank() == 0):
+                    save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
+            except Exception as e:
+                print(e)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(optimizer.state_dict())
+        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(prv_optimizer.state_dict())
         if (not opts.distrb or opts.distrb and hvd.rank() == 0): print(optimizer)
     else:
         # Build model
