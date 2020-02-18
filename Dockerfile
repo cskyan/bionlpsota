@@ -73,7 +73,7 @@ RUN git clone https://github.com/NVIDIA/apex && \
     cd ..
 
 # Install NLP packages
-RUN pip install tqdm pandas scikit-learn && \
+RUN pip install tqdm openpyxl pandas scikit-learn && \
     pip install nltk ftfy spacy
 RUN pip install scispacy
 RUN pip install allennlp
