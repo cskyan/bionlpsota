@@ -12,6 +12,12 @@ ENV MXNET_VERSION=1.5.1
 ARG python=3.6
 ENV PYTHON_VERSION=${python}
 
+# Configure Java version 8 or 11
+ENV JAVA_VERSION=8
+
+# Configure PyLucene version
+ENV PYLUCENE_VERSION=8.1.1
+
 # Set default shell to /bin/bash
 SHELL ["/bin/bash", "-cu"]
 
@@ -47,6 +53,10 @@ RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     update-locale LANG=en_US.UTF-8
 ENV LANG=en_US.UTF-8
 
+# Install JDK
+RUN apt-get install -y openjdk-${JAVA_VERSION}-jdk ant
+ENV JAVA_HOME=/usr/lib/jvm/java-${JAVA_VERSION}-openjdk-amd64
+
 # Install Python
 RUN if [[ "${PYTHON_VERSION}" == "3.6" ]]; then \
         apt-get install -y python${PYTHON_VERSION}-distutils; \
@@ -67,10 +77,22 @@ RUN pip install torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} 
 RUN pip install mxnet-cu101==${MXNET_VERSION}
 
 # Install apex
-RUN git clone https://github.com/NVIDIA/apex && \
-    cd apex && \
+RUN git clone https://github.com/NVIDIA/apex /usr/local/apex && \
+    cd /usr/local/apex && \
     pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./ && \
-    cd ..
+    cd /
+
+# Install PyLucene
+RUN mkdir /tmp/pylucene && \
+    cd /tmp/pylucene && \
+    wget https://dist.apache.org/repos/dist/release/lucene/pylucene/pylucene-${PYLUCENE_VERSION}-src.tar.gz -q && \
+    tar zxf pylucene-${PYLUCENE_VERSION}-src.tar.gz && \
+    cd pylucene-${PYLUCENE_VERSION}/jcc && \
+    NO_SHARED=1 JCC_JDK=${JAVA_HOME} python setup.py install && \
+    cd .. && \
+    make all install JCC='python -m jcc' ANT=ant PYTHON=python NUM_FILES=8 && \
+    ldconfig && \
+    rm -rf /tmp/pylucene
 
 # Install NLP packages
 RUN pip install tqdm openpyxl pandas scikit-learn && \
@@ -87,7 +109,7 @@ RUN pip install pytorch_pretrained_bert
 # Install Open MPI
 RUN mkdir /tmp/openmpi && \
     cd /tmp/openmpi && \
-    wget https://www.open-mpi.org/software/ompi/v4.0/downloads/openmpi-4.0.1.tar.gz && \
+    wget https://www.open-mpi.org/software/ompi/v4.0/downloads/openmpi-4.0.1.tar.gz -q && \
     tar zxf openmpi-4.0.1.tar.gz && \
     cd openmpi-4.0.1 && \
     ./configure --enable-orterun-prefix-by-default && \
