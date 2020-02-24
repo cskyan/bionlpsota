@@ -82,7 +82,7 @@ RUN git clone https://github.com/NVIDIA/apex /usr/local/apex && \
     pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./ && \
     cd /
 
-# Install PyLucene
+# Install PyLucene, pysolr and ijson
 RUN mkdir /tmp/pylucene && \
     cd /tmp/pylucene && \
     wget https://dist.apache.org/repos/dist/release/lucene/pylucene/pylucene-${PYLUCENE_VERSION}-src.tar.gz -q && \
@@ -93,6 +93,7 @@ RUN mkdir /tmp/pylucene && \
     make all install JCC='python -m jcc' ANT=ant PYTHON=python NUM_FILES=8 && \
     ldconfig && \
     rm -rf /tmp/pylucene
+RUN pip install pysolr ijson
 
 # Install NLP packages
 RUN pip install tqdm openpyxl pandas scikit-learn && \
