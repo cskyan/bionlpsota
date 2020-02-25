@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, IterableDataset, DataLoader
 from torch.utils.data.sampler import WeightedRandomSampler
 from torch.nn.parallel import replicate
 
@@ -1140,55 +1140,9 @@ class DataParallel(nn.DataParallel):
         return replicas
 
 
-class BaseDataset(Dataset):
-    """Basic dataset class"""
-
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
-        self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
-        self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
-        # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
-        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
-        if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
-        self.df.columns = self.df.columns.astype(str, copy=False)
-        self.mltl = mltl
-        if (binlb == 'rgrsn'):
-            self.binlb = None
-            self.binlbr = None
-            self.df = self.df[self.df[self.label_col].notnull()]
-        elif (type(binlb) is str and binlb.startswith('mltl')):
-            sc = binlb.split(SC)[-1]
-            self.df = self.df[self.df[self.label_col].notnull()]
-            lb_df = self.df[self.label_col]
-            labels = sorted(set([lb for lbs in lb_df for lb in lbs.split(sc)])) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
-            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
-            self.binlbr = OrderedDict([(i, lb) for i, lb in enumerate(labels)])
-            self.mltl = True
-        elif (binlb is None):
-            lb_df = self.df[self.df[self.label_col].notnull()][self.label_col]
-            labels = sorted(set(lb_df)) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
-            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
-            self.binlbr = OrderedDict([(i, lb) for i, lb in enumerate(labels)])
-        else:
-            self.binlb = binlb
-            self.binlbr = OrderedDict([(i, lb) for lb, i in binlb.items()])
-        self.encode_func = encode_func
-        self.tokenizer = tokenizer
-        if hasattr(tokenizer, 'vocab'):
-            self.vocab_size = len(tokenizer.vocab)
-        elif hasattr(tokenizer, 'vocab_size'):
-            self.vocab_size = tokenizer.vocab_size
-        self.transforms = transforms
-        self.transforms_args = transforms_args
-        self.transforms_kwargs = transforms_kwargs
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        record = self.df.iloc[idx]
-        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
-        sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])
+class DatasetInterface(object):
+    def __init__(self):
+        raise NotImplementedError
 
     def _transform_chain(self, sample):
         if self.transforms:
@@ -1278,6 +1232,55 @@ class BaseDataset(Dataset):
         self.df = self.df.loc[list(set(self.df.index)-set(max_lb_df.index))]
 
 
+class BaseDataset(DatasetInterface, Dataset):
+    """Basic dataset class"""
+
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
+        self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
+        self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
+        # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
+        self.df.columns = self.df.columns.astype(str, copy=False)
+        self.mltl = mltl
+        if (binlb == 'rgrsn'):
+            self.binlb = None
+            self.binlbr = None
+            self.df = self.df[self.df[self.label_col].notnull()]
+        elif (type(binlb) is str and binlb.startswith('mltl')):
+            sc = binlb.split(SC)[-1]
+            self.df = self.df[self.df[self.label_col].notnull()]
+            lb_df = self.df[self.label_col]
+            labels = sorted(set([lb for lbs in lb_df for lb in lbs.split(sc)])) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
+            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
+            self.mltl = True
+        elif (binlb is None):
+            lb_df = self.df[self.df[self.label_col].notnull()][self.label_col]
+            labels = sorted(set(lb_df)) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
+            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
+        else:
+            self.binlb = binlb
+        if self.binlb: self.binlbr = OrderedDict([(i, lb) for lb, i in self.binlb.items()])
+        self.encode_func = encode_func
+        self.tokenizer = tokenizer
+        if hasattr(tokenizer, 'vocab'):
+            self.vocab_size = len(tokenizer.vocab)
+        elif hasattr(tokenizer, 'vocab_size'):
+            self.vocab_size = tokenizer.vocab_size
+        self.transforms = transforms
+        self.transforms_args = transforms_args
+        self.transforms_kwargs = transforms_kwargs
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        record = self.df.iloc[idx]
+        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
+        sample = self._transform_chain(sample)
+        return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])
+
+
 class SentSimDataset(BaseDataset):
     """Sentence Similarity task dataset class"""
 
@@ -1308,7 +1311,7 @@ class EntlmntDataset(BaseDataset):
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col]
+        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlbr][0]
         sample = self._transform_chain(sample)
         return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])
 
@@ -1365,8 +1368,6 @@ class MaskedLMDataset(BaseDataset):
         self._ds = dataset
         self.text_col = self._ds.text_col
         self.label_col = self._ds.label_col
-        self.df = self._ds.df
-        self._df = self._ds._df
         self.mltl = self._ds.mltl
         self.binlb = self._ds.binlb
         self.binlbr = self._ds.binlbr
@@ -1378,6 +1379,8 @@ class MaskedLMDataset(BaseDataset):
         self.transforms_kwargs = self._ds.transforms_kwargs
         self.special_tknids = special_tknids
         self.masked_lm_prob = masked_lm_prob
+        if hasattr(self._ds, 'df'): self.df = self._ds.df
+        if hasattr(self._ds, '_df'): self._df = self._ds._df
 
     def __len__(self):
         return self._ds.__len__()
@@ -1481,6 +1484,149 @@ class EmbeddingPairDataset(BaseDataset):
         indices = self.pair_indices[idx]
         sample = torch.stack((self.embeddings1[indices[0]], self.embeddings2[indices[1]])).view(1, 2, -1)
         return (sample, self.labels[idx]) if self.labels else sample
+
+
+class BaseIterDataset(DatasetInterface, IterableDataset):
+    """ Basic iterable dataset """
+
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
+        self.index_col = index_col
+        self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
+        self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
+        self.mltl = mltl
+        self.data = io.JsonIterable(fpath, retgen=True) if os.path.splitext(fpath)[-1] == '.json' else None
+        self.encode_func = encode_func
+        self.tokenizer = tokenizer
+        if hasattr(tokenizer, 'vocab'):
+            self.vocab_size = len(tokenizer.vocab)
+        elif hasattr(tokenizer, 'vocab_size'):
+            self.vocab_size = tokenizer.vocab_size
+        self.transforms = transforms
+        self.transforms_args = transforms_args
+        self.transforms_kwargs = transforms_kwargs
+
+        self.data, preproc_data = itertools.tee(self.data)
+        labels = set([])
+        if (binlb == 'rgrsn'):
+            self.binlb = None
+            self.binlbr = None
+        elif (type(binlb) is str and binlb.startswith('mltl')):
+            sc = binlb.split(SC)[-1]
+            for record in preproc_data:
+                labels |= set(record[self.label_col].split(sc))
+            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(sorted(labels))])
+            self.mltl = True
+        elif (binlb is None):
+            for record in preproc_data:
+                labels.add(record[self.label_col])
+            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(sorted(labels))])
+        else:
+            self.binlb = binlb
+        if self.binlb: self.binlbr = OrderedDict([(i, lb) for lb, i in self.binlb.items()])
+
+    def _transform(self, record):
+        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
+        sample = self._transform_chain(sample)
+        return record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])
+
+    def __iter__(self):
+        return iter((self._transform(record) for record in self.data))
+
+
+class EntlmntIterDataset(BaseIterDataset):
+    """Entailment task iterable dataset class"""
+
+    def _transform(self, record):
+        sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
+        sample = self._transform_chain(sample)
+        return record[self.index_col], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])
+
+
+class EntlmntMltlIterDataset(EntlmntIterDataset):
+    """Entailment task transformed from multi-label classification iterable dataset class"""
+
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
+        try:
+            super(EntlmntMltlIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, mltl=mltl, sampfrac=sampfrac, **kwargs)
+        except Exception as e:
+            print(e)
+        if type(binlb) is str and binlb.startswith('mltl'):
+            self.data, preproc_data = itertools.tee(self.data)
+            labels = set([])
+            sc = binlb.split(SC)[-1]
+            for record in preproc_data:
+                labels |= set(record[kwargs['origlb']] if type(record[kwargs['origlb']]) is list else record[kwargs['origlb']].split(sc))
+            self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(sorted(labels))])
+            self.binlbr = OrderedDict([(i, lb) for lb, i in self.binlb.items()])
+            self.mltl = True
+        def _mltl2entlmnt(data, text_col, orig_lb_col, dest_lb_col, lbtxt=None, neglbs=None):
+            for record in data:
+                for lb in record[orig_lb_col]:
+                    record[text_col[-1]] = lb if lbtxt is None else lbtxt['func'](lb, **lbtxt['kwargs'])
+                    record[dest_lb_col] = 'include'
+                    yield record
+                if neglbs is not None:
+                    for neg_lb in neglbs['func'](record[orig_lb_col], **neglbs['kwargs']):
+                        record[text_col[-1]] = neg_lb if lbtxt is None else lbtxt['func'](neg_lb, **lbtxt['kwargs'])
+                        record[dest_lb_col] = ''
+                        yield record
+        self.data = _mltl2entlmnt(self.data, text_col, kwargs['origlb'], label_col, lbtxt=kwargs.setdefault('lbtxt', None), neglbs=kwargs.setdefault('neglbs', None))
+
+
+class MaskedLMIterDataset(BaseIterDataset):
+    """Wrapper iterable dataset class for masked language model"""
+
+    def __init__(self, dataset, special_tknids=[101, 102, 102, 103], masked_lm_prob=0.15):
+        self._ds = dataset
+        self.index_col = self._ds.index_col
+        self.text_col = self._ds.text_col
+        self.label_col = self._ds.label_col
+        self.mltl = self._ds.mltl
+        self.binlb = self._ds.binlb
+        self.binlbr = self._ds.binlbr
+        self.encode_func = self._ds.encode_func
+        self.tokenizer = self._ds.tokenizer
+        self.vocab_size = self._ds.vocab_size
+        self.transforms = self._ds.transforms
+        self.transforms_args = self._ds.transforms_args
+        self.transforms_kwargs = self._ds.transforms_kwargs
+        self._transform_chain = self._ds._transform_chain
+        self.special_tknids = special_tknids
+        self.masked_lm_prob = masked_lm_prob
+        self.data = dataset.data
+
+    def _transform(self, record):
+        sample = self.encode_func(record[self.text_col], self.tokenizer) if type(self.text_col) is str else [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
+        sample = self._transform_chain(sample)
+        orig_sample = (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])
+        sample = orig_sample[0], orig_sample[1]
+        masked_lm_ids = np.array(sample[0])
+        pad_trnsfm_idx = self.transforms.index(_pad_transform) if len(self.transforms) > 0 and _pad_transform in self.transforms else -1
+        pad_trnsfm_kwargs = self.transforms_kwargs[pad_trnsfm_idx] if pad_trnsfm_idx and pad_trnsfm_idx in self.transforms_kwargs > -1 else {}
+        if type(self._ds) in [EntlmntIterDataset, EntlmntMltlIterDataset] and len(self.transforms_kwargs) >= 2 and self.transforms_kwargs[1].setdefault('sentsim_func', None) is not None:
+            masked_lm_lbs = [np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0][X]]) for X in [0,1]]
+            valid_idx = [np.where(masked_lm_lbs[x] > -1)[0] for x in [0,1]]
+            cand_samp_idx = [random.sample(range(len(valid_idx[x])), min(opts.maxlen, max(1, int(round(len(valid_idx[x]) * self.masked_lm_prob))))) for x in [0,1]]
+            cand_idx = [valid_idx[x][cand_samp_idx[x]] for x in [0,1]]
+            rndm = [np.random.uniform(low=0, high=1, size=(len(cand_idx[x]),)) for x in [0,1]]
+            for x in [0,1]:
+                masked_lm_ids[x][cand_idx[x][rndm[x] < 0.8]] = self.special_tknids[-1]
+                masked_lm_ids[x][cand_idx[x][rndm[x] >= 0.9]] = random.randrange(0, self.vocab_size)
+            for X in [0,1]:
+                masked_lm_lbs[X][list(filter(lambda x: x not in cand_idx[X], range(len(masked_lm_lbs[X]))))] = -1
+        else:
+            masked_lm_lbs = np.array([-1 if x in self.special_tknids + [pad_trnsfm_kwargs.setdefault('xpad_val', -1)] else x for x in sample[0]])
+            valid_idx = np.where(masked_lm_lbs > -1)[0]
+            cand_samp_idx = random.sample(range(len(valid_idx)), min(opts.maxlen, max(1, int(round(len(valid_idx) * self.masked_lm_prob)))))
+            cand_idx = valid_idx[cand_samp_idx]
+            rndm = np.random.uniform(low=0, high=1, size=(len(cand_idx),))
+            masked_lm_ids[cand_idx[rndm < 0.8]] = self.special_tknids[-1]
+            masked_lm_ids[cand_idx[rndm >= 0.9]] = random.randrange(0, self.vocab_size)
+            masked_lm_lbs[list(filter(lambda x: x not in cand_idx, range(len(masked_lm_lbs))))] = -1
+        return record[self.index_col], orig_sample[0], orig_sample[1], torch.tensor(masked_lm_ids), torch.tensor(masked_lm_lbs)
+
+    def __iter__(self):
+        return iter((self._transform(record) for record in self.data))
 
 
 def _sentclf_transform(sample, options=None, model=None, seqlen=32, start_tknids=[], clf_tknids=[], **kwargs):
@@ -1591,7 +1737,7 @@ def _adjust_encoder(mdl_name, tokenizer, extra_tokens=[], ret_list=False):
 
 
 def _bert_encode(text, tokenizer):
-    texts, records = [text] if (type(text) is str) else text, []
+    texts, records = [str(text)] if (type(text) is str or not hasattr(text, '__iter__')) else [str(s) for s in text], []
     try:
         for txt in texts:
             tokens = tokenizer.tokenize(ftfy.fix_text(txt))
@@ -1603,17 +1749,17 @@ def _bert_encode(text, tokenizer):
             records.append(record)
     except Exception as e:
         print(e)
-        print('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
+        print('Cannot encode %s' % str(text).encode('ascii', 'replace').decode('ascii'))
         return []
-    return records[0] if (type(text) is str) else records
+    return records[0] if (type(text) is str or not hasattr(text, '__iter__')) else records
 
 
 def _gpt2_encode(text, tokenizer):
     try:
-        records = tokenizer.encode(ftfy.fix_text(text).encode('ascii', 'replace').decode('ascii')) if (type(text) is str) else [tokenizer.encode(ftfy.fix_text(line).encode('ascii', 'replace').decode('ascii')) for line in text]
+        records = tokenizer.encode(ftfy.fix_text(str(text)).encode('ascii', 'replace').decode('ascii')) if (type(text) is str or not hasattr(text, '__iter__')) else [tokenizer.encode(ftfy.fix_text(str(line)).encode('ascii', 'replace').decode('ascii')) for line in text]
     except ValueError as e:
         try:
-            records = list(itertools.chain(*[tokenizer.encode(w.text) for w in nlp(ftfy.fix_text(text))])) if (type(text) is str) else list(itertools.chain(*[list(itertools.chain(*[tokenizer.encode(w.text) for w in nlp(ftfy.fix_text(line))])) for line in text]))
+            records = list(itertools.chain(*[tokenizer.encode(w.text) for w in nlp(ftfy.fix_text(str(text)))])) if (type(text) is str or not hasattr(text, '__iter__')) else list(itertools.chain(*[list(itertools.chain(*[tokenizer.encode(w.text) for w in nlp(ftfy.fix_text(str(line)))])) for line in text]))
         except Exception as e:
             print(e)
             print('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
@@ -1690,14 +1836,14 @@ def _handle_model(model, dev_id=None, distrb=False):
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
     return {'options_file':options_path, 'weight_file':weights_path, 'num_output_representations':2, 'elmoedim':elmoedim, 'dropout':dropout}
 
-TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'biolarkgsc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'meshpubs_siamese':'sentsim', 'meshpubs_entilement':'entlmnt', 'meshpubs_simsearch':'mltl-clf', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
-TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'biolarkgsc':'biolarkgsc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs', 'meshpubs_siamese':'meshpubs', 'meshpubs_entilement':'meshpubs.entlmnt', 'meshpubs_simsearch':'meshpubs', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
-TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'biolarkgsc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'meshpubs_siamese':SentSimDataset, 'meshpubs_entilement':EntlmntDataset, 'meshpubs_simsearch':BaseDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
-TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'biolarkgsc':{'index':'id', 'X':'text', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'meshpubs_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'meshpubs_simsearch':{'index':'id', 'X':'text', 'y':'labels'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
+TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'biolarkgsc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'meshpubs_siamese':'sentsim', 'meshpubs_entilement':'entlmnt', 'meshpubs_simsearch':'mltl-clf', 'bioasqa':'entlmnt', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'snli':'entlmnt', 'mnli':'entlmnt', 'wnli':'entlmnt', 'qnli':'entlmnt', 'biolarkgsc_entilement':'entlmnt', 'copd_entilement':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
+TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'biolarkgsc':'biolarkgsc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs', 'meshpubs_siamese':'meshpubs', 'meshpubs_entilement':'meshpubs.entlmnt', 'meshpubs_simsearch':'meshpubs', 'bioasqa':'bioasq-a', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'snli':'snli', 'mnli':'mnli', 'wnli':'wnli', 'qnli':'qnli', 'biolarkgsc_entilement':'biolarkgsc.entlmnt', 'copd_entilement':'copd.entlmnt', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
+TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'biolarkgsc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'meshpubs_siamese':SentSimDataset, 'meshpubs_entilement':EntlmntDataset, 'meshpubs_simsearch':BaseDataset, 'bioasqa':EntlmntMltlIterDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'snli':EntlmntDataset, 'mnli':EntlmntDataset, 'wnli':EntlmntDataset, 'qnli':EntlmntDataset, 'biolarkgsc_entilement':EntlmntDataset, 'copd_entilement':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
+TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'biolarkgsc':{'index':'id', 'X':'text', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'meshpubs_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'meshpubs_simsearch':{'index':'id', 'X':'text', 'y':'labels'}, 'bioasqa':{'index':'pmid', 'X':['title','abstractText','mesh'], 'y':'label'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'snli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'mnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'wnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'label'}, 'qnli':{'index':'index', 'X':['question','sentence'], 'y':'label'}, 'biolarkgsc_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'copd_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
-TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'biolarkgsc':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'meshpubs_entilement':(['_binc_transform'], [{}]), 'meshpubs_simsearch':([], []), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
-TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'biolarkgsc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'meshpubs_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'meshpubs_simsearch':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O', 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'chemprot':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'i2b2':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'biolarkgsc':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'meshpubs_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'meshpubs_simsearch':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'biolarkgsc':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'meshpubs_entilement':(['_binc_transform'], [{}]), 'meshpubs_simsearch':([], []), 'bioasqa':(['_binc_transform'], [{}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'snli':(['_mltc_transform'], [{}]), 'mnli':(['_mltc_transform'], [{}]), 'wnli':(['_mltc_transform'], [{}]), 'qnli':(['_mltc_transform'], [{}]), 'biolarkgsc_entilement':(['_mltc_transform'], [{}]), 'copd_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
+TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'biolarkgsc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'meshpubs_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'meshpubs_simsearch':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'bioasqa':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'snli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'mnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'wnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'qnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biolarkgsc_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'copd_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O', 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'chemprot':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'i2b2':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'biolarkgsc':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'meshpubs_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'meshpubs_simsearch':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'bioasqa':{'binlb': 'mltl%s;'%SC, 'origlb':'meshMajor', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'snli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'mnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'wnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'qnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biolarkgsc_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'copd_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
@@ -1823,7 +1969,7 @@ def gen_clf(mdl_name, encoder='pool', constraints=[], use_gpu=False, distrb=Fals
 
     lvar = locals()
     for x in constraints:
-        cnstrnt_cls, cnstrnt_params = copy.deepcopy.deepcopy(CNSTRNTS_MAP[x])
+        cnstrnt_cls, cnstrnt_params = copy.deepcopy(CNSTRNTS_MAP[x])
         constraint_params = pr('Constraint', CNSTRNT_PARAMS_MAP[x])
         cnstrnt_params.update(dict([((k, p), constraint_params[p]) for k, p in cnstrnt_params.keys() if p in constraint_params]))
         cnstrnt_params.update(dict([((k, p), kwargs[p]) for k, p in cnstrnt_params.keys() if p in kwargs]))
@@ -2189,13 +2335,15 @@ def classify(dev_id=None):
     ds_kwargs = {'sampfrac':opts.sampfrac}
     if task_type == 'nmt':
         ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
+    elif task_type == 'entlmnt':
+        ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'lbtxt', 'neglbs'] if k in task_extparms))
     elif task_type == 'sentsim':
         ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
 
     # Prepare data
     if (not opts.distrb or opts.distrb and hvd.rank() == 0): print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
+    if mdl_name == 'bert': train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
     if (not opts.weight_class or task_type == 'sentsim'):
         class_count = None
@@ -2222,10 +2370,10 @@ def classify(dev_id=None):
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=sampler is None and opts.droplast, sampler=sampler, num_workers=opts.np, drop_last=opts.droplast)
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
@@ -2351,7 +2499,7 @@ def multi_clf(dev_id=None):
             train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
             new_lbs = [k for k in train_ds.binlb.keys() if k not in all_binlb]
             all_binlb.update(dict([(k, v) for k, v in zip(new_lbs, range(len(all_binlb), len(all_binlb)+len(new_lbs)))]))
-            if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
+            if mdl_name == 'bert': train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
             lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
             if (not opts.weight_class or task_type == 'sentsim'):
                 class_count = None
@@ -2374,10 +2522,10 @@ def multi_clf(dev_id=None):
             train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
             dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-            if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+            if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
             dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
             test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-            if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+            if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
             test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
             # print((len(train_ds.binlb), len(dev_ds.binlb), len(test_ds.binlb)))
 
@@ -2406,10 +2554,10 @@ def multi_clf(dev_id=None):
     opts.epochs = orig_epochs
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     # Evaluation
@@ -2478,7 +2626,7 @@ def siamese_rank(dev_id=None):
     # Prepare data
     print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': train_ds = MaskedLMDataset(train_ds)
+    if mdl_name == 'bert': train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
     if (not opts.weight_class or task_type == 'sentsim'):
         class_count = None
@@ -2500,10 +2648,10 @@ def siamese_rank(dev_id=None):
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_siamese.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     # Training on doc/sent-pair datasets
@@ -2528,10 +2676,10 @@ def siamese_rank(dev_id=None):
     # Prepare dev and test sets
     del ds_kwargs['ynormfunc']
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
@@ -2582,10 +2730,10 @@ def simsearch(dev_id=None):
     print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     del ds_kwargs['ynormfunc']
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMDataset(dev_ds)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMDataset(test_ds)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     lbnotes_fname, lb_embd_fname, lb_embd_raw_fname = 'lbnotes.csv', 'onto_embd.pkl', 'onto_embd_raw.pkl'
@@ -2706,7 +2854,7 @@ def simsearch(dev_id=None):
 
 
 def main():
-    if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'biolarkgsc', 'copd', 'phenopubs', 'meshpubs', 'meshpubs_entilement', 'phenochf', 'toxic', 'mednli', 'biosses', 'clnclsts', 'cncpt-ddi']):
+    if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'biolarkgsc', 'copd', 'phenopubs', 'meshpubs', 'meshpubs_entilement', 'bioasqa', 'phenochf', 'toxic', 'mednli', 'snli', 'mnli', 'wnli', 'qnli', 'biolarkgsc_entilement', 'copd_entilement', 'biosses', 'clnclsts', 'cncpt-ddi']):
         if (opts.method == 'classify'):
             main_func = classify
         elif (opts.method == 'multiclf'):
