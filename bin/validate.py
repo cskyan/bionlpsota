@@ -138,7 +138,7 @@ class BaseClfHead(nn.Module):
         self.clf_h = self._clf_h
         self.num_lbs = num_lbs
         self.dim_mulriple = 2 if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] and self.task_params.setdefault('sentsim_func', None) is not None and self.task_params['sentsim_func'] == 'concat' else 1 # two or one sentence
-        if self.dim_mulriple > 1 and self.task_params.setdefault('concat_strategy', 'normal') == 'diff': self.dim_mulriple = 3
+        if self.dim_mulriple > 1 and self.task_params.setdefault('concat_strategy', 'normal') == 'diff': self.dim_mulriple = 4
         self.kwprop = {}
         self.binlb = binlb
         self.global_binlb = copy.deepcopy(binlb)
@@ -215,7 +215,7 @@ class BaseClfHead(nn.Module):
             if embedding_mode: return clf_h
             if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
                 # clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
-                clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1])], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
+                clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1]), clf_h[0]*clf_h[1]], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
                 clf_logits = self.linear(clf_h) if self.linear else clf_h
             elif self.task_type == 'sentsim':
                 clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
@@ -694,7 +694,7 @@ class EmbeddingSeq2Seq(EmbeddingClfHead):
             self.seq2seq = None
             encoder_odim = self.n_embd
         self.maxlen = self.task_params.setdefault('maxlen', 128)
-        self.norm = NORM_TYPE_MAP[norm_type](seqlen)
+        self.norm = NORM_TYPE_MAP[norm_type](self.maxlen)
         # self.norm = nn.LayerNorm([128,2048])
         self.hdim = encoder_odim
         self.linear = self.__init_linear__()
@@ -755,7 +755,7 @@ class EmbeddingHead(nn.Module):
         use_gpu = next(self.base_model['model'].parameters()).is_cuda
         clf_h = hidden_states
         if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
-            clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1])], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
+            clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1]), clf_h[0]*clf_h[1]], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
             clf_logits = self.linear(clf_h) if self.linear else clf_h
         else:
             clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
