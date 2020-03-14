@@ -34,8 +34,8 @@ from allennlp.modules.stacked_alternating_lstm import StackedAlternatingLstm
 from allennlp.modules.conditional_random_field import ConditionalRandomField
 from allennlp.modules.seq2seq_encoders import FeedForwardEncoder, PytorchSeq2SeqWrapper, GatedCnnEncoder, IntraSentenceAttentionEncoder, QaNetEncoder, StackedSelfAttentionEncoder
 from allennlp.modules.seq2vec_encoders import BagOfEmbeddingsEncoder, PytorchSeq2VecWrapper, Seq2VecEncoder, CnnEncoder, CnnHighwayEncoder
-from pytorch_pretrained_bert import BertConfig, BertTokenizer, BertModel, BertAdam, OpenAIGPTConfig, OpenAIGPTTokenizer, OpenAIGPTLMHeadModel, OpenAIAdam, GPT2Config, GPT2Tokenizer, GPT2LMHeadModel, TransfoXLConfig, TransfoXLTokenizer, TransfoXLLMHeadModel
-from pytorch_pretrained_bert.modeling import BertPreTrainingHeads
+from transformers import BertConfig, BertTokenizer, BertModel, AdamW, OpenAIGPTConfig, OpenAIGPTTokenizer, OpenAIGPTLMHeadModel, GPT2Config, GPT2Tokenizer, GPT2LMHeadModel, TransfoXLConfig, TransfoXLTokenizer, TransfoXLLMHeadModel, get_linear_schedule_with_warmup
+from transformers.modeling_bert import BertPreTrainingHeads
 
 import ftfy, spacy
 try:
@@ -163,7 +163,7 @@ class BaseClfHead(nn.Module):
             hidden_states, past = list(hidden_states), list(past)
         else:
             trnsfm_output = self.transformer(input_ids=input_ids, pool_idx=pool_idx)
-            (hidden_states, past) = trnsfm_output if type(trnsfm_output) is tuple else (trnsfm_output, None)
+            (hidden_states, past) = trnsfm_output[:2] if type(trnsfm_output) is tuple else (trnsfm_output, None)
         # print(('after transformer', trnsfm_output))
         if (self.lm_loss):
             lm_logits, lm_target = self.lm_logit(input_ids=input_ids, hidden_states=hidden_states, past=past, pool_idx=pool_idx, **lm_logit_kwargs)
@@ -377,7 +377,7 @@ class BaseClfHead(nn.Module):
 class BERTClfHead(BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
         super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
-        self.lm_head = BertPreTrainingHeads(config, lm_model.embeddings.word_embeddings.weight)
+        self.lm_head = BertPreTrainingHeads(config)
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.n_embd = config.hidden_size
@@ -417,9 +417,13 @@ class BERTClfHead(BaseClfHead):
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
         segment_ids = torch.zeros_like(input_ids).to('cuda') if use_gpu else torch.zeros_like(input_ids)
         if (self.output_layer == -1 or self.output_layer == 11):
-            return self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx, output_all_encoded_layers=False)
+            self.lm_model.encoder.output_hidden_states = False
+            last_hidden_state, pooled_output = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx, output_all_encoded_layers=False)
+            return sequence_output, pooled_output
         else:
-            all_encoder_layers, pooled_output = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx, output_all_encoded_layers=True)
+            self.lm_model.encoder.output_hidden_states = True
+            outputs = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx)
+            last_hidden_state, pooled_output, all_encoder_layers = outputs[:3]
             return all_encoder_layers[self.output_layer] if type(self.output_layer) is int else [all_encoder_layers[x] for x in self.output_layer], pooled_output
 
 
@@ -1855,7 +1859,7 @@ CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvt
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
-OPTMZR_MAP = {'bert':BertAdam, 'gpt':OpenAIAdam}
+OPTMZR_MAP = {'bert':(AdamW, {'correct_bias':False}, 'linwarm'), 'gpt':(AdamW, {'correct_bias':False}, 'linwarm'), 'gpt2':(AdamW, {'correct_bias':False}, 'linwarm')}
 PYTORCH_WRAPPER = {'lstm':nn.LSTM, 'rnn':nn.RNN, 'gru':nn.GRU, 'agmnlstm':AugmentedLstm, 'stkaltlstm':StackedAlternatingLstm}
 SEQ2SEQ_MAP = {'ff':FeedForwardEncoder, 'pytorch':PytorchSeq2SeqWrapper, 'cnn':GatedCnnEncoder, 'isa':IntraSentenceAttentionEncoder, 'qanet':QaNetEncoder, 'ssae':StackedSelfAttentionEncoder}
 SEQ2SEQ_MDL_PARAMS = {'pytorch':{'elmo':{'lstm':{'input_size':2048,'hidden_size':768, 'batch_first':True}, 'rnn':{'input_size':2048,'hidden_size':768, 'batch_first':True}, 'gru':{'input_size':2048,'hidden_size':768, 'batch_first':True},'agmnlstm':{'input_size':2048,'hidden_size':768},'stkaltlstm':{'input_size':2048,'hidden_size':768, 'num_layers':3}}}, 'cnn':{'elmo':{'input_dim':2048, 'dropout':0.5, 'layers':[[[4, 2048]],[[4, 2048],[4, 2048]]]}}, 'isa':{'elmo':{'input_dim':2048}}, 'qanet':{'elmo':{}}, 'ssae':{'elmo':{'input_dim':2048, 'hidden_dim':1024, 'projection_dim':768, 'feedforward_hidden_dim':768, 'num_layers':1, 'num_attention_heads':8}}}
@@ -2001,7 +2005,7 @@ def load_model(mdl_path):
     return model, optimizer, checkpoint.setdefault('resume', {}), dict([(k, v) for k, v in checkpoint.items() if k not in ['model', 'state_dict', 'optimizer', 'optimizer_state_dict', 'resume']])
 
 
-def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, distrb=False, resume={}, chckpnt_kwargs={}):
+def train(clf, optimizer, dataset, special_tkns, scheduler=None, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, distrb=False, resume={}, chckpnt_kwargs={}):
     chckpnt_fname, model_fname = '%s_%s_checkpoint.pth' % (task_name, mdl_name), '%s_%s.pth' % (task_name, mdl_name)
     clf_tknids = special_tkns['clf_tknids']
     earlystoper, clf_kwargs = EarlyStopping(mode='min', min_delta=earlystop_delta, patience=earlystop_patience), {}
@@ -2099,6 +2103,7 @@ def train(clf, optimizer, dataset, special_tkns, pad_val=0, weights=None, lmcoef
                     torch.nn.utils.clip_grad_value_(clf.lm_model.encoder.layer.parameters() if mdl_name == 'bert' else clf.parameters(), clipmaxn)
                     torch.nn.utils.clip_grad_value_(clf.parameters(), clipmaxn)
                 optimizer.step()
+                if scheduler: scheduler.step()
             except Exception as e:
                 print(e)
                 train_time = time.time() - t0
@@ -2380,9 +2385,11 @@ def classify(dev_id=None):
             except Exception as e:
                 print(e)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(prv_optimizer.state_dict())
-        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print(optimizer)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, (torch.optim.Adam, {}, None))
+        optimizer = (optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)).load_state_dict(prv_optimizer.state_dict())
+        training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(opts.wrmprop*training_steps), num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print((optimizer, scheduler))
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
@@ -2393,9 +2400,11 @@ def classify(dev_id=None):
             print('Classifier hyper-parameters: %s' % ext_params)
             print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
-        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print(optimizer)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, (torch.optim.Adam, {}, None))
+        optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+        training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print((optimizer, scheduler))
 
     if opts.distrb:
         # Add Horovod Distributed Optimizer
@@ -2404,7 +2413,7 @@ def classify(dev_id=None):
         hvd.broadcast_parameters(clf.state_dict(), root_rank=0)
 
     # Training
-    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, resume=resume if opts.resume else {})
+    train(clf, optimizer, train_loader, special_tknids_args, scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, resume=resume if opts.resume else {})
 
     if opts.distrb:
         if hvd.rank() == 0:
@@ -2423,7 +2432,7 @@ def classify(dev_id=None):
 
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb)
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
@@ -2471,10 +2480,11 @@ def multi_clf(dev_id=None):
                 print(e)
         elapsed_mltclf_epochs, all_binlb = chckpnt.setdefault('mltclf_epochs', 0), clf.binlb
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9).load_state_dict(prv_optimizer.state_dict())
-        # optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
-        print(optimizer)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, (torch.optim.Adam, {}, None))
+        optimizer = (optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)).load_state_dict(prv_optimizer.state_dict())
+        training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        print((optimizer, scheduler))
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
@@ -2484,9 +2494,11 @@ def multi_clf(dev_id=None):
         print('Classifier hyper-parameters: %s' % ext_params)
         print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
-        print(optimizer)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, (torch.optim.Adam, {}, None))
+        optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+        training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        print((optimizer, scheduler))
 
     # Prepare data
     print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
@@ -2534,7 +2546,7 @@ def multi_clf(dev_id=None):
             clf.get_linear(binlb=train_ds.binlb, idx=i)
 
             # Training on splitted datasets
-            train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {}, chckpnt_kwargs=dict(mltclf_epochs=epoch))
+            train(clf, optimizer, train_loader, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {}, chckpnt_kwargs=dict(mltclf_epochs=epoch))
 
             # Adjust the model
             clf.merge_linear(num_linear=i+1)
@@ -2564,7 +2576,7 @@ def multi_clf(dev_id=None):
 
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=orig_epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=orig_epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
@@ -2607,10 +2619,12 @@ def siamese_rank(dev_id=None):
         clf.task_params.update(task_params)
         clf.to_siamese()
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, (torch.optim.Adam, {}, None))
+        optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
         if len(resume) > 0: optimizer = optimizer.load_state_dict(prv_optimizer.state_dict())
-        print(optimizer)
+        training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        print((optimizer, scheduler))
 
     else:
         # Build model
@@ -2621,9 +2635,11 @@ def siamese_rank(dev_id=None):
         print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         clf.to_siamese()
-        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, torch.optim.Adam)
-        optimizer = optmzr_cls(clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
-        print(optimizer)
+        optmzr_cls = OPTMZR_MAP.setdefault(opts.model, (torch.optim.Adam, {}, None))
+        optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
+        training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        print((optimizer, scheduler))
 
     # Prepare data
     print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
@@ -2657,7 +2673,7 @@ def siamese_rank(dev_id=None):
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     # Training on doc/sent-pair datasets
-    train(clf, optimizer, train_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
+    train(clf, optimizer, train_loader, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {})
 
     # Evaluating on the doc/sent-pair dev and test sets
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev_siamese', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
@@ -2685,7 +2701,7 @@ def siamese_rank(dev_id=None):
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
-    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
+    if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id)
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
@@ -2899,8 +2915,11 @@ if __name__ == '__main__':
     op.add_option('--distbknd', default='nccl', action='store', dest='distbknd', help='distribute framework backend')
     op.add_option('--disturl', default='env://', action='store', dest='disturl', help='distribute framework url')
     op.add_option('--optim', default='adam', action='store', dest='optim', help='indicate the optimizer')
+    op.add_option('--wrmprop', default=0.1, action='store', type='float', dest='wrmprop', help='indicate the warmup proportion')
+    op.add_option('--trainsteps', default=1000, action='store', type='int', dest='trainsteps', help='indicate the training steps')
     op.add_option('--traindev', default=False, action='store_true', dest='traindev', help='whether to use dev dataset for training')
     op.add_option('--noeval', default=False, action='store_true', dest='noeval', help='whether to train only')
+    op.add_option('--noschdlr', default=False, action='store_true', dest='noschdlr', help='force to not use scheduler whatever the default setting is')
     op.add_option('--earlystop', default=False, action='store_true', dest='earlystop', help='whether to use early stopping')
     op.add_option('--es_patience', default=5, action='store', type='int', dest='es_patience', help='indicate the tolerance time for training metric violation')
     op.add_option('--es_delta', default=float(5e-3), action='store', type='float', dest='es_delta', help='indicate the minimum delta of early stopping')

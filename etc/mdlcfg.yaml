@@ -1,8 +1,8 @@
 LM:
 - name: BERT
   params:
-    pretrained_mdl_path: /home/yans2/data/lm/bert/base-uncased/archive.tar.gz
-    pretrained_vocab_path: /home/yans2/data/lm/bert/base-uncased/vocab.txt
+    pretrained_mdl_path: /home/yans2/data/lm/bert/base-uncased
+    pretrained_vocab_path: /home/yans2/data/lm/bert/base-uncased
     hidden_size: 768
     # hidden_size: 1024
     num_hidden_layers: 12
