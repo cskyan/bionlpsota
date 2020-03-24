@@ -446,6 +446,91 @@ class BERTClfHead(BaseClfHead):
         return self.lm_head(*self.transformer(masked_lm_ids, *extra_inputs, pool_idx=pool_idx))[0], masked_lm_lbs
 
 
+class OntoBERTClfHead(BERTClfHead):
+    from bionlp.util.func import DFSVertex, stack_dfs
+    class _PyTorchModuleVertex(DFSVertex):
+        @property
+        def children(self):
+            return [OntoBERTClfHead._PyTorchModuleVertex.from_dict({'module':getattr(self.module, attr)}) for attr in dir(self.module) if not attr.startswith('__') and attr != 'base_model' and isinstance(getattr(self.module, attr), nn.Module)] + [OntoBERTClfHead._PyTorchModuleVertex.from_dict({'module':sub_module}) for attr in dir(self.module) if not attr.startswith('__') and attr != 'base_model' and isinstance(getattr(self.module, attr), nn.ModuleList) for sub_module in getattr(self.module, attr)]
+
+        def modify_config(self, shared_data):
+            config = shared_data['config']
+            for k, v in config.items():
+                if hasattr(self.module, k): setattr(self.module, k, v)
+
+    def __init__(self, lm_model, config, task_type, onto='onto.csv', embeddim=128, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+        config.output_hidden_states = True
+        output_layer = list(range(config.num_hidden_layers))
+        BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
+        self.onto = pd.read_csv(onto, sep=kwargs.setdefault('sep', '\t'), index_col='id')
+        self.embedding = nn.Embedding(self.onto.shape[0], embeddim)
+        self.encoder = nn.Linear(embeddim, config.num_hidden_layers + config.num_attention_heads)
+        self.halflen = config.num_hidden_layers
+        if (type(output_layer) is not int):
+            self.output_layer = [x for x in output_layer if (x >= -self.num_hidden_layers and x < self.num_hidden_layers)]
+            self.layer_pooler = TransformerLayerWeightedReduce(reduction=layer_pooler)
+        self.att2spans = nn.Linear(self.maxlen, 2)
+
+    def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, ret_ftspans=False, ret_attention=False):
+        use_gpu = next(self.parameters()).is_cuda
+        outputs = BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights)
+        if (labels is None):
+            clf_logits, all_attentions, pooled_attentions = outputs
+            outputs = clf_logits
+        else:
+            clf_loss, lm_loss, all_attentions, pooled_attentions = outputs
+            outputs = clf_loss, lm_loss
+        segment_ids = extra_inputs[3]
+        spans = extra_inputs[5] if len(extra_inputs) > 5 else None
+        if labels is None or spans is not None or ret_ftspans or ret_attention:
+            # pos_idx, idn_mask, inv_segment_ids = (torch.arange(segment_ids.size()[1]).to('cuda') if use_gpu else torch.arange(segment_ids.size()[1])), torch.ones_like(segment_ids), 1 - segment_ids
+            # mask = pos_idx * idn_mask <= pool_idx.view((-1,1)) * idn_mask
+            segment_ids_f, masked_inv_segment_ids = segment_ids.float(), (pool_idx * (1 - segment_ids)).float()
+            segment_mask = torch.cat([torch.ger(x, y).unsqueeze(0) for x, y in zip(segment_ids_f, masked_inv_segment_ids)], dim=0) + torch.cat([torch.ger(y, x).unsqueeze(0) for x, y in zip(segment_ids_f, masked_inv_segment_ids)], dim=0)
+            masked_pooled_attentions = segment_mask * pooled_attentions
+            span_logits = (masked_pooled_attentions + masked_pooled_attentions.permute(0, 2, 1)).sum(-1) * masked_inv_segment_ids
+            spans_logits = self.att2spans(masked_pooled_attentions)
+            start_logits, end_logits = spans_logits.split(1, dim=-1)
+            start_logits, end_logits = start_logits.squeeze(-1), end_logits.squeeze(-1)
+        if labels is not None:
+            if spans is not None:
+                start_positions, end_positions = spans.split(1, dim=-1)
+                loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+                start_loss = loss_fct(start_logits, start_positions)
+                end_loss = loss_fct(end_logits, end_positions)
+                clf_loss = clf_loss + (start_loss + end_loss) / 2
+                outputs = clf_loss, lm_loss
+        else:
+            if ret_ftspans:
+                outputs = (outputs, start_logits, end_logits)
+            else:
+                span_logits = (masked_pooled_attentions + masked_pooled_attentions.permute(0, 2, 1)).sum(-1) * masked_inv_segment_ids
+                outputs = (outputs, span_logits)
+        return (outputs + (all_attentions, pooled_attentions, masked_pooled_attentions)) if ret_attention else outputs
+
+    def pool(self, input_ids, pool_idx, clf_h, *extra_inputs):
+        onto_ids = extra_inputs[0]
+        onto_h = self.encoder(self.embedding(onto_ids))
+        lyrw_h, mlthead_h = onto_h[:,:self.halflen], onto_h[:,self.halflen:]
+        lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
+        clf_h = self.layer_pooler(lyr_h, lyrw_h).view(lyr_h[0].size())
+        output_size = clf_h.size()
+        all_attentions = extra_inputs[4]
+        segment_ids = extra_inputs[3]
+        pooled_attentions = torch.sum(all_attentions.permute(*((1, 0)+tuple(range(2, len(all_attentions.size()))))) * lyrw_h.view(lyrw_h.size()+(1,)*(len(all_attentions.size())-len(lyrw_h.size()))), dim=1)
+        pooled_attentions = torch.sum(pooled_attentions * mlthead_h.view(mlthead_h.size()+(1,)*(len(pooled_attentions.size())-len(mlthead_h.size()))), dim=1)
+        return torch.cat([clf_h, torch.sum(clf_h.view(output_size[:-1]+(self.halflen, -1)) * mlthead_h.view(*((onto_ids.size()[0], -1)+(1,)*(len(output_size)-1))), 1)], dim=-1), pooled_attentions
+
+    def transformer(self, input_ids, *extra_inputs, pool_idx=None):
+        use_gpu = next(self.parameters()).is_cuda
+        segment_ids = extra_inputs[3]
+        root = OntoBERTClfHead._PyTorchModuleVertex.from_dict({'module':self.lm_model})
+        OntoBERTClfHead.stack_dfs(root, 'modify_config', shared_data={'config':{'output_attentions':True, 'output_hidden_states':True}})
+        last_hidden_state, pooled_output, all_encoder_layers, all_attentions = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx)
+        all_attentions = torch.cat([att.unsqueeze(0) for att in all_attentions], dim=0)
+        return all_encoder_layers[self.output_layer] if type(self.output_layer) is int else [all_encoder_layers[x] for x in self.output_layer], pooled_output, all_attentions
+
+
 class GPTClfHead(BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         super(GPTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_type == 'sentsim', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
@@ -944,6 +1029,22 @@ class TransformerLayerAvgPool(nn.AvgPool1d):
         _, _, plyr = pooled_hidden_states.size()
         pooled_hidden_states = pooled_hidden_states.permute(2, 0, 1)
         return pooled_hidden_states.view(plyr, bs, *hidden_size[2:])
+
+
+class TransformerLayerWeightedReduce(nn.Module):
+    def __init__(self, reduction='sum'):
+        super(TransformerLayerWeightedReduce, self).__init__()
+        self.reduction = reduction
+
+    def forward(self, hidden_states, *extra_inputs):
+        if type(hidden_states) is list:
+            hidden_states = torch.cat([x.unsqueeze(0) for x in hidden_states], dim=0)
+        weights = extra_inputs[0]
+        hidden_size, weight_size = hidden_states.size(), weights.size()
+        lyr, bs = hidden_size[:2]
+        w = (torch.cat((weights, torch.zeros((weight_size[0], lyr-weight_size[1]))), dim=1) if lyr > weight_size[1] else weights[:,:lyr]).permute(1, 0).view((lyr, -1)+(1,)*(len(hidden_size)-2))
+        wsum_hidden_states = torch.sum(hidden_states * w, 0) if self.reduction == 'sum' else torch.mean(hidden_states * w, 0)
+        return wsum_hidden_states.view(bs, *hidden_size[2:])
 
 
 class MaskedReduction(nn.Module):
@@ -1514,6 +1615,20 @@ class EmbeddingPairDataset(BaseDataset):
         return (sample, self.labels[idx]) if self.labels else sample
 
 
+class OntoDataset(BaseDataset):
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
+        super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+        self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
+        self.onto2id = dict([(k, i) for i, k in enumerate(self.onto.index)])
+        self.onto_col = onto_col
+
+    def __getitem__(self, idx):
+        record = self.df.iloc[idx]
+        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlbr][0]
+        sample = self._transform_chain(sample)
+        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(self.onto2id[record[self.onto_col]])
+
+
 class BaseIterDataset(DatasetInterface, IterableDataset):
     """ Basic iterable dataset """
 
@@ -1623,6 +1738,27 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
             lbs = [sc.join([origlb for origlb, lb in zip(origlbs.split(sc), lbstr.split(sc)) if lb == '1']) if type(origlbs) is str and type(lbstr) is str else '' for origlbs, lbstr in zip(self._df[self.origlb], lbs)]
             binlb=False
         return BaseIterDataset.fill_labels(self, lbs, binlb=binlb, index=index, saved_col=saved_col, saved_path=saved_path, **kwargs)
+
+
+class OntoIterDataset(EntlmntMltlIterDataset):
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
+        def _get_onto_lb(lb, onto_df=None):
+            if onto_df is not None: return onto_df.loc[lb].values[0]
+        if onto_fpath and os.path.exists(onto_fpath):
+            self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
+            self.onto2id = dict([(k, i) for i, k in enumerate(self.onto.index)])
+            self.onto_col = onto_col
+            kwargs['lbtxt'] = dict(func=_get_onto_lb, kwargs={'onto_df':self.onto})
+        super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+
+
+    def _transform(self, record):
+        sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
+        sample = self._transform_chain(sample)
+        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(self.onto2id[record[self.onto_col]]),) if hasattr(self, 'onto_col') and self.onto_col in record else ())
+
+    def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
+        return EntlmntMltlIterDataset.fill_labels(self, lbs, index=index, saved_col='rerank_preds', saved_path=saved_path, **kwargs)
 
 
 class MaskedLMIterDataset(BaseIterDataset):
@@ -1896,22 +2032,22 @@ def _handle_model(model, dev_id=None, distrb=False):
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
     return {'options_file':options_path, 'weight_file':weights_path, 'num_output_representations':2, 'elmoedim':elmoedim, 'dropout':dropout}
 
-TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'biolarkgsc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'meshpubs_siamese':'sentsim', 'meshpubs_entilement':'entlmnt', 'meshpubs_simsearch':'mltl-clf', 'bioasqa':'entlmnt', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'snli':'entlmnt', 'mnli':'entlmnt', 'wnli':'entlmnt', 'qnli':'entlmnt', 'biolarkgsc_entilement':'entlmnt', 'copd_entilement':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
-TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'biolarkgsc':'biolarkgsc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs', 'meshpubs_siamese':'meshpubs', 'meshpubs_entilement':'meshpubs.entlmnt', 'meshpubs_simsearch':'meshpubs', 'bioasqa':'bioasq-a', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'snli':'snli', 'mnli':'mnli', 'wnli':'wnli', 'qnli':'qnli', 'biolarkgsc_entilement':'biolarkgsc.entlmnt', 'copd_entilement':'copd.entlmnt', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
-TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'biolarkgsc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'meshpubs_siamese':SentSimDataset, 'meshpubs_entilement':EntlmntDataset, 'meshpubs_simsearch':BaseDataset, 'bioasqa':EntlmntMltlIterDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'snli':EntlmntDataset, 'mnli':EntlmntDataset, 'wnli':EntlmntDataset, 'qnli':EntlmntDataset, 'biolarkgsc_entilement':EntlmntDataset, 'copd_entilement':EntlmntDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
-TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'biolarkgsc':{'index':'id', 'X':'text', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'meshpubs_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'meshpubs_simsearch':{'index':'id', 'X':'text', 'y':'labels'}, 'bioasqa':{'index':'pmid', 'X':['title','abstractText','mesh'], 'y':'label'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'snli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'mnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'wnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'label'}, 'qnli':{'index':'index', 'X':['question','sentence'], 'y':'label'}, 'biolarkgsc_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'copd_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
+TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'biolarkgsc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'meshpubs_siamese':'sentsim', 'meshpubs_entilement':'entlmnt', 'meshpubs_simsearch':'mltl-clf', 'meshpubs_rerank':'entlmnt', 'bioasqa':'entlmnt', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'snli':'entlmnt', 'mnli':'entlmnt', 'wnli':'entlmnt', 'qnli':'entlmnt', 'biolarkgsc_entilement':'entlmnt', 'copd_entilement':'entlmnt', 'hpo_entilement':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
+TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'biolarkgsc':'biolarkgsc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs', 'meshpubs_siamese':'meshpubs', 'meshpubs_entilement':'meshpubs.entlmnt', 'meshpubs_simsearch':'meshpubs', 'meshpubs_rerank':'meshpubs.pred', 'bioasqa':'bioasq-a', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'snli':'snli', 'mnli':'mnli', 'wnli':'wnli', 'qnli':'qnli', 'biolarkgsc_entilement':'biolarkgsc.entlmnt', 'copd_entilement':'copd.entlmnt', 'hpo_entilement':'hpo.entlmnt', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
+TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'biolarkgsc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'meshpubs_siamese':SentSimDataset, 'meshpubs_entilement':EntlmntDataset, 'meshpubs_simsearch':BaseDataset, 'meshpubs_rerank':OntoIterDataset, 'bioasqa':EntlmntMltlIterDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'snli':EntlmntDataset, 'mnli':EntlmntDataset, 'wnli':EntlmntDataset, 'qnli':EntlmntDataset, 'biolarkgsc_entilement':EntlmntDataset, 'copd_entilement':EntlmntDataset, 'hpo_entilement':OntoDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
+TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'biolarkgsc':{'index':'id', 'X':'text', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'meshpubs_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'meshpubs_simsearch':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_rerank':{'index':'id', 'X':['text', 'onto'], 'y':'label', 'ontoid':'ontoid'}, 'bioasqa':{'index':'pmid', 'X':['title','abstractText','mesh'], 'y':'label'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'snli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'mnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'wnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'label'}, 'qnli':{'index':'index', 'X':['question','sentence'], 'y':'label'}, 'biolarkgsc_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'copd_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'hpo_entilement':{'index':'id', 'X':['text1','onto'], 'y':'label', 'ontoid':'orig_label'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
-TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'biolarkgsc':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'meshpubs_entilement':(['_binc_transform'], [{}]), 'meshpubs_simsearch':([], []), 'bioasqa':(['_binc_transform'], [{}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'snli':(['_mltc_transform'], [{}]), 'mnli':(['_mltc_transform'], [{}]), 'wnli':(['_mltc_transform'], [{}]), 'qnli':(['_mltc_transform'], [{}]), 'biolarkgsc_entilement':(['_mltc_transform'], [{}]), 'copd_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
-TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'biolarkgsc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'meshpubs_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'meshpubs_simsearch':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'bioasqa':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'snli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'mnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'wnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'qnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biolarkgsc_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'copd_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O', 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'chemprot':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'i2b2':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'biolarkgsc':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'meshpubs_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'meshpubs_simsearch':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'bioasqa':{'binlb': 'mltl%s;'%SC, 'origlb':'meshMajor', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'snli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'mnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'wnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'qnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biolarkgsc_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'copd_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'biolarkgsc':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'meshpubs_entilement':(['_binc_transform'], [{}]), 'meshpubs_simsearch':([], []), 'meshpubs_rerank':(['_binc_transform'], [{}]), 'bioasqa':(['_binc_transform'], [{}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'snli':(['_mltc_transform'], [{}]), 'mnli':(['_mltc_transform'], [{}]), 'wnli':(['_mltc_transform'], [{}]), 'qnli':(['_mltc_transform'], [{}]), 'biolarkgsc_entilement':(['_mltc_transform'], [{}]), 'copd_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'hpo_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
+TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'biolarkgsc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'meshpubs_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'meshpubs_simsearch':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_rerank':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'bioasqa':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'snli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'mnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'wnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'qnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biolarkgsc_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'copd_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'hpo_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O', 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'chemprot':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'i2b2':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'biolarkgsc':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'meshpubs_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'meshpubs_simsearch':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_rerank':{'binlb': 'mltl%s;'%SC, 'origlb':'preds', 'locallb':'ontoid', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'bioasqa':{'binlb': 'mltl%s;'%SC, 'origlb':'meshMajor', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'snli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'mnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'wnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'qnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biolarkgsc_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'copd_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'hpo_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
 ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode, 'trsfmxl':_bert_encode, 'elmo':_tokenize, 'elmo_w2v':_tokenize, 'none':_tokenize, 'sentvec':_tokenize}
 LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec', 'elmo_sentvec':'elmo_sentvec', 'elmo_w2v_sentvec':'elmo_w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
-CLF_MAP = {'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
-CLF_EXT_PARAMS = {'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_MAP = {'bert_onto':OntoBERTClfHead, 'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
+CLF_EXT_PARAMS = {'bert_onto':{'onto':'onto.csv', 'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
@@ -2390,6 +2526,9 @@ def classify(dev_id=None):
         ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'lbtxt', 'neglbs'] if k in task_extparms))
     elif task_type == 'sentsim':
         ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
+    if task_dstype in [OntoDataset, OntoIterDataset]:
+        ds_kwargs['onto_fpath'] = opts.onto if opts.onto and os.path.exists(opts.onto) else task_extparms.setdefault('onto_fpath', 'onto.csv')
+        ds_kwargs['onto_col'] = task_cols['ontoid']
 
     # Prepare data
     if (not opts.distrb or opts.distrb and hvd.rank() == 0): print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
@@ -2917,8 +3056,64 @@ def simsearch(dev_id=None):
             pickle.dump(plot_data, fd)
 
 
+def rerank(dev_id=None):
+    print('### Re-rank Mode ###')
+    orig_task = opts.task
+    opts.task = opts.task + '_rerank'
+    # Prepare model related meta data
+    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    common_cfg = cfgr('validate', 'common')
+    pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
+    use_gpu = dev_id is not None
+    encode_func = ENCODE_FUNC_MAP[mdl_name]
+    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
+    task_type = 'entlmnt' #TASK_TYPE_MAP[opts.task]
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
+    special_tknids_args = dict(zip(special_tkns[0], special_tknids))
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('model',opts.model), ('sentsim_func', opts.sentsim_func), ('seqlen',opts.maxlen)])
+    # Prepare task related meta data
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+    ds_kwargs = {'ynormfunc':task_extparms.setdefault('ynormfunc', None)}
+    ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'locallb', 'lbtxt', 'neglbs'] if k in task_extparms))
+    if task_dstype in [OntoDataset, OntoIterDataset]:
+        ds_kwargs['onto_fpath'] = opts.onto if opts.onto and os.path.exists(opts.onto) else task_extparms.setdefault('onto_fpath', 'onto.csv')
+        ds_kwargs['onto_col'] = task_cols['ontoid']
+
+    # Load model
+    clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
+    if opts.refresh:
+        print('Refreshing and saving the model with newest code...')
+        try:
+            save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
+        except Exception as e:
+            print(e)
+    prv_task_params = copy.deepcopy(clf.task_params)
+    clf.task_params.update(task_params)
+    if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+    # model = SHELL_MAP[opts.model](clf, tokenizer=tokenizer, encode_func=encode_func, transforms=trsfms, transforms_kwargs=trsfms_kwargs, special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0))
+
+    # Prepare dev and test sets
+    print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
+    del ds_kwargs['ynormfunc']
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, **ds_kwargs)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(dev_ds) if isinstance(dev_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
+    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, **ds_kwargs)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(test_ds) if isinstance(test_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
+    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    # Evaluation
+    eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
+    eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
+
+
+
 def main():
-    if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'biolarkgsc', 'copd', 'phenopubs', 'meshpubs', 'meshpubs_entilement', 'bioasqa', 'phenochf', 'toxic', 'mednli', 'snli', 'mnli', 'wnli', 'qnli', 'biolarkgsc_entilement', 'copd_entilement', 'biosses', 'clnclsts', 'cncpt-ddi']):
+    if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'biolarkgsc', 'copd', 'phenopubs', 'meshpubs', 'meshpubs_entilement', 'bioasqa', 'phenochf', 'toxic', 'mednli', 'snli', 'mnli', 'wnli', 'qnli', 'biolarkgsc_entilement', 'copd_entilement', 'hpo_entilement', 'biosses', 'clnclsts', 'cncpt-ddi']):
         if (opts.method == 'classify'):
             main_func = classify
         elif (opts.method == 'multiclf'):
@@ -2927,6 +3122,8 @@ def main():
             main_func = siamese_rank
         elif (opts.method == 'simsearch'):
             main_func = simsearch
+        elif (opts.method == 'rerank'):
+            main_func = rerank
     else:
         return
     if (opts.distrb):
@@ -3012,6 +3209,8 @@ if __name__ == '__main__':
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
     op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
+    op.add_option('--onto', help='ontology data')
+    op.add_option('--pred', help='prediction file')
     op.add_option('-i', '--input', help='input dataset')
     op.add_option('-w', '--cache', default='.cache', help='the location of cache files')
     op.add_option('-u', '--task', default='ddi', type='str', dest='task', help='the task name [default: %default]')
