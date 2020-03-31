@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, time, copy, random, pickle, logging, itertools
+import os, sys, ast, time, copy, random, pickle, logging, itertools
 from collections import OrderedDict
 from optparse import OptionParser
 from tqdm import tqdm
@@ -464,7 +464,7 @@ class OntoBERTClfHead(BERTClfHead):
         BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
         self.onto = pd.read_csv(onto, sep=kwargs.setdefault('sep', '\t'), index_col='id')
         self.embeddim = embeddim
-        self.embedding = nn.Embedding(self.onto.shape[0], embeddim)
+        self.embedding = nn.Embedding(self.onto.shape[0]+1, embeddim)
         self.onto_fchdim = onto_fchdim
         self.onto_linear = nn.Sequential(nn.Linear(embeddim, onto_fchdim), self._int_actvtn(), nn.Linear(onto_fchdim, onto_fchdim), self._int_actvtn(), nn.Linear(onto_fchdim, config.num_hidden_layers + config.num_attention_heads), self._out_actvtn())
         if (initln): self.onto_linear.apply(_weights_init(mean=initln_mean, std=initln_std))
@@ -476,6 +476,7 @@ class OntoBERTClfHead(BERTClfHead):
 
     def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, ret_ftspans=False, ret_attention=False):
         use_gpu = next(self.parameters()).is_cuda
+        sample_weights = extra_inputs[1]
         outputs = BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights)
         if (labels is None):
             clf_logits, all_attentions, pooled_attentions = outputs
@@ -483,8 +484,8 @@ class OntoBERTClfHead(BERTClfHead):
         else:
             clf_loss, lm_loss, all_attentions, pooled_attentions = outputs
             outputs = clf_loss, lm_loss
-        segment_ids = extra_inputs[3]
-        spans = extra_inputs[5] if len(extra_inputs) > 5 else None
+        segment_ids = extra_inputs[4]
+        spans = extra_inputs[6] if len(extra_inputs) > 6 else None
         if labels is None or spans is not None or ret_ftspans or ret_attention:
             # pos_idx, idn_mask, inv_segment_ids = (torch.arange(segment_ids.size()[1]).to('cuda') if use_gpu else torch.arange(segment_ids.size()[1])), torch.ones_like(segment_ids), 1 - segment_ids
             # mask = pos_idx * idn_mask <= pool_idx.view((-1,1)) * idn_mask
@@ -518,15 +519,15 @@ class OntoBERTClfHead(BERTClfHead):
         lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
         clf_h = self.layer_pooler(lyr_h, lyrw_h).view(lyr_h[0].size())
         output_size = clf_h.size()
-        all_attentions = extra_inputs[4]
-        segment_ids = extra_inputs[3]
+        all_attentions = extra_inputs[5]
+        segment_ids = extra_inputs[4]
         pooled_attentions = torch.sum(all_attentions.permute(*((1, 0)+tuple(range(2, len(all_attentions.size()))))) * lyrw_h.view(lyrw_h.size()+(1,)*(len(all_attentions.size())-len(lyrw_h.size()))), dim=1)
         pooled_attentions = torch.sum(pooled_attentions * mlthead_h.view(mlthead_h.size()+(1,)*(len(pooled_attentions.size())-len(mlthead_h.size()))), dim=1)
         return torch.cat([clf_h, torch.sum(clf_h.view(output_size[:-1]+(self.halflen, -1)) * mlthead_h.view(*((onto_ids.size()[0], -1)+(1,)*(len(output_size)-1))), 1)], dim=-1), pooled_attentions
 
     def transformer(self, input_ids, *extra_inputs, pool_idx=None):
         use_gpu = next(self.parameters()).is_cuda
-        segment_ids = extra_inputs[3]
+        segment_ids = extra_inputs[4]
         root = OntoBERTClfHead._PyTorchModuleVertex.from_dict({'module':self.lm_model})
         OntoBERTClfHead.stack_dfs(root, 'modify_config', shared_data={'config':{'output_attentions':True, 'output_hidden_states':True}})
         last_hidden_state, pooled_output, all_encoder_layers, all_attentions = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx)
@@ -1382,6 +1383,7 @@ class BaseDataset(DatasetInterface, Dataset):
         elif (binlb is None):
             lb_df = self.df[self.df[self.label_col].notnull()][self.label_col]
             labels = sorted(set(lb_df)) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
+            if len(labels) == 1: labels = ['false'] + labels
             self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
         else:
             self.binlb = binlb
@@ -1436,7 +1438,7 @@ class EntlmntDataset(BaseDataset):
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlbr][0]
+        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
         sample = self._transform_chain(sample)
         return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])
 
@@ -1622,14 +1624,14 @@ class OntoDataset(BaseDataset):
     def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
         super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
         self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
-        self.onto2id = dict([(k, i) for i, k in enumerate(self.onto.index)])
+        self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         self.onto_col = onto_col
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlbr][0]
+        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(self.onto2id[record[self.onto_col]])
+        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(self.onto2id[record[self.onto_col]]), torch.tensor(record['weight'] if 'weight' in record else 1.0)
 
 
 class BaseIterDataset(DatasetInterface, IterableDataset):
@@ -1713,8 +1715,8 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
         self.origlb = kwargs['origlb']
         self.locallb = kwargs['locallb']
         self.binlb_str = binlb
-        self.binlb = OrderedDict([('include', 0)])
-        self.binlbr = OrderedDict([(0, 'include')])
+        self.binlb = OrderedDict([('false', 0), ('include', 1)])
+        self.binlbr = OrderedDict([(0, 'false'), (1, 'include')])
 
     @classmethod
     def _mltl2entlmnt(cls, data, text_col, orig_lb_col, dest_lb_col, local_lb_col='local_label', binlb=None, lbtxt=None, neglbs=None):
@@ -1756,7 +1758,7 @@ class OntoIterDataset(EntlmntMltlIterDataset):
         onto_fpath, onto_defs_fpath = (onto_fpaths[0], onto_fpaths[1] if len(onto_fpaths) > 1 else None) if onto_fpath is not None else (None, None)
         if onto_fpath and os.path.exists(onto_fpath):
             self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
-            self.onto2id = dict([(k, i) for i, k in enumerate(self.onto.index)])
+            self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         if onto_defs_fpath and os.path.exists(onto_defs_fpath):
             self.onto_defs = pd.read_csv(onto_defs_fpath, sep=sep, index_col=index_col)
         self.onto_col = onto_col
@@ -1766,7 +1768,7 @@ class OntoIterDataset(EntlmntMltlIterDataset):
     def _transform(self, record):
         sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
         sample = self._transform_chain(sample)
-        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(self.onto2id[record[self.onto_col]]),) if hasattr(self, 'onto_col') and self.onto_col in record else ())
+        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + (torch.tensor(self.onto2id[record[self.onto_col]] if hasattr(self, 'onto_col') and self.onto_col in record else 0),) + (torch.tensor(record['weight'] if 'weight' in record else 1.0),)
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
         return EntlmntMltlIterDataset.fill_labels(self, lbs, index=index, saved_col='rerank_preds', saved_path=saved_path, **kwargs)
@@ -2501,7 +2503,7 @@ def eval(clf, dataset, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', ta
         perf_df = pd.DataFrame(metrics.classification_report(trues, preds, labels=labels, target_names=[binlbr[x] for x in labels], output_dict=True)).T[['precision', 'recall', 'f1-score', 'support']]
     else:
         labels = [x for x in (list(binlbr.keys()-[clf.binlb[ignored_label]]) if ignored_label else list(binlbr.keys())) if x in preds or x in trues] if len(binlbr) > 1 else [0, 1]
-        perf_df = pd.DataFrame(metrics.classification_report(trues, preds, labels=labels, target_names=[binlbr[x] for x in labels] if len(binlbr) > 1 else ['false']+list(binlbr.values()), output_dict=True)).T[['precision', 'recall', 'f1-score', 'support']]
+        perf_df = pd.DataFrame(metrics.classification_report(trues, preds, labels=labels, target_names=[binlbr[x] for x in labels], output_dict=True)).T[['precision', 'recall', 'f1-score', 'support']]
     print('Results for %s dataset is:\n%s' % (ds_name.title(), perf_df))
     perf_df.to_excel('perf_%s.xlsx' % resf_prefix)
 
@@ -3139,6 +3141,18 @@ def main():
             main_func = rerank
     else:
         return
+    # Update config
+    cfg_kwargs = {} if opts.cfg is None else ast.literal_eval(opts.cfg)
+    global_vars = globals()
+    for glb, glbvs in cfg_kwargs.items():
+        if glb in global_vars:
+            for cfgk in [opts.task, opts.model, opts.method]:
+                if cfgk in global_vars[glb]:
+                    if type(global_vars[glb][cfgk]) is dict:
+                        global_vars[glb][cfgk].update(glbvs)
+                    else:
+                        global_vars[glb][cfgk] = glbvs
+
     if (opts.distrb):
         global DATA_PATH
         DATA_PATH = os.path.join('/', 'data', 'bionlp')
@@ -3233,6 +3247,7 @@ if __name__ == '__main__':
     op.add_option('--encoder', dest='encoder', help='the encoder to be used after the language model: pool, s2v or s2s')
     op.add_option('--pretrained', dest='pretrained', help='pretrained model file')
     op.add_option('--seed', dest='seed', help='manually set the random seed')
+    op.add_option('-c', '--cfg', help='config string used to update the settings, format: {\'param_name1\':param_value1[, \'param_name1\':param_value1]}')
     op.add_option('-m', '--method', default='classify', help='main method to run')
     op.add_option('-v', '--verbose', default=False, action='store_true', dest='verbose', help='display detailed information')
 
