@@ -118,12 +118,13 @@ class BaseShell():
 class BaseClfHead(nn.Module):
     """ Classifier Head for the Basic Language Model """
 
-    def __init__(self, lm_model, config, task_type, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_extlin=False, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_extlin=False, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
         super(BaseClfHead, self).__init__()
         self.task_params = task_params
         self.lm_model = lm_model
         self.lm_loss = lm_loss
         self.task_type = task_type
+        self.sample_weights = sample_weights
         self.do_norm = do_norm
         self.do_extlin = do_extlin
         self.do_lastdrop = do_lastdrop
@@ -153,6 +154,7 @@ class BaseClfHead(nn.Module):
 
     def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, embedding_mode=False):
         use_gpu = next(self.parameters()).is_cuda
+        sample_weights = extra_inputs[0] if self.sample_weights and len(extra_inputs) > 0 else None
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
         # print(('input_ids', [x.size() for x in input_ids] if type(input_ids) is list else input_ids.size()))
         # print(('input_ids', [[','.join(map(str, s.tolist())) for s in x] for x in input_ids] if type(input_ids) is list else [','.join(map(str, s.tolist())) for s in input_ids]))
@@ -173,6 +175,7 @@ class BaseClfHead(nn.Module):
             lm_logits, lm_target = self.lm_logit(input_ids, hidden_states, *extra_inputs, past=past, pool_idx=pool_idx)
             lm_loss_func = nn.CrossEntropyLoss(ignore_index=-1, reduction='none')
             lm_loss = lm_loss_func(lm_logits.contiguous().view(-1, lm_logits.size(-1)), lm_target.contiguous().view(-1)).view(input_ids.size(0), -1)
+            if sample_weights is not None: lm_loss *= sample_weights
         else:
             lm_loss = None
 
@@ -226,6 +229,7 @@ class BaseClfHead(nn.Module):
         # print((labels.max(), labels.size()))
         if self.crf:
             clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), pool_idx)
+            if sample_weights is not None: clf_loss *= sample_weights
             return (clf_loss, lm_loss) + extra_outputs
         else:
             for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
@@ -243,6 +247,7 @@ class BaseClfHead(nn.Module):
         if self.thrshlder:
             num_lbs = labels.view(-1, self.num_lbs).sum(1)
             clf_loss = 0.8 * clf_loss + 0.2 * F.mse_loss(self.thrshld, torch.sigmoid(torch.topk(clf_logits, k=num_lbs.max(), dim=1, sorted=True)[0][:,num_lbs-1]), reduction='mean')
+        if sample_weights is not None: clf_loss *= sample_weights
         return (clf_loss, lm_loss) + extra_outputs
 
     def pool(self, input_ids, pool_idx, clf_h, *extra_inputs):
@@ -387,10 +392,19 @@ class BaseClfHead(nn.Module):
         self.linear = self.linear.to('cuda') if use_gpu else self.linear
         self.mode = 'clf'
 
+    def update_params(self, task_params={}, **kwargs):
+        self.task_params.update(task_params)
+        for k, v in kwargs.items():
+            if hasattr(self, k) and type(v) == type(getattr(self, k)):
+                if type(v) is dict:
+                    getattr(self, k).update(v)
+                else:
+                    setattr(self, k, v)
+
 
 class BERTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
-        super(BERTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+        super(BERTClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
         self.lm_head = BertPreTrainingHeads(config)
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -429,7 +443,7 @@ class BERTClfHead(BaseClfHead):
     def transformer(self, input_ids, *extra_inputs, pool_idx=None):
         use_gpu = next(self.parameters()).is_cuda
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
-        segment_ids = extra_inputs[2]
+        segment_ids = extra_inputs[3] if self.sample_weights else extra_inputs[2]
         if (self.output_layer == -1 or self.output_layer == 11):
             self.lm_model.encoder.output_hidden_states = False
             last_hidden_state, pooled_output = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids.long(), attention_mask=pool_idx)
@@ -442,7 +456,7 @@ class BERTClfHead(BaseClfHead):
 
 
     def _lm_logit(self, input_ids, hidden_states, *extra_inputs, past=None, pool_idx=None):
-        masked_lm_ids = extra_inputs[0] if len(extra_inputs) > 0 else input_ids
+        masked_lm_ids = (extra_inputs[1] if len(extra_inputs) > 1 else input_ids) if self.sample_weights else (extra_inputs[0] if len(extra_inputs) > 0 else input_ids)
         return self.lm_head(*self.transformer(masked_lm_ids, *extra_inputs, pool_idx=pool_idx))[0], masked_lm_lbs
 
 
@@ -458,10 +472,10 @@ class OntoBERTClfHead(BERTClfHead):
             for k, v in config.items():
                 if hasattr(self.module, k): setattr(self.module, k, v)
 
-    def __init__(self, lm_model, config, task_type, onto='onto.csv', embeddim=128, onto_fchdim=128, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+    def __init__(self, lm_model, config, task_type, onto='onto.csv', embeddim=128, onto_fchdim=128, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
         config.output_hidden_states = True
         output_layer = list(range(config.num_hidden_layers))
-        BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
+        BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
         self.onto = pd.read_csv(onto, sep=kwargs.setdefault('sep', '\t'), index_col='id')
         self.embeddim = embeddim
         self.embedding = nn.Embedding(self.onto.shape[0]+1, embeddim)
@@ -476,7 +490,7 @@ class OntoBERTClfHead(BERTClfHead):
 
     def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, ret_ftspans=False, ret_attention=False):
         use_gpu = next(self.parameters()).is_cuda
-        sample_weights = extra_inputs[1]
+        sample_weights = extra_inputs[0] if self.sample_weights and len(extra_inputs) > 0 else None
         outputs = BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights)
         if (labels is None):
             clf_logits, all_attentions, pooled_attentions = outputs
@@ -484,8 +498,8 @@ class OntoBERTClfHead(BERTClfHead):
         else:
             clf_loss, lm_loss, all_attentions, pooled_attentions = outputs
             outputs = clf_loss, lm_loss
-        segment_ids = extra_inputs[4]
-        spans = extra_inputs[6] if len(extra_inputs) > 6 else None
+        segment_ids = extra_inputs[4] if self.sample_weights else extra_inputs[3]
+        spans = (extra_inputs[6] if len(extra_inputs) > 6 else None) if self.sample_weights else (extra_inputs[5] if len(extra_inputs) > 5 else None)
         if labels is None or spans is not None or ret_ftspans or ret_attention:
             # pos_idx, idn_mask, inv_segment_ids = (torch.arange(segment_ids.size()[1]).to('cuda') if use_gpu else torch.arange(segment_ids.size()[1])), torch.ones_like(segment_ids), 1 - segment_ids
             # mask = pos_idx * idn_mask <= pool_idx.view((-1,1)) * idn_mask
@@ -503,6 +517,7 @@ class OntoBERTClfHead(BERTClfHead):
                 start_loss = loss_fct(start_logits, start_positions)
                 end_loss = loss_fct(end_logits, end_positions)
                 clf_loss = clf_loss + (start_loss + end_loss) / 2
+                if sample_weights is not None: clf_loss *= sample_weights
                 outputs = clf_loss, lm_loss
         else:
             if ret_ftspans:
@@ -513,21 +528,21 @@ class OntoBERTClfHead(BERTClfHead):
         return (outputs + (all_attentions, pooled_attentions, masked_pooled_attentions)) if ret_attention else outputs
 
     def pool(self, input_ids, pool_idx, clf_h, *extra_inputs):
-        onto_ids = extra_inputs[0]
+        onto_ids = extra_inputs[1] if self.sample_weights else extra_inputs[0]
         onto_h = self.onto_linear(self.embedding(onto_ids))
         lyrw_h, mlthead_h = onto_h[:,:self.halflen], onto_h[:,self.halflen:]
         lyr_h = [self.pooler(h, pool_idx) for h in clf_h]
         clf_h = self.layer_pooler(lyr_h, lyrw_h).view(lyr_h[0].size())
         output_size = clf_h.size()
-        all_attentions = extra_inputs[5]
-        segment_ids = extra_inputs[4]
+        all_attentions = extra_inputs[5] if self.sample_weights else extra_inputs[4]
+        segment_ids = extra_inputs[4] if self.sample_weights else extra_inputs[3]
         pooled_attentions = torch.sum(all_attentions.permute(*((1, 0)+tuple(range(2, len(all_attentions.size()))))) * lyrw_h.view(lyrw_h.size()+(1,)*(len(all_attentions.size())-len(lyrw_h.size()))), dim=1)
         pooled_attentions = torch.sum(pooled_attentions * mlthead_h.view(mlthead_h.size()+(1,)*(len(pooled_attentions.size())-len(mlthead_h.size()))), dim=1)
         return torch.cat([clf_h, torch.sum(clf_h.view(output_size[:-1]+(self.halflen, -1)) * mlthead_h.view(*((onto_ids.size()[0], -1)+(1,)*(len(output_size)-1))), 1)], dim=-1), pooled_attentions
 
     def transformer(self, input_ids, *extra_inputs, pool_idx=None):
         use_gpu = next(self.parameters()).is_cuda
-        segment_ids = extra_inputs[4]
+        segment_ids = extra_inputs[4] if self.sample_weights else extra_inputs[3]
         root = OntoBERTClfHead._PyTorchModuleVertex.from_dict({'module':self.lm_model})
         OntoBERTClfHead.stack_dfs(root, 'modify_config', shared_data={'config':{'output_attentions':True, 'output_hidden_states':True}})
         last_hidden_state, pooled_output, all_encoder_layers, all_attentions = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx)
@@ -536,8 +551,8 @@ class OntoBERTClfHead(BERTClfHead):
 
 
 class GPTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(GPTClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_type == 'sentsim', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        super(GPTClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type == 'sentsim', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         if type(lm_model) is GPT2LMHeadModel:self.kwprop['past_paramname'] = 'past'
         self.vocab_size = config.vocab_size
         self.n_embd = config.n_embd
@@ -558,8 +573,8 @@ class GPTClfHead(BaseClfHead):
 
 
 class TransformXLClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(TransformXLClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        super(TransformXLClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         self.kwprop['past_paramname'] = 'mems'
         self.vocab_size = config.n_token
         self.n_embd = config.d_embed
@@ -597,8 +612,8 @@ class TransformXLClfHead(BaseClfHead):
 
 
 class EmbeddingClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(EmbeddingClfHead, self).__init__(lm_model, config, task_type, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'], pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        super(EmbeddingClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'], pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         self.dim_mulriple = 2 if self.task_type in ['entlmnt', 'sentsim'] and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else 1
         self.embed_type = embed_type
         if embed_type.startswith('w2v'):
@@ -704,9 +719,9 @@ class EmbeddingClfHead(BaseClfHead):
 
 
 class EmbeddingPool(EmbeddingClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, pooler=None, pool_params={'kernel_size':8, 'stride':4}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, pooler=None, pool_params={'kernel_size':8, 'stride':4}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         assert(task_type != 'nmt')
-        super(EmbeddingPool, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+        super(EmbeddingPool, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         if pooler:
             self.pooler = nn.MaxPool2d(**pool_params) if pooler == 'max' else nn.AvgPool2d(**pool_params)
@@ -736,9 +751,9 @@ class EmbeddingPool(EmbeddingClfHead):
 
 
 class EmbeddingSeq2Vec(EmbeddingClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         assert(task_type != 'nmt')
-        super(EmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+        super(EmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         if seq2vec:
             params = {}
             if seq2vec.startswith('pytorch-'):
@@ -783,8 +798,8 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
 
 
 class EmbeddingSeq2Seq(EmbeddingClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2seq=None, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(EmbeddingSeq2Seq, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2seq=None, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        super(EmbeddingSeq2Seq, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         if seq2seq:
             params = {}
             if seq2seq.startswith('pytorch-'):
@@ -822,7 +837,7 @@ class EmbeddingSeq2Seq(EmbeddingClfHead):
 
 
 class SentVecEmbeddingSeq2Vec(EmbeddingSeq2Vec):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v_sentvec', w2v_path=None, sentvec_path=None, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v_sentvec', w2v_path=None, sentvec_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         import sent2vec
         if type(sentvec_path) is sent2vec.Sent2vecModel:
             self.sentvec_model = w2v_path
@@ -833,10 +848,10 @@ class SentVecEmbeddingSeq2Vec(EmbeddingSeq2Vec):
             self.sentvec_model = None
         assert(self.sentvec_model)
         self.n_embd = self.sentvec_model.get_emb_size()
-        super(SentVecEmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type.replace('_sentvec', ''), w2v_path=w2v_path, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
+        super(SentVecEmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type.replace('_sentvec', ''), w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
 
     def forward(self, input_ids, pool_idx, *extra_inputs, w2v_ids=None, labels=None, past=None, weights=None):
-        sentvec_tnsr, extra_inputs = extra_inputs[0], extra_inputs[1:]
+        sample_weights, entvec_tnsr, extra_inputs = (extra_inputs[0], extra_inputs[1], extra_inputs[2:]) if self.sample_weights else (None, extra_inputs[0], extra_inputs[1:])
         clf_h, mask = EmbeddingClfHead.forward(self, input_ids, pool_idx, *extra_inputs, w2v_ids=w2v_ids, labels=labels, past=past, weights=weights, ret_mask=True)
         if self.seq2vec:
             clf_h = [self.seq2vec(clf_h[x], mask=mask[x]) for x in [0,1]] if self.task_type in ['entlmnt', 'sentsim'] else self.seq2vec(clf_h, mask=mask)
@@ -885,7 +900,8 @@ class EmbeddingHead(nn.Module):
             return clf_logits.view(-1, self.num_lbs)
         if self.crf:
             clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), pool_idx)
-            return clf_loss, lm_loss
+            if sample_weights is not None: clf_loss *= sample_weights
+            return clf_loss, None
         else:
             for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
         if self.task_type == 'mltc-clf' or (self.task_type == 'entlmnt' and self.num_lbs > 1) or self.task_type == 'nmt':
@@ -901,6 +917,7 @@ class EmbeddingHead(nn.Module):
         if self.thrshlder:
             num_lbs = labels.view(-1, self.num_lbs).sum(1)
             clf_loss = 0.8 * clf_loss + 0.2 * F.mse_loss(self.thrshld, torch.sigmoid(torch.topk(clf_logits, k=num_lbs.max(), dim=1, sorted=True)[0][:,num_lbs-1]), reduction='mean')
+        if sample_weights is not None: clf_loss *= sample_weights
         return clf_loss, lm_loss
 
 
@@ -1361,7 +1378,7 @@ class DatasetInterface(object):
 class BaseDataset(DatasetInterface, Dataset):
     """Basic dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampfrac=None, **kwargs):
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampw=False, sampfrac=None, **kwargs):
         self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
         # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
@@ -1369,6 +1386,7 @@ class BaseDataset(DatasetInterface, Dataset):
         if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
         self.df.columns = self.df.columns.astype(str, copy=False)
         self.mltl = mltl
+        self.sample_weights = sampw
         if (binlb == 'rgrsn'):
             self.binlb = None
             self.binlbr = None
@@ -1405,21 +1423,21 @@ class BaseDataset(DatasetInterface, Dataset):
         record = self.df.iloc[idx]
         sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])
+        return (self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class SentSimDataset(BaseDataset):
     """Sentence Similarity task dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampfrac=None, ynormfunc=None, **kwargs):
-        super(SentSimDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampfrac=sampfrac, **kwargs)
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, ynormfunc=None, **kwargs):
+        super(SentSimDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
         self.ynormfunc, self.ynormfuncr = ynormfunc if ynormfunc is not None else (None, None)
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
         sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(0. if sample[1] is np.nan else (float(sample[1]) if self.ynormfunc is None else self.ynormfunc(float(sample[1]))))
+        return (self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(0. if sample[1] is np.nan else (float(sample[1]) if self.ynormfunc is None else self.ynormfunc(float(sample[1]))))) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
         lbs = lbs if self.ynormfuncr is None else list(map(self.ynormfuncr, lbs))
@@ -1440,14 +1458,14 @@ class EntlmntDataset(BaseDataset):
         record = self.df.iloc[idx]
         sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])
+        return (self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class NERDataset(BaseDataset):
     """NER task dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampfrac=None, lb_coding='IOB', **kwargs):
-        super(NERDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, header=None if csv_file.endswith('tsv') else 0, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampfrac=sampfrac, **kwargs)
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, lb_coding='IOB', **kwargs):
+        super(NERDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, header=None if csv_file.endswith('tsv') else 0, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
         all_binlb = set([k.split('-')[-1] for k in self.binlb.keys() if k != 'O'])
         encoded_lbs = ['%s-%s' % (pre, lb) for lb in all_binlb for pre in set(lb_coding) - set(['O']) if lb and not lb.isspace()] + ['O']
         self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(encoded_lbs)])
@@ -1555,8 +1573,8 @@ class MaskedLMDataset(BaseDataset):
 class ConceptREDataset(BaseDataset):
     """Relation extraction task with pre-annotated concepts dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, cw2v_model=None, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
-        super(ConceptREDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, cw2v_model=None, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
+        super(ConceptREDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
         self.cw2v_model = cw2v_model
 
     def __getitem__(self, idx):
@@ -1621,8 +1639,8 @@ class EmbeddingPairDataset(BaseDataset):
 
 
 class OntoDataset(BaseDataset):
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
-        super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
+        super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
         self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
         self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         self.onto_col = onto_col
@@ -1631,17 +1649,18 @@ class OntoDataset(BaseDataset):
         record = self.df.iloc[idx]
         sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
         sample = self._transform_chain(sample)
-        return self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(self.onto2id[record[self.onto_col]]), torch.tensor(record['weight'] if 'weight' in record else 1.0)
+        return (self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]]),)
 
 
 class BaseIterDataset(DatasetInterface, IterableDataset):
     """ Basic iterable dataset """
 
-    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, **kwargs):
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampw=False, **kwargs):
         self.index_col = index_col
         self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
         self.mltl = mltl
+        self.sample_weights = sampw
         self.data = io.JsonIterable(fpath, retgen=True) if os.path.splitext(fpath)[-1] == '.json' else io.DataFrameIterable(fpath, retgen=True, sep=sep)
         self._df = pd.read_csv(fpath, sep=sep, dtype={self.index_col:object}).set_index(self.index_col) if type(self.data) is io.DataFrameIterable else None
         self.encode_func = encode_func
@@ -1676,7 +1695,7 @@ class BaseIterDataset(DatasetInterface, IterableDataset):
     def _transform(self, record):
         sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
         sample = self._transform_chain(sample)
-        return record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])
+        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
     def __iter__(self):
         return iter((self._transform(record) for record in self.data))
@@ -1691,15 +1710,15 @@ class EntlmntIterDataset(BaseIterDataset):
     def _transform(self, record):
         sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
         sample = self._transform_chain(sample)
-        return record[self.index_col], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])
+        return (record[self.index_col], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class EntlmntMltlIterDataset(EntlmntIterDataset):
     """Entailment task transformed from multi-label classification iterable dataset class"""
 
-    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, **kwargs):
         try:
-            super(EntlmntMltlIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, mltl=False, **kwargs)
+            super(EntlmntMltlIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, mltl=False, sampw=sampw, **kwargs)
         except Exception as e:
             print(e)
         if type(binlb) is str and binlb.startswith('mltl'):
@@ -1746,7 +1765,7 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
 
 
 class OntoIterDataset(EntlmntMltlIterDataset):
-    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], **kwargs):
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, **kwargs):
         def _get_onto_lb(lb, onto_df=None):
             if onto_df is not None and lb in onto_df.index: return onto_df.loc[lb]['label']
         def _get_onto_def(lb, onto_df=None, onto_defs_df=None):
@@ -1763,12 +1782,12 @@ class OntoIterDataset(EntlmntMltlIterDataset):
             self.onto_defs = pd.read_csv(onto_defs_fpath, sep=sep, index_col=index_col)
         self.onto_col = onto_col
         kwargs['lbtxt'] = dict(func=_get_onto_def, kwargs={'onto_df':self.onto, 'onto_defs_df':self.onto_defs}) if text_col[-1] != 'onto' and hasattr(self, 'onto_defs') else dict(func=_get_onto_lb, kwargs={'onto_df':self.onto})
-        super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, **kwargs)
+        super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, **kwargs)
 
     def _transform(self, record):
         sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
         sample = self._transform_chain(sample)
-        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + (torch.tensor(self.onto2id[record[self.onto_col]] if hasattr(self, 'onto_col') and self.onto_col in record else 0),) + (torch.tensor(record['weight'] if 'weight' in record else 1.0),)
+        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]] if hasattr(self, 'onto_col') and self.onto_col in record else 0),)
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
         return EntlmntMltlIterDataset.fill_labels(self, lbs, index=index, saved_col='rerank_preds', saved_path=saved_path, **kwargs)
@@ -2060,7 +2079,7 @@ ENCODE_FUNC_MAP = {'bert':_bert_encode, 'gpt2':_gpt2_encode, 'gpt':_bert_encode,
 LM_EMBED_MDL_MAP = {'elmo':'elmo', 'none':'w2v', 'elmo_w2v':'elmo_w2v', 'none_sentvec':'w2v_sentvec', 'elmo_sentvec':'elmo_sentvec', 'elmo_w2v_sentvec':'elmo_w2v_sentvec'}
 LM_MODEL_MAP = {'bert':BertModel, 'gpt2':GPT2LMHeadModel, 'gpt':OpenAIGPTLMHeadModel, 'trsfmxl':TransfoXLLMHeadModel, 'elmo':Elmo}
 CLF_MAP = {'bert_onto':OntoBERTClfHead, 'bert':BERTClfHead, 'gpt2':GPTClfHead, 'gpt':GPTClfHead, 'trsfmxl':TransformXLClfHead, 'embed':{'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}}
-CLF_EXT_PARAMS = {'bert_onto':{'onto':'onto.csv', 'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02}}
+CLF_EXT_PARAMS = {'bert_onto':{'onto':'onto.csv', 'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None, 'sample_weights':False}, 'bert':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'do_thrshld':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'output_layer':-1, 'pooler':None, 'sample_weights':False}, 'gpt2':{'lm_loss':False, 'fchdim':0, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_extlin':False, 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}, 'elmo':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}, 'none':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}, 'elmo_w2v':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}, 'none_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}, 'elmo_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}, 'elmo_w2v_sentvec':{'pooler':False, 'seq2seq':'isa', 'seq2vec':'boe', 'fchdim':768, 'iactvtn':'relu', 'oactvtn':'sigmoid', 'w2v_path':None, 'sentvec_path':None, 'pdrop':0.2, 'do_norm':True, 'norm_type':'batch', 'do_lastdrop':True, 'do_crf':False, 'initln':False, 'initln_mean':0., 'initln_std':0.02, 'sample_weights':False}}
 CONFIG_MAP = {'bert':BertConfig, 'gpt2':GPT2Config, 'gpt':OpenAIGPTConfig, 'trsfmxl':TransfoXLConfig, 'elmo':elmo_config}
 TKNZR_MAP = {'bert':BertTokenizer, 'gpt2':GPT2Tokenizer, 'gpt':OpenAIGPTTokenizer, 'trsfmxl':TransfoXLTokenizer, 'elmo':None, 'none':None, 'sentvec':None}
 LM_TKNZ_EXTRA_CHAR = {'bert':['[CLS]', '[SEP]', '[SEP]', '[MASK]']}
@@ -2532,7 +2551,7 @@ def classify(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'required_special_tkns':['start_tknids', 'clf_tknids', 'delim_tknids'] if task_type in ['entlmnt', 'sentsim'] and (task_extparms.setdefault('sentsim_func', None) is None or not mdl_name.startswith('bert')) else ['start_tknids', 'clf_tknids'], 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {'sampfrac':opts.sampfrac}
+    ds_kwargs = {'sampw':opts.sample_weights, 'sampfrac':opts.sampfrac}
     if task_type == 'nmt':
         ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
     elif task_type == 'entlmnt':
@@ -2572,6 +2591,12 @@ def classify(dev_id=None):
 
     train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=sampler is None and opts.droplast, sampler=sampler, num_workers=opts.np, drop_last=opts.droplast)
 
+    ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
+    if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+    if (not opts.distrb or opts.distrb and hvd.rank() == 0):
+        print('Classifier hyper-parameters: %s' % ext_params)
+        print('Classifier task-related parameters: %s' % task_params)
     if (opts.resume):
         # Load model
         clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
@@ -2582,6 +2607,8 @@ def classify(dev_id=None):
                     save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
             except Exception as e:
                 print(e)
+        # Update parameters
+        clf.update_params(task_params=task_params, **ext_params)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model.split('_')[0], (torch.optim.Adam, {}, None))
         optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
@@ -2592,12 +2619,6 @@ def classify(dev_id=None):
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
-        ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
-        if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
-        task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-        if (not opts.distrb or opts.distrb and hvd.rank() == 0):
-            print('Classifier hyper-parameters: %s' % ext_params)
-            print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, binlb=train_ds.binlb, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model.split('_')[0], (torch.optim.Adam, {}, None))
         optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
@@ -2659,13 +2680,18 @@ def multi_clf(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    ds_kwargs = {'sampfrac':opts.sampfrac}
+    ds_kwargs = {'sampw':opts.sample_weights, 'sampfrac':opts.sampfrac}
     if task_type == 'nmt':
         ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
     elif task_type == 'sentsim':
         ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
     global_all_binlb = {}
 
+    ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
+    if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+    print('Classifier hyper-parameters: %s' % ext_params)
+    print('Classifier task-related parameters: %s' % task_params)
     orig_epochs = mltclf_epochs = opts.epochs
     elapsed_mltclf_epochs, opts.epochs = 0, 1
     if (opts.resume):
@@ -2678,6 +2704,8 @@ def multi_clf(dev_id=None):
             except Exception as e:
                 print(e)
         elapsed_mltclf_epochs, all_binlb = chckpnt.setdefault('mltclf_epochs', 0), clf.binlb
+        # Update parameters
+        clf.update_params(task_params=task_params, **ext_params)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model.split('_')[0], (torch.optim.Adam, {}, None))
         optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
@@ -2688,11 +2716,6 @@ def multi_clf(dev_id=None):
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
-        ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
-        if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
-        task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-        print('Classifier hyper-parameters: %s' % ext_params)
-        print('Classifier task-related parameters: %s' % task_params)
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model.split('_')[0], (torch.optim.Adam, {}, None))
         optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
@@ -2802,9 +2825,13 @@ def siamese_rank(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-    ds_kwargs = {'sampfrac':opts.sampfrac}
+    ds_kwargs = {'sampw':opts.sample_weights, 'sampfrac':opts.sampfrac}
     ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
+    ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
+    if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+    print('Classifier hyper-parameters: %s' % ext_params)
+    print('Classifier task-related parameters: %s' % task_params)
 
     if (opts.resume):
         # Load model
@@ -2816,7 +2843,8 @@ def siamese_rank(dev_id=None):
             except Exception as e:
                 print(e)
         prv_task_params = copy.deepcopy(clf.task_params)
-        clf.task_params.update(task_params)
+        # Update parameters
+        clf.update_params(task_params=task_params, **ext_params)
         clf.to_siamese()
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model.split('_')[0], (torch.optim.Adam, {}, None))
@@ -2829,10 +2857,7 @@ def siamese_rank(dev_id=None):
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
-        ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in CLF_EXT_PARAMS.setdefault(opts.model, {}).items()])
-        if (opts.model in LM_EMBED_MDL_MAP): ext_params['embed_type'] = LM_EMBED_MDL_MAP[opts.model]
-        print('Classifier hyper-parameters: %s' % ext_params)
-        print('Classifier task-related parameters: %s' % task_params)
+
         clf = gen_clf(opts.model, opts.encoder, lm_model=lm_model, constraints=opts.cnstrnts.split(',') if opts.cnstrnts else [], task_type=task_type, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None else False, task_params=task_params, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id, **ext_params)
         clf.to_siamese()
         optmzr_cls = OPTMZR_MAP.setdefault(opts.model.split('_')[0], (torch.optim.Adam, {}, None))
@@ -2926,9 +2951,9 @@ def simsearch(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-    ds_kwargs = {'sampfrac':opts.sampfrac}
+    ds_kwargs = {'sampw':opts.sample_weights, 'sampfrac':opts.sampfrac}
     ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
 
     # Load model
     clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
@@ -2939,7 +2964,8 @@ def simsearch(dev_id=None):
         except Exception as e:
             print(e)
     prv_task_params = copy.deepcopy(clf.task_params)
-    clf.task_params.update(task_params)
+    # Update parameters
+    clf.update_params(task_params=task_params)
     clf.mlt_trnsfmr = False
     if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
     model = SHELL_MAP[opts.model](clf, tokenizer=tokenizer, encode_func=encode_func, transforms=trsfms, transforms_kwargs=trsfms_kwargs, special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0))
@@ -3092,12 +3118,12 @@ def rerank(dev_id=None):
     task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
-    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
     ds_kwargs = {'ynormfunc':task_extparms.setdefault('ynormfunc', None)}
     ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'locallb', 'lbtxt', 'neglbs'] if k in task_extparms))
     if task_dstype in [OntoDataset, OntoIterDataset]:
         ds_kwargs['onto_fpath'] = opts.onto if opts.onto else task_extparms.setdefault('onto_fpath', 'onto.csv')
         ds_kwargs['onto_col'] = task_cols['ontoid']
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
 
     # Load model
     clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
@@ -3108,9 +3134,9 @@ def rerank(dev_id=None):
         except Exception as e:
             print(e)
     prv_task_params = copy.deepcopy(clf.task_params)
-    clf.task_params.update(task_params)
+    # Update parameters
+    clf.update_params(task_params=task_params)
     if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
-    # model = SHELL_MAP[opts.model](clf, tokenizer=tokenizer, encode_func=encode_func, transforms=trsfms, transforms_kwargs=trsfms_kwargs, special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0))
 
     # Prepare dev and test sets
     print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
@@ -3121,6 +3147,7 @@ def rerank(dev_id=None):
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, **ds_kwargs)
     if mdl_name == 'bert': test_ds = MaskedLMIterDataset(test_ds) if isinstance(test_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+
     # Evaluation
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
@@ -3238,6 +3265,7 @@ if __name__ == '__main__':
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
     op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
+    op.add_option('--sampw', default=False, action='store_true', dest='sample_weights', help='use sample weights')
     op.add_option('--onto', help='ontology data')
     op.add_option('--pred', help='prediction file')
     op.add_option('-i', '--input', help='input dataset')
