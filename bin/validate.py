@@ -1640,7 +1640,7 @@ class EmbeddingPairDataset(BaseDataset):
 
 class OntoDataset(BaseDataset):
     def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
-        super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
+        super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
         self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
         self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         self.onto_col = onto_col
@@ -1716,7 +1716,7 @@ class EntlmntIterDataset(BaseIterDataset):
 class EntlmntMltlIterDataset(EntlmntIterDataset):
     """Entailment task transformed from multi-label classification iterable dataset class"""
 
-    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, **kwargs):
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sent_mode=False, **kwargs):
         try:
             super(EntlmntMltlIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, mltl=False, sampw=sampw, **kwargs)
         except Exception as e:
@@ -1736,6 +1736,7 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
         self.binlb_str = binlb
         self.binlb = OrderedDict([('false', 0), ('include', 1)])
         self.binlbr = OrderedDict([(0, 'false'), (1, 'include')])
+        self.sent_mode = sent_mode
 
     @classmethod
     def _mltl2entlmnt(cls, data, text_col, orig_lb_col, dest_lb_col, local_lb_col='local_label', binlb=None, lbtxt=None, neglbs=None):
@@ -1765,7 +1766,7 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
 
 
 class OntoIterDataset(EntlmntMltlIterDataset):
-    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, **kwargs):
+    def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sent_mode=False, **kwargs):
         def _get_onto_lb(lb, onto_df=None):
             if onto_df is not None and lb in onto_df.index: return onto_df.loc[lb]['label']
         def _get_onto_def(lb, onto_df=None, onto_defs_df=None):
@@ -1782,7 +1783,7 @@ class OntoIterDataset(EntlmntMltlIterDataset):
             self.onto_defs = pd.read_csv(onto_defs_fpath, sep=sep, index_col=index_col)
         self.onto_col = onto_col
         kwargs['lbtxt'] = dict(func=_get_onto_def, kwargs={'onto_df':self.onto, 'onto_defs_df':self.onto_defs}) if text_col[-1] != 'onto' and hasattr(self, 'onto_defs') else dict(func=_get_onto_lb, kwargs={'onto_df':self.onto})
-        super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, **kwargs)
+        super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sent_mode=sent_mode, **kwargs)
 
     def _transform(self, record):
         sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
@@ -2567,6 +2568,8 @@ def classify(dev_id=None):
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name == 'bert': train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
+    if hasattr(train_ds, 'df'):
+        train_ds.df[task_cols['y']] = ['false' if lb is None or lb is np.nan or (type(lb) is str and lb.isspace()) else lb for lb in train_ds.df[task_cols['y']]]
     if (not opts.weight_class or task_type == 'sentsim'):
         class_count = None
     elif len(lb_trsfm) > 0:
@@ -2583,7 +2586,7 @@ def classify(dev_id=None):
         class_weights = torch.Tensor(1.0 / class_count)
         class_weights /= class_weights.sum()
         sampler = WeightedRandomSampler(weights=class_weights, num_samples=opts.bsize, replacement=True)
-        if type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
+        if not opts.distrb and type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
 
     if opts.distrb:
         # Partition dataset among workers using DistributedSampler
