@@ -1730,59 +1730,116 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
             self.orig_binlb = OrderedDict([(lb, i) for i, lb in enumerate(sorted(labels))])
             self.orig_binlbr = OrderedDict([(i, lb) for lb, i in self.orig_binlb.items()])
             self.mltl = True
-        self.data = EntlmntMltlIterDataset._mltl2entlmnt(self.data, text_col, kwargs['origlb'], label_col, local_lb_col=kwargs.setdefault('locallb', 'local_label'), binlb=binlb, lbtxt=kwargs.setdefault('lbtxt', None), neglbs=kwargs.setdefault('neglbs', None))
+        self.sent_mode = sent_mode
+        if sent_mode: self.data = EntlmntMltlIterDataset._split_to_sents(self.data, index_col=index_col, text_col=text_col[0], lb_col=kwargs['origlb'], lb_sep=sc if 'sc' in locals() else ';', keep_locs=kwargs.setdefault('keep_locs', False), update_locs=kwargs.setdefault('update_locs', False))
+        self.data = EntlmntMltlIterDataset._mltl2entlmnt(self.data, text_col, kwargs['origlb'], label_col, local_lb_col=kwargs.setdefault('locallb', 'local_label'), ref_lb_col=kwargs.setdefault('reflb', None), binlb=binlb, lbtxt=kwargs.setdefault('lbtxt', None), sampw=sampw, neglbs=kwargs.setdefault('neglbs', None))
         self.origlb = kwargs['origlb']
         self.locallb = kwargs['locallb']
         self.binlb_str = binlb
         self.binlb = OrderedDict([('false', 0), ('include', 1)])
         self.binlbr = OrderedDict([(0, 'false'), (1, 'include')])
-        self.sent_mode = sent_mode
 
     @classmethod
-    def _mltl2entlmnt(cls, data, text_col, orig_lb_col, dest_lb_col, local_lb_col='local_label', binlb=None, lbtxt=None, neglbs=None):
+    def _mltl2entlmnt(cls, data, text_col, orig_lb_col, dest_lb_col, local_lb_col='local_label', ref_lb_col=None, binlb=None, lbtxt=None, sampw=False, neglbs=None):
         sc = binlb.split(SC)[-1]
         for record in data:
-            for lb in sorted(set(record[orig_lb_col] if type(record[orig_lb_col]) is list else (record[orig_lb_col].split(sc) if type(record[orig_lb_col]) is str else []))):
+            ref_lbs = set(record[ref_lb_col] if type(record[ref_lb_col]) is list else (record[ref_lb_col].split(sc) if type(record[ref_lb_col]) is str else [])) if ref_lb_col is not None and ref_lb_col in record else None
+            for lb in sorted(filter(lambda x: x, set(record[orig_lb_col] if type(record[orig_lb_col]) is list else (record[orig_lb_col].split(sc) if type(record[orig_lb_col]) is str else [])))):
                 record[local_lb_col] = lb
-                record[text_col[-1]] = lb if lbtxt is None else lbtxt['func'](lb, **lbtxt['kwargs'])
-                record[dest_lb_col] = 'include'
-                yield record
+                record[dest_lb_col] = 'include' if ref_lbs is None or len(ref_lbs) == 0 or lb in ref_lbs else 'false'
+                if sampw:
+                    notes, nwghts = ([lb],[1.0]) if lbtxt is None else lbtxt['func'](lb, sampw=True, **lbtxt['kwargs'])
+                else:
+                    notes = [lb] if lbtxt is None else lbtxt['func'](lb, **lbtxt['kwargs'])
+                    nwghts = [1.0] * len(notes) if type(notes) is list else 1.0
+                notes = [notes] if type(notes) is not list else notes
+                nwghts = [nwghts] if type(nwghts) is not list else nwghts
+                for note, w in zip(notes, nwghts):
+                    record[text_col[-1]] = note
+                    if sampw: record['weight'] = w
+                    yield record
             if neglbs is not None:
+                if sampw: record['weight'] = 1.0
                 for neg_lb in neglbs['func'](record[orig_lb_col], **neglbs['kwargs']):
                     record[local_lb_col] = neg_lb
-                    record[text_col[-1]] = neg_lb if lbtxt is None else lbtxt['func'](neg_lb, **lbtxt['kwargs'])
                     record[dest_lb_col] = ''
-                    yield record
+                    notes = [neg_lb] if lbtxt is None else lbtxt['func'](neg_lb, **lbtxt['kwargs'])
+                    for note in notes:
+                        record[text_col[-1]] = note
+                        yield record
+
+    @classmethod
+    def _split_to_sents(cls, data, index_col='id', text_col='text', lb_col='labels', lb_sep=';', keep_locs=False, update_locs=False):
+        from bionlp.util import func
+        splitted_data = []
+        for record in data:
+            doc_id = record[index_col]
+            orig_labels = record[lb_col].split(lb_sep) if record[lb_col] is not None and type(record[lb_col]) is str and not record[lb_col].isspace() else []
+            if len(orig_labels) == 0:
+                yield record
+                continue
+            labels, locs = zip(*[lb.split('|') for lb in orig_labels])
+            doc = nlp(record[text_col])
+            sent_bndrs = [(s.start_char, s.end_char) for s in doc.sents]
+            lb_locs = [tuple(map(int, loc.split(':'))) for loc in locs]
+            if (np.amax(lb_locs) > np.amax(sent_bndrs)): lb_locs = np.array(lb_locs) - np.amin(lb_locs) # Temporary fix
+            # overlaps = list(filter(lambda x: len(x) > 0, [func.overlap_tuple(lb_locs, sb, ret_idx=True) for sb in sent_bndrs]))
+            overlaps = [func.overlap_tuple(lb_locs, sb, ret_idx=True) for sb in sent_bndrs]
+            overlaps = [ovr if len(ovr)>0 else ((),()) for ovr in overlaps]
+            indices, locss = zip(*overlaps) if len(overlaps) > 0 else ([[]]*len(sent_bndrs),[[]]*len(sent_bndrs))
+            indices, locss = list(map(list, indices)), list(map(list, locss))
+            miss_aligned = list(set(range(len(labels))) - set(func.flatten_list(indices)))
+            if len(miss_aligned) > 0:
+                for i in range(len(sent_bndrs)):
+                    indices[i].extend(miss_aligned)
+                    locss[i].extend([sent_bndrs[i]]*len(miss_aligned))
+            last_idx = 0
+            for i, (idx, locs, sent) in enumerate(zip(indices, locss, doc.sents)):
+                lbs = [labels[x] for x in idx]
+                record[index_col] = '_'.join(map(str, [doc_id, i]))
+                record[text_col] = sent.text
+                record[lb_col] = lb_sep.join(['|'.join([lb, ':'.join(map(str, np.array(loc)-(last_idx if update_locs else 0)))]) for lb, loc in zip(lbs, locs)] if keep_locs else lbs)
+                last_idx += sent.end_char
+                yield record
 
     def fill_labels(self, lbs, binlb=True, index=None, saved_col='preds', saved_path=None, **kwargs):
-        if self._df is not None:
-            index = list(map(str, index))
-            sc = self.binlb_str.split(SC)[-1]
-            combined_df = pd.DataFrame({'id':index, 'lbs':lbs}).groupby('id').apply(lambda x: sc.join(map(str, x['lbs'].values)))
-            index, lbs = combined_df.index, combined_df.values
-            lbs = [sc.join([origlb for origlb, lb in zip(origlbs.split(sc), lbstr.split(sc)) if lb == '1']) if type(origlbs) is str and type(lbstr) is str else '' for origlbs, lbstr in zip(self._df[self.origlb], lbs)]
-            binlb=False
+        if self._df is None: return
+        sc = self.binlb_str.split(SC)[-1]
+        num_underline =  list(str(self._df.index[0])).count('_')
+        index = ['_'.join(str(idx).split('_')[:num_underline+1]) for idx in index]
+        combined_df = pd.DataFrame({'id':index, 'lbs':lbs}).groupby('id').apply(lambda x: sc.join(map(str, x['lbs'].values)))
+        index, lbs = combined_df.index, combined_df.values
+        lbs = [sc.join([origlb for origlb, lb in zip(origlbs.split(sc), lbstr.split(sc)) if lb == '1']) if type(origlbs) is str and type(lbstr) is str else '' for origlbs, lbstr in zip(self._df[self.origlb], lbs)]
+        binlb=False
         return BaseIterDataset.fill_labels(self, lbs, binlb=binlb, index=index, saved_col=saved_col, saved_path=saved_path, **kwargs)
 
 
 class OntoIterDataset(EntlmntMltlIterDataset):
     def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sent_mode=False, **kwargs):
-        def _get_onto_lb(lb, onto_df=None):
-            if onto_df is not None and lb in onto_df.index: return onto_df.loc[lb]['label']
-        def _get_onto_def(lb, onto_df=None, onto_defs_df=None):
-            if onto_defs_df is not None and lb in onto_defs_df.index:
-                return onto_defs_df.loc[lb]['text']
+        def _get_onto_lb(lb, sampw=False, onto_df=None):
+            if onto_df is not None and lb in onto_df.index: return (onto_df.loc[lb]['label'], 1) if sampw else onto_df.loc[lb]['label']
+        def _get_onto_def(lb, sampw=False, onto_df=None, onto_dict_df=None):
+            if onto_dict_df is not None and lb in onto_dict_df.index:
+                # return ((list(set(onto_dict_df.loc[lb]['text'].tolist())) if type(onto_dict_df.loc[lb]['text']) is pd.Series else [onto_dict_df.loc[lb]['text']]) if onto_dict_df.loc[lb]['text'] is not np.nan else [t for t in onto_dict_df.loc[lb][['label','exact_synm','relate_synm','narrow_synm','broad_synm']] if t is not np.nan][:2]) if lb in onto_dict_df.index else []
+                if lb not in onto_dict_df.index:
+                    return [[],[]] if sampw else []
+                elif onto_dict_df.loc[lb]['text'] is not np.nan:
+                    notes = list(set(onto_dict_df.loc[lb]['text'].tolist())) if type(onto_dict_df.loc[lb]['text']) is pd.Series else [onto_dict_df.loc[lb]['text']]
+                    return (notes, [1.0]*len(notes)) if sampw else notes
+                else:
+                    notes = [t for t in onto_dict_df.loc[lb][['label','exact_synm','relate_synm','narrow_synm','broad_synm']] if t is not np.nan][:2]
+                    return (notes, [0.5]*len(notes)) if sampw else notes
             elif onto_df is not None and lb in onto_df.index:
-                return onto_df.loc[lb]['label']
+                return (onto_df.loc[lb]['label'], 0.5) if sampw else onto_df.loc[lb]['label']
         onto_fpaths = onto_fpath.split(SC) if onto_fpath and type(onto_fpath) is str else None
-        onto_fpath, onto_defs_fpath = (onto_fpaths[0], onto_fpaths[1] if len(onto_fpaths) > 1 else None) if onto_fpath is not None else (None, None)
+        onto_fpath, onto_dict_fpath = (onto_fpaths[0], onto_fpaths[1] if len(onto_fpaths) > 1 else None) if onto_fpath is not None else (None, None)
         if onto_fpath and os.path.exists(onto_fpath):
             self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
             self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
-        if onto_defs_fpath and os.path.exists(onto_defs_fpath):
-            self.onto_defs = pd.read_csv(onto_defs_fpath, sep=sep, index_col=index_col)
+        if onto_dict_fpath and os.path.exists(onto_dict_fpath):
+            self.onto_dict = pd.read_csv(onto_dict_fpath, sep=sep, index_col=index_col)
         self.onto_col = onto_col
-        kwargs['lbtxt'] = dict(func=_get_onto_def, kwargs={'onto_df':self.onto, 'onto_defs_df':self.onto_defs}) if text_col[-1] != 'onto' and hasattr(self, 'onto_defs') else dict(func=_get_onto_lb, kwargs={'onto_df':self.onto})
+        kwargs['lbtxt'] = dict(func=_get_onto_def, kwargs={'onto_df':self.onto, 'onto_dict_df':self.onto_dict}) if text_col[-1] != 'onto' and hasattr(self, 'onto_dict') else dict(func=_get_onto_lb, kwargs={'onto_df':self.onto})
         super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sent_mode=sent_mode, **kwargs)
 
     def _transform(self, record):
@@ -2062,17 +2119,29 @@ def _handle_model(model, dev_id=None, distrb=False):
     return model
 
 
+def _update_cfgs(cfgs):
+    global_vars = globals()
+    for glb, glbvs in cfgs.items():
+        if glb in global_vars:
+            for cfgk in [opts.task, opts.model, opts.method]:
+                if cfgk in global_vars[glb]:
+                    if type(global_vars[glb][cfgk]) is dict:
+                        global_vars[glb][cfgk].update(glbvs)
+                    else:
+                        global_vars[glb][cfgk] = glbvs
+
+
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
     return {'options_file':options_path, 'weight_file':weights_path, 'num_output_representations':2, 'elmoedim':elmoedim, 'dropout':dropout}
 
 TASK_TYPE_MAP = {'bc5cdr-chem':'nmt', 'bc5cdr-dz':'nmt', 'shareclefe':'nmt', 'copdner':'nmt', 'ddi':'mltc-clf', 'chemprot':'mltc-clf', 'i2b2':'mltc-clf', 'hoc':'mltl-clf', 'biolarkgsc':'mltl-clf', 'copd':'mltl-clf', 'phenopubs':'mltl-clf', 'meshpubs':'mltl-clf', 'meshpubs_siamese':'sentsim', 'meshpubs_entilement':'entlmnt', 'meshpubs_simsearch':'mltl-clf', 'meshpubs_rerank':'entlmnt', 'bioasqa':'entlmnt', 'phenochf':'mltl-clf', 'toxic':'mltl-clf', 'mednli':'entlmnt', 'snli':'entlmnt', 'mnli':'entlmnt', 'wnli':'entlmnt', 'qnli':'entlmnt', 'biolarkgsc_entilement':'entlmnt', 'copd_entilement':'entlmnt', 'hpo_entilement':'entlmnt', 'biosses':'sentsim', 'clnclsts':'sentsim', 'cncpt-ddi':'mltc-clf'}
 TASK_PATH_MAP = {'bc5cdr-chem':'BC5CDR-chem', 'bc5cdr-dz':'BC5CDR-disease', 'shareclefe':'ShAReCLEFEHealthCorpus', 'copdner':'copdner', 'ddi':'ddi2013-type', 'chemprot':'ChemProt', 'i2b2':'i2b2-2010', 'hoc':'hoc', 'biolarkgsc':'biolarkgsc', 'copd':'copd', 'phenopubs':'phenopubs', 'meshpubs':'meshpubs', 'meshpubs_siamese':'meshpubs', 'meshpubs_entilement':'meshpubs.entlmnt', 'meshpubs_simsearch':'meshpubs', 'meshpubs_rerank':'meshpubs.pred', 'bioasqa':'bioasq-a', 'phenochf':'phenochf', 'toxic':'toxic', 'mednli':'mednli', 'snli':'snli', 'mnli':'mnli', 'wnli':'wnli', 'qnli':'qnli', 'biolarkgsc_entilement':'biolarkgsc.entlmnt', 'copd_entilement':'copd.entlmnt', 'hpo_entilement':'hpo.entlmnt', 'biosses':'BIOSSES', 'clnclsts':'clinicalSTS', 'cncpt-ddi':'cncpt-ddi'}
 TASK_DS_MAP = {'bc5cdr-chem':NERDataset, 'bc5cdr-dz':NERDataset, 'shareclefe':NERDataset, 'copdner':NERDataset, 'ddi':BaseDataset, 'chemprot':BaseDataset, 'i2b2':BaseDataset, 'hoc':BaseDataset, 'biolarkgsc':BaseDataset, 'copd':BaseDataset, 'phenopubs':BaseDataset, 'meshpubs':BaseDataset, 'meshpubs_siamese':SentSimDataset, 'meshpubs_entilement':EntlmntDataset, 'meshpubs_simsearch':BaseDataset, 'meshpubs_rerank':OntoIterDataset, 'bioasqa':EntlmntMltlIterDataset, 'phenochf':BaseDataset, 'toxic':BaseDataset, 'mednli':EntlmntDataset, 'snli':EntlmntDataset, 'mnli':EntlmntDataset, 'wnli':EntlmntDataset, 'qnli':EntlmntDataset, 'biolarkgsc_entilement':EntlmntDataset, 'copd_entilement':EntlmntDataset, 'hpo_entilement':OntoDataset, 'biosses':SentSimDataset, 'clnclsts':SentSimDataset, 'cncpt-ddi':ConceptREDataset}
-TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'biolarkgsc':{'index':'id', 'X':'text', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'meshpubs_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'meshpubs_simsearch':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_rerank':{'index':'id', 'X':['text', 'onto'], 'y':'label', 'ontoid':'ontoid'}, 'bioasqa':{'index':'pmid', 'X':['title','abstractText','mesh'], 'y':'label'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'snli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'mnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'wnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'label'}, 'qnli':{'index':'index', 'X':['question','sentence'], 'y':'label'}, 'biolarkgsc_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'copd_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'hpo_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label', 'ontoid':'label2'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
+TASK_COL_MAP = {'bc5cdr-chem':{'index':False, 'X':'0', 'y':'3'}, 'bc5cdr-dz':{'index':False, 'X':'0', 'y':'3'}, 'shareclefe':{'index':False, 'X':'0', 'y':'3'}, 'copdner':{'index':'id', 'X':'text', 'y':'label'}, 'ddi':{'index':'index', 'X':'sentence', 'y':'label'}, 'chemprot':{'index':'index', 'X':'sentence', 'y':'label'}, 'i2b2':{'index':'index', 'X':'sentence', 'y':'label'}, 'hoc':{'index':'index', 'X':'sentence', 'y':'labels'}, 'biolarkgsc':{'index':'id', 'X':'text', 'y':'labels'}, 'copd':{'index':'id', 'X':'text', 'y':'labels'}, 'phenopubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_siamese':{'index':'id', 'X':['text1','text2'], 'y':'score'}, 'meshpubs_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'meshpubs_simsearch':{'index':'id', 'X':'text', 'y':'labels'}, 'meshpubs_rerank':{'index':'id', 'X':['text', 'onto_note'], 'y':'label', 'ontoid':'ontoid'}, 'bioasqa':{'index':'pmid', 'X':['title','abstractText','mesh'], 'y':'label'}, 'phenochf':{'index':'id', 'X':'text', 'y':'labels'}, 'toxic':{'index':'id', 'X':'text', 'y':'labels'}, 'mednli':{'index':'id', 'X':['sentence1','sentence2'], 'y':'label'}, 'snli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'mnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'gold_label'}, 'wnli':{'index':'index', 'X':['sentence1','sentence2'], 'y':'label'}, 'qnli':{'index':'index', 'X':['question','sentence'], 'y':'label'}, 'biolarkgsc_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'copd_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label'}, 'hpo_entilement':{'index':'id', 'X':['text1','text2'], 'y':'label', 'ontoid':'label2'}, 'biosses':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'clnclsts':{'index':'index', 'X':['sentence1','sentence2'], 'y':'score'}, 'cncpt-ddi':{'index':'index', 'X':'sentence', 'y':'label', 'cid':['cncpt1_id', 'cncpt2_id']}}
 # ([in_func|*], [in_func_params|*], [out_func|*], [out_func_params|*])
-TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'biolarkgsc':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'meshpubs_entilement':(['_binc_transform'], [{}]), 'meshpubs_simsearch':([], []), 'meshpubs_rerank':(['_binc_transform'], [{}]), 'bioasqa':(['_binc_transform'], [{}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'snli':(['_mltc_transform'], [{}]), 'mnli':(['_mltc_transform'], [{}]), 'wnli':(['_mltc_transform'], [{}]), 'qnli':(['_mltc_transform'], [{}]), 'biolarkgsc_entilement':(['_mltc_transform'], [{}]), 'copd_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'hpo_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
+TASK_TRSFM = {'bc5cdr-chem':(['_nmt_transform'], [{}]), 'bc5cdr-dz':(['_nmt_transform'], [{}]), 'shareclefe':(['_nmt_transform'], [{}]), 'copdner1':(['_nmt_transform'], [{}]), 'copdner':(['_mltl_nmt_transform'], [{'get_lb': lambda x: '' if x is np.nan or x is None else x.split(';')[0]}]), 'ddi':(['_mltc_transform'], [{}]), 'chemprot':(['_mltc_transform'], [{}]), 'i2b2':(['_mltc_transform'], [{}]), 'hoc':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(10)])}]), 'biolarkgsc':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'copd':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'phenopubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'meshpubs_siamese':([], []), 'meshpubs_entilement':(['_binc_transform'], [{}]), 'meshpubs_simsearch':([], []), 'meshpubs_rerank':(['_mltc_transform'], [{}]), 'bioasqa':(['_binc_transform'], [{}]), 'phenochf':(['_mltl_transform'], [{ 'get_lb':lambda x: [] if x is np.nan or x is None else x.split(';')}]), 'toxic':(['_mltl_transform'], [{ 'get_lb':lambda x: [s.split('_')[0] for s in x.split(',') if s.split('_')[1] == '1'], 'binlb': dict([(str(x),x) for x in range(6)])}]), 'mednli':(['_mltc_transform'], [{}]), 'snli':(['_mltc_transform'], [{}]), 'mnli':(['_mltc_transform'], [{}]), 'wnli':(['_mltc_transform'], [{}]), 'qnli':(['_mltc_transform'], [{}]), 'biolarkgsc_entilement':(['_mltc_transform'], [{}]), 'copd_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'hpo_entilement':(['_mltc_transform'], [{}]), 'biosses':([], []), 'clnclsts':([], []), 'cncpt-ddi':(['_mltc_transform'], [{}])}
 TASK_EXT_TRSFM = {'bc5cdr-chem':([_padtrim_transform], [{}]), 'bc5cdr-dz':([_padtrim_transform], [{}]), 'shareclefe':([_padtrim_transform], [{}]), 'copdner':([_padtrim_transform], [{}]), 'ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'chemprot':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'i2b2':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'hoc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'biolarkgsc':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'copd':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'phenopubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_siamese':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'meshpubs_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'meshpubs_simsearch':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'meshpubs_rerank':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'bioasqa':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'phenochf':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'toxic':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}]), 'mednli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'snli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'mnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'wnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'qnli':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biolarkgsc_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'copd_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'hpo_entilement':([_trim_transform, _entlmnt_transform, _pad_transform], [{},{},{}]), 'biosses':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'clnclsts':([_trim_transform, _sentsim_transform, _pad_transform], [{},{},{}]), 'cncpt-ddi':([_trim_transform, _sentclf_transform, _pad_transform], [{},{},{}])}
-TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O', 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'chemprot':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'i2b2':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'biolarkgsc':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'meshpubs_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'meshpubs_simsearch':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_rerank':{'binlb': 'mltl%s;'%SC, 'origlb':'preds', 'locallb':'ontoid', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'bioasqa':{'binlb': 'mltl%s;'%SC, 'origlb':'meshMajor', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'snli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'mnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'wnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'qnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biolarkgsc_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'copd_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'hpo_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
+TASK_EXT_PARAMS = {'bc5cdr-chem':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'bc5cdr-dz':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'shareclefe':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O'}, 'copdner':{'ypad_val':'O', 'trimlbs':True, 'mdlcfg':{'maxlen':128}, 'ignored_label':'O', 'lb_coding':'IOBES'}, 'ddi':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'chemprot':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'i2b2':{'mdlcfg':{'maxlen':128}, 'ignored_label':'false'}, 'hoc':{'binlb': OrderedDict([(str(x),x) for x in range(10)]), 'mdlcfg':{'maxlen':128}}, 'biolarkgsc':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'copd':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'phenopubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_siamese':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}}, 'meshpubs_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'meshpubs_simsearch':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'meshpubs_rerank':{'binlb': 'mltl%s;'%SC, 'origlb':'preds', 'locallb':'ontoid', 'reflb':'labels', 'lbtxt':None, 'neglbs':None, 'sent_mode':True, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'bioasqa':{'binlb': 'mltl%s;'%SC, 'origlb':'meshMajor', 'lbtxt':None, 'neglbs':None, 'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'phenochf':{'binlb': 'mltl%s;'%SC, 'mdlcfg':{'maxlen':128}, 'mltl':True}, 'toxic':{'binlb': OrderedDict([(str(x),x) for x in range(6)]), 'mdlcfg':{'maxlen':128}}, 'mednli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'snli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'mnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'wnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'qnli':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biolarkgsc_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'copd_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'hpo_entilement':{'mdlcfg':{'sentsim_func':None, 'concat_strategy':None, 'maxlen':128}}, 'biosses':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'clnclsts':{'binlb':'rgrsn', 'mdlcfg':{'sentsim_func':None, 'ymode':'sim', 'loss':'contrastive', 'maxlen':128}, 'ynormfunc':(lambda x: x / 5.0, lambda x: 5.0 * x)}, 'cncpt-ddi':{'mdlcfg':{'maxlen':128}}}
 
 LM_MDL_NAME_MAP = {'bert':'bert-base-uncased', 'gpt2':'gpt2', 'gpt':'openai-gpt', 'trsfmxl':'transfo-xl-wt103', 'elmo':'elmo'}
 LM_PARAMS_MAP = {'bert':'BERT', 'gpt2':'GPT-2', 'gpt':'GPT', 'trsfmxl':'TransformXL', 'elmo':'ELMo'}
@@ -2556,7 +2625,7 @@ def classify(dev_id=None):
     if task_type == 'nmt':
         ds_kwargs.update({'lb_coding':task_extparms.setdefault('lb_coding', 'IOB')})
     elif task_type == 'entlmnt':
-        ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'lbtxt', 'neglbs'] if k in task_extparms))
+        ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'lbtxt', 'neglbs', 'reflb'] if k in task_extparms))
     elif task_type == 'sentsim':
         ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
     if task_dstype in [OntoDataset, OntoIterDataset]:
@@ -2657,6 +2726,16 @@ def classify(dev_id=None):
     eval(clf, dev_loader, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
     if opts.traindev: train(clf, optimizer, dev_loader, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb)
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
+
+
+def mltphz_clf(dev_id=None):
+    cfg_kwargs = {} if opts.cfg is None else ast.literal_eval(opts.cfg)
+    common_cfg_kwargs = dict([(k, v) for k, v in cfg_kwargs.items() if k != 'phases'])
+    _update_cfgs(common_cfg_kwargs)
+    for cfgs in cfg_kwargs['phases']:
+        _update_cfgs(cfgs)
+        classify(dev_id=dev_id)
+        setattr(opts, 'resume', '%s_%s.pth' % (opts.task, opts.model))
 
 
 def multi_clf(dev_id=None):
@@ -3122,7 +3201,7 @@ def rerank(dev_id=None):
     trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
     trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
     ds_kwargs = {'ynormfunc':task_extparms.setdefault('ynormfunc', None)}
-    ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'locallb', 'lbtxt', 'neglbs'] if k in task_extparms))
+    ds_kwargs.update(dict((k, task_extparms[k]) for k in ['origlb', 'locallb', 'lbtxt', 'neglbs', 'reflb', 'sent_mode'] if k in task_extparms))
     if task_dstype in [OntoDataset, OntoIterDataset]:
         ds_kwargs['onto_fpath'] = opts.onto if opts.onto else task_extparms.setdefault('onto_fpath', 'onto.csv')
         ds_kwargs['onto_col'] = task_cols['ontoid']
@@ -3138,7 +3217,7 @@ def rerank(dev_id=None):
             print(e)
     prv_task_params = copy.deepcopy(clf.task_params)
     # Update parameters
-    clf.update_params(task_params=task_params)
+    clf.update_params(task_params=task_params, sample_weights=False)
     if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
 
     # Prepare dev and test sets
@@ -3156,11 +3235,12 @@ def rerank(dev_id=None):
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
-
 def main():
     if any(opts.task == t for t in ['bc5cdr-chem', 'bc5cdr-dz', 'shareclefe', 'copdner', 'ddi', 'chemprot', 'i2b2', 'hoc', 'biolarkgsc', 'copd', 'phenopubs', 'meshpubs', 'meshpubs_entilement', 'bioasqa', 'phenochf', 'toxic', 'mednli', 'snli', 'mnli', 'wnli', 'qnli', 'biolarkgsc_entilement', 'copd_entilement', 'hpo_entilement', 'biosses', 'clnclsts', 'cncpt-ddi']):
         if (opts.method == 'classify'):
             main_func = classify
+        elif (opts.method == 'mltphz'):
+            main_func = mltphz_clf
         elif (opts.method == 'multiclf'):
             main_func = multi_clf
         elif (opts.method == 'simrank'):
@@ -3172,16 +3252,8 @@ def main():
     else:
         return
     # Update config
-    cfg_kwargs = {} if opts.cfg is None else ast.literal_eval(opts.cfg)
-    global_vars = globals()
-    for glb, glbvs in cfg_kwargs.items():
-        if glb in global_vars:
-            for cfgk in [opts.task, opts.model, opts.method]:
-                if cfgk in global_vars[glb]:
-                    if type(global_vars[glb][cfgk]) is dict:
-                        global_vars[glb][cfgk].update(glbvs)
-                    else:
-                        global_vars[glb][cfgk] = glbvs
+    cfg_kwargs = {} if opts.cfg is None or opts.method == 'mltphz' else ast.literal_eval(opts.cfg)
+    _update_cfgs(cfg_kwargs)
 
     if (opts.distrb):
         global DATA_PATH
