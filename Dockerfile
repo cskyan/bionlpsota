@@ -41,7 +41,8 @@ RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-
         python${PYTHON_VERSION}-dev \
         librdmacm1 \
         libibverbs1 \
-        ibverbs-providers
+        ibverbs-providers \
+        libopenblas-dev
 
 # Get rid of the debconf messages
 RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
@@ -106,6 +107,13 @@ RUN python -c "import nltk; nltk.download('popular')"
 RUN python -m spacy download en_core_web_sm
 RUN pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.2.4/en_core_sci_md-0.2.4.tar.gz
 RUN pip install pytorch_pretrained_bert transformers
+
+# Install Faiss
+RUN git clone https://github.com/facebookresearch/faiss.git /tmp/faiss && \
+    cd /tmp/faiss && \
+    ./configure --with-cuda=/usr/local/cuda && make -j $(nproc) && make install && \
+    make -j $(nproc) -C python && make -C python install && \
+    rm -rf /tmp/faiss
 
 # Install Open MPI
 RUN mkdir /tmp/openmpi && \
