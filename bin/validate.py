@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, ast, time, copy, random, pickle, logging, itertools
+import os, sys, ast, time, copy, random, pickle, string, logging, itertools
 from collections import OrderedDict
 from optparse import OptionParser
 from tqdm import tqdm
@@ -49,6 +49,7 @@ except Exception as e:
         nlp = spacy.load('en_core_web_sm')
 
 from bionlp.util import io, system
+from bionlp.nlp import AdvancedCountVectorizer, AdvancedTfidfVectorizer
 
 
 FILE_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -77,17 +78,17 @@ class BaseShell():
         use_gpu = next(self.model.parameters()).is_cuda
         batch_size, n_jobs, droplast = kwargs.setdefault('bsize', 16), kwargs.setdefault('n_jobs', 1), kwargs.setdefault('droplast', False)
         ds = ShellDataset(inputs[0], encode_func=self.encode_func, tokenizer=self.tokenizer, transforms=self.transforms, transforms_args=self.transforms_args, transforms_kwargs=self.transforms_kwargs)
+        if isinstance(self.model, BERTClfHead) or type(self.model) is DataParallel and isinstance(self.model.module, BERTClfHead): ds = MaskedLMIterDataset(ds) if isinstance(ds, BaseIterDataset) else MaskedLMDataset(ds)
         ds_loader = DataLoader(ds, batch_size=batch_size, shuffle=False, sampler=None, num_workers=n_jobs, drop_last=droplast)
         clf_tknids = self.special_tknids_args['clf_tknids']
         clf_h = []
         for step, batch in enumerate(tqdm(ds_loader, desc='[Totally %i samples] Retrieving predictions/embeddings' % len(ds))):
-            if type(batch) is torch.Tensor:
-                tkns_tnsr = batch.to('cuda') if use_gpu else batch
-            else:
-                pass
+            idx, tkns_tnsr, lb_tnsr = batch[:3]
+            extra_inputs = batch[3:]
             mask_tnsr = (~tkns_tnsr.eq(self.pad_val * torch.ones_like(tkns_tnsr))).long()
             pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-            h = self.model(tkns_tnsr, mask_tnsr if isinstance(self.model, BERTClfHead) else pool_idx, embedding_mode=kwargs.setdefault('embedding_mode', False))
+            if use_gpu: tkns_tnsr, pool_idx, mask_tnsr, extra_inputs = tkns_tnsr.to('cuda'), pool_idx.to('cuda'), mask_tnsr.to('cuda'), tuple([x.to('cuda') for x in extra_inputs])
+            h = self.model(tkns_tnsr, mask_tnsr if isinstance(self.model, BERTClfHead) or type(self.model) is DataParallel and isinstance(self.model.module, BERTClfHead) else pool_idx, *extra_inputs, embedding_mode=kwargs.setdefault('embedding_mode', False))
             clf_h.append(h.detach().cpu().view(tkns_tnsr.size(0), -1))
             del tkns_tnsr, mask_tnsr, pool_idx, h
         return torch.cat(clf_h, dim=0)
@@ -432,7 +433,6 @@ class BERTClfHead(BaseClfHead):
 
     def __init_linear__(self):
         use_gpu = next(self.parameters()).is_cuda
-        self.hdim = self.dim_mulriple * self.n_embd if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
         linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.fchdim), self._int_actvtn(), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
         return linear.to('cuda') if use_gpu else linear
 
@@ -476,6 +476,7 @@ class OntoBERTClfHead(BERTClfHead):
         config.output_hidden_states = True
         output_layer = list(range(config.num_hidden_layers))
         BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
+        self.num_attention_heads = config.num_attention_heads
         self.onto = pd.read_csv(onto, sep=kwargs.setdefault('sep', '\t'), index_col='id')
         self.embeddim = embeddim
         self.embedding = nn.Embedding(self.onto.shape[0]+1, embeddim)
@@ -488,10 +489,17 @@ class OntoBERTClfHead(BERTClfHead):
             self.layer_pooler = TransformerLayerWeightedReduce(reduction=layer_pooler)
         self.att2spans = nn.Linear(self.maxlen, 2)
 
-    def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, ret_ftspans=False, ret_attention=False):
+    def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, embedding_mode=False, ret_ftspans=False, ret_attention=False):
         use_gpu = next(self.parameters()).is_cuda
         sample_weights = extra_inputs[0] if self.sample_weights and len(extra_inputs) > 0 else None
-        outputs = BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights)
+        if embedding_mode:
+            extra_inputs = list(extra_inputs)
+            extra_inputs.insert(1 if self.sample_weights else 0, torch.zeros(input_ids.size()[0], dtype=torch.long).to('cuda') if use_gpu else torch.zeros(input_ids.size()[0], dtype=torch.long))
+            extra_inputs = tuple(extra_inputs)
+        outputs = BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights, embedding_mode=embedding_mode)
+        setattr(self, 'num_attention_heads', 12)
+        sys.stdout.flush()
+        if embedding_mode: return outputs[:,:int(-self.hdim/(self.num_attention_heads+1))]
         if (labels is None):
             clf_logits, all_attentions, pooled_attentions = outputs
             outputs = clf_logits
@@ -1383,6 +1391,7 @@ class BaseDataset(DatasetInterface, Dataset):
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
         # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
         self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        print('Input DataFrame size: %s' % str(self.df.shape))
         if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
         self.df.columns = self.df.columns.astype(str, copy=False)
         self.mltl = mltl
@@ -1511,11 +1520,11 @@ class MaskedLMDataset(BaseDataset):
 
     def __init__(self, dataset, special_tknids=[101, 102, 102, 103], masked_lm_prob=0.15):
         self._ds = dataset
-        self.text_col = self._ds.text_col
-        self.label_col = self._ds.label_col
-        self.mltl = self._ds.mltl
-        self.binlb = self._ds.binlb
-        self.binlbr = self._ds.binlbr
+        self.text_col = self._ds.text_col if hasattr(self._ds, 'text_col') else None
+        self.label_col = self._ds.label_col if hasattr(self._ds, 'label_col') else None
+        self.mltl = self._ds.mltl if hasattr(self._ds, 'mltl') else None
+        self.binlb = self._ds.binlb if hasattr(self._ds, 'binlb') else None
+        self.binlbr = self._ds.binlbr if hasattr(self._ds, 'binlbr') else None
         self.encode_func = self._ds.encode_func
         self.tokenizer = self._ds.tokenizer
         self.vocab_size = self._ds.vocab_size
@@ -1592,6 +1601,10 @@ class ShellDataset(BaseDataset):
         self.text = [text] if type(text) is str else list(text)
         self.encode_func = encode_func
         self.tokenizer = tokenizer
+        if hasattr(tokenizer, 'vocab'):
+            self.vocab_size = len(tokenizer.vocab)
+        elif hasattr(tokenizer, 'vocab_size'):
+            self.vocab_size = tokenizer.vocab_size
         self.transforms = transforms
         self.transforms_args = transforms_args
         self.transforms_kwargs = transforms_kwargs
@@ -1603,7 +1616,7 @@ class ShellDataset(BaseDataset):
         text = self.text[idx]
         sample = self.encode_func(text, self.tokenizer), None
         sample = self._transform_chain(sample)
-        return sample[0] if type(sample[0]) is str or (type(sample[0]) is list and type(sample[0][0]) is str) else torch.tensor(sample[0])
+        return (idx, sample[0] if type(sample[0]) is str or (type(sample[0]) is list and type(sample[0][0]) is str) else torch.tensor(sample[0]), torch.tensor(0))
 
 
 class EmbeddingDataset(BaseDataset):
@@ -1642,6 +1655,7 @@ class OntoDataset(BaseDataset):
     def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
         super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
         self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
+        print('Ontology DataFrame size: %s' % str(self.onto.shape))
         self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         self.onto_col = onto_col
 
@@ -2123,12 +2137,15 @@ def _update_cfgs(cfgs):
     global_vars = globals()
     for glb, glbvs in cfgs.items():
         if glb in global_vars:
-            for cfgk in [opts.task, opts.model, opts.method]:
-                if cfgk in global_vars[glb]:
-                    if type(global_vars[glb][cfgk]) is dict:
-                        global_vars[glb][cfgk].update(glbvs)
-                    else:
-                        global_vars[glb][cfgk] = glbvs
+            if type(global_vars[glb]) is dict:
+                for cfgk in [opts.task, opts.model, opts.method]:
+                    if cfgk in global_vars[glb]:
+                        if type(global_vars[glb][cfgk]) is dict:
+                            global_vars[glb][cfgk].update(glbvs)
+                        else:
+                            global_vars[glb][cfgk] = glbvs
+            else:
+                global_vars[glb] = glbvs
 
 
 def elmo_config(options_path, weights_path, elmoedim=1024, dropout=0.5):
@@ -2209,7 +2226,7 @@ RGRSN_LOSS_MAP = {'mse':MSELoss, 'contrastive':ContrastiveLoss, 'huber':HuberLos
 SIM_FUNC_MAP = {'sim':'sim', 'dist':'dist'}
 CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
 CNSTRNTS_MAP = {'hrch':(HrchConstraint, {('num_lbs','num_lbs'):1, ('hrchrel_path','hrchrel_path'):'hpo_ancrels.pkl', ('binlb','binlb'):{}})}
-SHELL_MAP = {'bert':BaseShell, 'gpt':BaseShell, 'gpt2':BaseShell}
+SHELL_MAP = {'bert':BaseShell, 'gpt':BaseShell, 'gpt2':BaseShell, 'bert_onto':BaseShell}
 
 
 def gen_pytorch_wrapper(mdl_type, mdl_name, **kwargs):
@@ -2729,7 +2746,7 @@ def classify(dev_id=None):
 
 
 def mltphz_clf(dev_id=None):
-    cfg_kwargs = {} if opts.cfg is None else ast.literal_eval(opts.cfg)
+    cfg_kwargs = opts.cfg
     common_cfg_kwargs = dict([(k, v) for k, v in cfg_kwargs.items() if k != 'phases'])
     _update_cfgs(common_cfg_kwargs)
     for cfgs in cfg_kwargs['phases']:
@@ -2886,7 +2903,7 @@ def multi_clf(dev_id=None):
 
 
 def siamese_rank(dev_id=None):
-    '''Predict candidate labels using pre-trained model and rank the predictions using siamese network, assuming that each label has a gold standard sample'''
+    '''Predict candidate labels from all available ones using pre-trained model and rank the predictions using siamese network, assuming that each label has a gold standard sample'''
     print('### Siamese Rank Mode ###')
     orig_task = opts.task
     opts.task = opts.task + '_siamese'
@@ -3012,8 +3029,8 @@ def siamese_rank(dev_id=None):
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
-def simsearch(dev_id=None):
-    print('### Search Re-rank Mode ###')
+def simsearch_smsrerank(dev_id=None):
+    print('### Search Siamese Re-rank Mode ###')
     orig_task = opts.task
     opts.task = opts.task + '_simsearch'
     # Prepare model related meta data
@@ -3056,10 +3073,10 @@ def simsearch(dev_id=None):
     print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     del ds_kwargs['ynormfunc']
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
+    if mdl_name == 'bert': dev_ds = MaskedLMIterDataset(dev_ds) if isinstance(dev_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
+    if mdl_name == 'bert': test_ds = MaskedLMIterDataset(test_ds) if isinstance(test_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     lbnotes_fname, lb_embd_fname, lb_embd_raw_fname = 'lbnotes.csv', 'onto_embd.pkl', 'onto_embd_raw.pkl'
@@ -3179,6 +3196,217 @@ def simsearch(dev_id=None):
             pickle.dump(plot_data, fd)
 
 
+def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecomp='pca', ftmdl=None, n_components=128, saved_path='.', prefix='corpus', **kwargs):
+    print('Converting text to vectors with parameters: %s; %s' % (str(dict(concat=concat, txt_vctrz=txt_vctrz, ftdecomp=ftdecomp, ftmdl=ftmdl, n_components=n_components, prefix=prefix, saved_path=saved_path)), str(kwargs)))
+    concat_tfidf, concat_chartfidf, concat_bm25 = concat[:3] if type(concat) is list and len(concat) >=3 else [concat] * 3
+    concat_tfidf, concat_chartfidf, concat_bm25 = tuple([True if x or type(x) is str and x.lower() == 'true' else False for x in [concat_tfidf, concat_chartfidf, concat_bm25]])
+    print('Concat with previous hidden states in TFIDF/ChrTFIDF/BM25: %s/%s/%s' % (concat_tfidf, concat_chartfidf, concat_bm25))
+    from scipy.sparse import csr_matrix, hstack, issparse
+    if opts.sentvec_path and os.path.isfile(opts.sentvec_path):
+        import sent2vec
+        sentvec_model = sent2vec.Sent2vecModel()
+        sentvec_model.load_model(opts.sentvec_path)
+        sentvec = sentvec_model.embed_sentences(texts)
+        print('Sentence vector dimension of dataset %s: %i' % (prefix, sentvec.shape[1]))
+        clf_h = hstack((csr_matrix(clf_h), txt_X)) if concat_tfidf else sentvec
+    if opts.do_tfidf:
+        tfidf_cache_fpath = os.path.join(saved_path, '%s_tfidf.pkl' % prefix)
+        if os.path.exists(tfidf_cache_fpath):
+            with open(tfidf_cache_fpath, 'rb') as fd:
+                txt_X, txt_vctrz = pickle.load(fd)
+        else:
+            if txt_vctrz is None:
+                binary = (ftdecomp=='svd' or kwargs.setdefault('binary', False))
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                # txt_vctrz = AdvancedCountVectorizer(stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('ngram', (1,2)), binary=binary, dtype='int8' if binary else 'int32', lemma=kwargs.setdefault('lemma', False), stem=kwargs.setdefault('stem', False), synonym=kwargs.setdefault('synonym', False), keep_orig=kwargs.setdefault('keep_orig', False))
+                txt_vctrz = AdvancedTfidfVectorizer(stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('ngram', (1,2)), binary=binary, dtype='float32', use_idf=kwargs.setdefault('use_idf', True), sublinear_tf=kwargs.setdefault('sublinear_tf', False), lemma=kwargs.setdefault('lemma', False), stem=kwargs.setdefault('stem', False), phraser_fpath=kwargs.setdefault('phraser', False), keep_orig=kwargs.setdefault('keep_orig', False))
+                txt_X = txt_vctrz.fit_transform(texts)
+            else:
+                print('Eval mode of TFIDF:')
+                txt_X = txt_vctrz.transform(texts)
+            with open('%s_tfidf.pkl' % prefix, 'wb') as fd:
+                pickle.dump((txt_X, txt_vctrz), fd)
+        print('TFIDF dimension of dataset %s: %i' % (prefix, txt_X.shape[1]))
+        clf_h = hstack((csr_matrix(clf_h), txt_X)) if concat_tfidf else txt_X
+    if opts.do_chartfidf:
+        chartfidf_cache_fpath = os.path.join(saved_path, '%s_chartfidf.pkl' % prefix)
+        if os.path.exists(chartfidf_cache_fpath):
+            with open(chartfidf_cache_fpath, 'rb') as fd:
+                char_X, char_vctrz = pickle.load(fd)
+        else:
+            if char_vctrz is None:
+                binary = (ftdecomp=='svd' or kwargs.setdefault('binary', False))
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                # char_vctrz = CountVectorizer(analyzer=kwargs.setdefault('char_analyzer', 'char_wb'), stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('char_ngram', (2,6)), binary=binary, dtype='int8' if binary else 'int32')
+                char_vctrz = TfidfVectorizer(analyzer=kwargs.setdefault('char_analyzer', 'char_wb'), stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('char_ngram', (2,6)), binary=binary, dtype='float32', use_idf=kwargs.setdefault('use_idf', True), sublinear_tf=kwargs.setdefault('sublinear_tf', False))
+                char_X = char_vctrz.fit_transform(texts)
+            else:
+                print('Eval mode of Char TFIDF:')
+                char_X = char_vctrz.transform(texts)
+            with open('%s_chartfidf.pkl' % prefix, 'wb') as fd:
+                pickle.dump((char_X, char_vctrz), fd)
+        print('Char TFIDF dimension of dataset %s: %i' % (prefix, char_X.shape[1]))
+        clf_h = hstack((csr_matrix(clf_h), char_X)) if concat_chartfidf else char_X
+    if opts.do_bm25:
+        bm25_cache_fpath = os.path.join(saved_path, '%s_bm25.pkl' % prefix)
+        if os.path.exists(bm25_cache_fpath):
+            with open(bm25_cache_fpath, 'rb') as fd:
+                txt_bm25_X = pickle.load(fd)
+        else:
+            from gensim.summarization.bm25 import get_bm25_weights
+            txt_bm25_X = np.array(get_bm25_weights(texts, n_jobs=opts.np))
+            with open('%s_bm25.pkl' % prefix, 'wb') as fd:
+                pickle.dump(txt_bm25_X, fd)
+        print('BM25 dimension of dataset %s: %i' % (prefix, txt_bm25_X.shape[1]))
+        clf_h = hstack((csr_matrix(clf_h), txt_bm25_X)) if concat_bm25 else txt_bm25_X
+    if type(ftdecomp) is str: ftdecomp = ftdecomp.lower()
+    if issparse(clf_h) and ftdecomp != 'svd': clf_h = clf_h.toarray()
+    # Feature reduction
+    if ftdecomp is None or type(ftdecomp) is str and ftdecomp.lower() == 'none' or n_components >= clf_h.shape[1]: return clf_h, txt_vctrz, char_vctrz, None
+    if ftmdl is None:
+        if ftdecomp == 'pca':
+            from sklearn.decomposition import PCA
+            ftmdl = PCA(n_components=min(n_components, clf_h.shape[0]))
+        elif ftdecomp == 'svd':
+            from sklearn.decomposition import TruncatedSVD
+            ftmdl = TruncatedSVD(n_components=n_components)
+        print('Using %s feature reduction...' % ftdecomp.upper())
+        clf_h = ftmdl.fit_transform(clf_h).astype('float32')
+    else:
+        print('Eval mode of feature reduction:')
+        clf_h = ftmdl.transform(clf_h).astype('float32')
+    return clf_h, txt_vctrz, char_vctrz, ftmdl
+
+
+def simsearch(dev_id=None):
+    print('### Similarity Search Mode ###')
+    orig_task = opts.task
+    opts.task = opts.task + '_simsearch'
+    # Prepare model related meta data
+    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    common_cfg = cfgr('validate', 'common')
+    pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
+    params = pr('LM', LM_PARAMS_MAP[mdl_name]) if mdl_name != 'none' else {}
+    use_gpu = dev_id is not None
+    encode_func = ENCODE_FUNC_MAP[mdl_name]
+    tokenizer = TKNZR_MAP[mdl_name].from_pretrained(params['pretrained_vocab_path'] if 'pretrained_vocab_path' in params else LM_MDL_NAME_MAP[mdl_name]) if TKNZR_MAP[mdl_name] else None
+    task_type = 'sentsim' #TASK_TYPE_MAP[opts.task]
+    special_tkns = (['start_tknids', 'clf_tknids', 'delim_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:3]) if task_type in ['entlmnt', 'sentsim'] else (['start_tknids', 'clf_tknids'], LM_TKNZ_EXTRA_CHAR.setdefault(mdl_name, ['_@_', ' _$_', ' _#_'])[:2])
+    special_tknids = _adjust_encoder(mdl_name, tokenizer, special_tkns[1], ret_list=True)
+    special_tknids_args = dict(zip(special_tkns[0], special_tknids))
+    task_trsfm_kwargs = dict(list(zip(special_tkns[0], special_tknids))+[('model',opts.model), ('sentsim_func', opts.sentsim_func), ('seqlen',opts.maxlen)])
+    # Prepare task related meta data
+    task_path, task_dstype, task_cols, task_trsfm, task_extrsfm, task_extparms = opts.input if opts.input and os.path.isdir(os.path.join(DATA_PATH, opts.input)) else TASK_PATH_MAP[opts.task], TASK_DS_MAP[opts.task], TASK_COL_MAP[opts.task], TASK_TRSFM[opts.task], TASK_EXT_TRSFM[opts.task], TASK_EXT_PARAMS[opts.task]
+    trsfms = ([] if opts.model in LM_EMBED_MDL_MAP else task_extrsfm[0]) + (task_trsfm[0] if len(task_trsfm) > 0 else [])
+    trsfms_kwargs = ([] if opts.model in LM_EMBED_MDL_MAP else ([{'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}] if TASK_TYPE_MAP[opts.task]=='nmt' else [{'seqlen':opts.maxlen, 'trimlbs':task_extparms.setdefault('trimlbs', False), 'special_tkns':special_tknids_args}, task_trsfm_kwargs, {'seqlen':opts.maxlen, 'xpad_val':task_extparms.setdefault('xpad_val', 0), 'ypad_val':task_extparms.setdefault('ypad_val', None)}])) + (task_trsfm[1] if len(task_trsfm) >= 2 else [{}] * len(task_trsfm[0]))
+    ds_kwargs = {'sampw':opts.sample_weights, 'sampfrac':opts.sampfrac}
+    ds_kwargs.update({'ynormfunc':task_extparms.setdefault('ynormfunc', None)})
+    task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
+
+    # Load model
+    clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
+    if opts.refresh:
+        print('Refreshing and saving the model with newest code...')
+        try:
+            save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
+        except Exception as e:
+            print(e)
+    prv_task_params = copy.deepcopy(clf.task_params)
+    # Update parameters
+    clf.update_params(task_params=task_params, sample_weights=False)
+    clf.mlt_trnsfmr = False
+    if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
+    model = SHELL_MAP[opts.model](clf, tokenizer=tokenizer, encode_func=encode_func, transforms=trsfms, transforms_kwargs=trsfms_kwargs, special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0))
+
+    # Prepare dev and test sets
+    print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
+    del ds_kwargs['ynormfunc']
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(dev_ds) if isinstance(dev_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
+    dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], ENCODE_FUNC_MAP[mdl_name], tokenizer=tokenizer, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else clf.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
+    if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(test_ds) if isinstance(test_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
+    test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
+
+    corpus_fnames, corpus_embd_fname, corpus_embd_raw_fname = opts.corpus.split(SC) if opts.corpus else ['corpus_df.csv'], 'corpus_embd.pkl', 'corpus_embd_raw.pkl'
+    if os.path.exists(os.path.join(os.path.pardir, corpus_embd_fname)):
+        with open(os.path.join(os.path.pardir, corpus_embd_fname), 'rb') as fd:
+            corpus_embd, labels, txt_vctrz, char_vctrz, ftmdl = pickle.load(fd)
+    else:
+        corpus_df = pd.concat([pd.read_csv(os.path.join(os.path.pardir, fname), sep='\t') for fname in corpus_fnames], axis=0, ignore_index=True).set_index('id')
+        labels = corpus_df['labels']
+        corpus_texts = corpus_df['text'].tolist()
+        corpus_embd_raw_fname = './corpus_embd_raw.pkl'
+        print('Corpus size from file(s) %s: %i' % (corpus_fnames, corpus_df.shape[0]))
+        if os.path.exists(os.path.join(os.path.pardir, corpus_embd_raw_fname)):
+            with open(os.path.join(os.path.pardir, corpus_embd_raw_fname), 'rb') as fd:
+                # corpus_embd_raw, labels = pickle.load(fd)
+                corpus_embd_raw = pickle.load(fd)
+        else:
+            corpus_embd_raw = model(corpus_texts, embedding_mode=True, bsize=opts.bsize).numpy()
+            with open(corpus_embd_raw_fname, 'wb') as fd:
+                pickle.dump(corpus_embd_raw, fd)
+        corpus_embd_raw, txt_vctrz, char_vctrz, ftmdl = _txt2vec(corpus_texts, corpus_embd_raw, concat=opts.cfg.setdefault('concat', True), ftdecomp=opts.cfg.setdefault('ftdecomp', 'pca'), n_components=opts.cfg.setdefault('n_components', 768), saved_path=os.path.pardir, prefix='corpus', **opts.cfg.setdefault('txt2vec_kwargs', {}))
+        corpus_df['embedding'] = [np.array(x).reshape((-1,)) for x in corpus_embd_raw]
+        corpus_embd = {}
+        # One label may has multiple notes
+        for gid, grp in corpus_df['embedding'].groupby('id'):
+            corpus_embd[gid] = grp.mean(axis=0) # averaged embedding
+        with open(corpus_embd_fname, 'wb') as fd:
+            pickle.dump((corpus_embd, labels, txt_vctrz, char_vctrz, ftmdl), fd)
+
+    # Build corpus embedding index
+    corpus_embd_idx_fname = 'corpus_embd_idx.pkl'
+    if os.path.exists(os.path.join(os.path.pardir, corpus_embd_idx_fname)):
+        with open(os.path.join(os.path.pardir, corpus_embd_idx_fname), 'rb') as fd:
+            corpus_embd_idx, indices, rindices = pickle.load(fd)
+    else:
+        import faiss
+        indices = dict([(k, i) for i, k in enumerate(corpus_embd.keys())])
+        rindices = dict([(v, k) for k, v in indices.items()])
+        dimension = next(x for x in corpus_embd.values()).shape[0]
+        print('Building faiss index with dimension %i' % dimension)
+        corpus_embd_idx = faiss.IndexFlatL2(dimension)
+        corpus_embd_idx.add(np.stack(corpus_embd.values()).astype('float32'))
+        # with open(corpus_embd_idx_fname, 'wb') as fd:
+        #     pickle.dump((corpus_embd_idx, indices, rindices), fd)
+    # corpus_embd_idx = faiss.index_cpu_to_all_gpus(corpus_embd_idx)
+
+    import scipy.spatial.distance as spdist
+    embd_clf = EmbeddingHead(clf)
+    for prefix, df in zip(['dev', 'test'], [dev_ds.df, test_ds.df]):
+        txt_corpus = df['text'].tolist()
+        # Calculate the doc/sentence embeddings
+        clf_h_cache_fname = '%s_clf_h.pkl' % prefix
+        if os.path.exists(os.path.join(os.path.pardir, clf_h_cache_fname)):
+            with open(os.path.join(os.path.pardir, clf_h_cache_fname), 'rb') as fd:
+                clf_h = pickle.load(fd)
+        else:
+            clf_h = model(txt_corpus, embedding_mode=True, bsize=opts.bsize).numpy()
+            with open(clf_h_cache_fname, 'wb') as fd:
+                pickle.dump(clf_h, fd)
+        clf_h, _, _, _ = _txt2vec(txt_corpus, clf_h, concat=opts.cfg.setdefault('concat', True), txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, ftdecomp=opts.cfg.setdefault('ftdecomp', 'pca'), ftmdl=ftmdl, n_components=opts.cfg.setdefault('n_components', 768), saved_path=os.path.pardir, prefix=prefix, **opts.cfg.setdefault('txt2vec_kwargs', {}))
+
+        # Search the topk similar labels
+        print('Searching dataset %s with size: %s...' % (prefix, str(clf_h.shape)))
+        clf_h = clf_h.astype('float32')
+        D, I = corpus_embd_idx.search(clf_h[:,:dimension] if clf_h.shape[1] >= dimension else np.hstack((clf_h, np.zeros((clf_h.shape[0], dimension-clf_h.shape[1]), dtype=clf_h.dtype))), opts.topk)
+        cand_preds = [[labels.iloc[idx].split(';') for idx in idxs] for idxs in I]
+        cand_lbs = [sorted(set(itertools.chain.from_iterable(lbs))) for lbs in cand_preds]
+        df['preds'] = [';'.join(lbs) for lbs in cand_lbs]
+        df.to_csv('%s_preds.csv' % prefix, sep='\t')
+
+		# Evaluation
+        from sklearn.preprocessing import MultiLabelBinarizer
+        from bionlp.util import math as imath
+        true_lbs = [lbs_str.split(';') if type(lbs_str) is str and not lbs_str.isspace() else [] for lbs_str in df['labels']]
+        mlb = MultiLabelBinarizer()
+        mlb = mlb.fit(true_lbs + cand_lbs)
+        lbs = mlb.transform(true_lbs)
+        pred_lbs = mlb.transform(cand_lbs)
+        print('exmp-precision: %.3f' % imath.exmp_precision(lbs, pred_lbs) + '\texmp-recall: %.3f' % imath.exmp_recall(lbs, pred_lbs) + '\texmp-f1-score: %.3f' % imath.exmp_fscore(lbs, pred_lbs) + '\n')
+
+
 def rerank(dev_id=None):
     print('### Re-rank Mode ###')
     orig_task = opts.task
@@ -3245,6 +3473,8 @@ def main():
             main_func = multi_clf
         elif (opts.method == 'simrank'):
             main_func = siamese_rank
+        elif (opts.method == 'simsearch_smsrerank'):
+            main_func = simsearch_smsrerank
         elif (opts.method == 'simsearch'):
             main_func = simsearch
         elif (opts.method == 'rerank'):
@@ -3252,8 +3482,11 @@ def main():
     else:
         return
     # Update config
-    cfg_kwargs = {} if opts.cfg is None or opts.method == 'mltphz' else ast.literal_eval(opts.cfg)
+    cfg_kwargs = {} if opts.cfg is None else ast.literal_eval(opts.cfg)
+    opts.cfg = cfg_kwargs
     _update_cfgs(cfg_kwargs)
+    global cfgr
+    cfgr = io.cfg_reader(CONFIG_FILE)
 
     if (opts.distrb):
         global DATA_PATH
@@ -3307,7 +3540,7 @@ if __name__ == '__main__':
     op.add_option('--initln_mean', default=0., action='store', type='float', dest='initln_mean', help='indicate the mean of the parameters in linear model when Initializing')
     op.add_option('--initln_std', default=0.02, action='store', type='float', dest='initln_std', help='indicate the standard deviation of the parameters in linear model when Initializing')
     op.add_option('--weight_class', default=False, action='store_true', dest='weight_class', help='whether to drop the last incompleted batch')
-    op.add_option('--class_weight_factor', default='1', action='store', type='str', dest='clswfac', help='whether to drop the last incompleted batch')
+    op.add_option('--clswfac', default='1', action='store', type='str', dest='clswfac', help='whether to drop the last incompleted batch')
     op.add_option('--droplast', default=False, action='store_true', dest='droplast', help='whether to drop the last incompleted batch')
     op.add_option('--do_norm', default=False, action='store_true', dest='do_norm', help='whether to do normalization')
     op.add_option('--norm_type', default='batch', action='store', dest='norm_type', help='normalization layer class')
@@ -3336,11 +3569,13 @@ if __name__ == '__main__':
     op.add_option('--pthrshld', default=0.5, action='store', type='float', dest='pthrshld', help='indicate the threshold for predictive probabilitiy')
     op.add_option('--topk', default=5, action='store', type='int', dest='topk', help='indicate the top k search parameter')
     op.add_option('--do_tfidf', default=False, action='store_true', dest='do_tfidf', help='whether to use tfidf as text features')
+    op.add_option('--do_chartfidf', default=False, action='store_true', dest='do_chartfidf', help='whether to use charater tfidf as text features')
     op.add_option('--do_bm25', default=False, action='store_true', dest='do_bm25', help='whether to use bm25 as text features')
     op.add_option('--clipmaxn', action='store', type='float', dest='clipmaxn', help='indicate the max norm of the gradients')
     op.add_option('--resume', action='store', dest='resume', help='resume training model file')
     op.add_option('--refresh', default=False, action='store_true', dest='refresh', help='refresh the trained model with newest code')
     op.add_option('--sampw', default=False, action='store_true', dest='sample_weights', help='use sample weights')
+    op.add_option('--corpus', help='corpus data')
     op.add_option('--onto', help='ontology data')
     op.add_option('--pred', help='prediction file')
     op.add_option('-i', '--input', help='input dataset')
