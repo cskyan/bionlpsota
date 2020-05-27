@@ -16,7 +16,12 @@ ENV PYTHON_VERSION=${python}
 ENV JAVA_VERSION=8
 
 # Configure PyLucene version
-ENV PYLUCENE_VERSION=8.1.1
+ENV PYLUCENE_VERSION=8.3.0
+
+# Configure Spacy, SciSpacy and AllenNLP versions
+ENV SPACY_VERSION=2.2.4
+ENV SCISPACY_VERSION=0.2.4
+ENV ALLENNLP_VERSION=1.0.0rc4
 
 # Set default shell to /bin/bash
 SHELL ["/bin/bash", "-cu"]
@@ -98,9 +103,9 @@ RUN pip install pysolr ijson
 
 # Install NLP packages
 RUN pip install tqdm openpyxl pandas scikit-learn && \
-    pip install nltk ftfy spacy
-RUN pip install scispacy
-RUN pip install allennlp
+    pip install nltk ftfy
+RUN pip install spacy==${SPACY_VERSION} scispacy==${SCISPACY_VERSION}
+RUN pip install allennlp==${ALLENNLP_VERSION}
 
 # Install NLP models
 RUN python -c "import nltk; nltk.download('popular')"
