@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, ast, time, copy, random, pickle, string, logging, itertools
+import os, sys, ast, time, copy, random, operator, pickle, string, logging, itertools
 from collections import OrderedDict
 from optparse import OptionParser
 from tqdm import tqdm
@@ -49,7 +49,8 @@ except Exception as e:
         nlp = spacy.load('en_core_web_sm')
 
 from bionlp.util import io, system
-from bionlp.nlp import AdvancedCountVectorizer, AdvancedTfidfVectorizer
+from bionlp.util import math as imath
+from bionlp.nlp import AdvancedCountVectorizer, AdvancedTfidfVectorizer, enrich_txt_by_w2v
 
 
 FILE_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -3196,11 +3197,9 @@ def simsearch_smsrerank(dev_id=None):
             pickle.dump(plot_data, fd)
 
 
-def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecomp='pca', ftmdl=None, n_components=128, saved_path='.', prefix='corpus', **kwargs):
-    print('Converting text to vectors with parameters: %s; %s' % (str(dict(concat=concat, txt_vctrz=txt_vctrz, ftdecomp=ftdecomp, ftmdl=ftmdl, n_components=n_components, prefix=prefix, saved_path=saved_path)), str(kwargs)))
-    concat_tfidf, concat_chartfidf, concat_bm25 = concat[:3] if type(concat) is list and len(concat) >=3 else [concat] * 3
-    concat_tfidf, concat_chartfidf, concat_bm25 = tuple([True if x or type(x) is str and x.lower() == 'true' else False for x in [concat_tfidf, concat_chartfidf, concat_bm25]])
-    print('Concat with previous hidden states in TFIDF/ChrTFIDF/BM25: %s/%s/%s' % (concat_tfidf, concat_chartfidf, concat_bm25))
+def _txt2vec(texts, clf_h=None, txt_vctrz=None, char_vctrz=None, use_tfidf=True, ftdecomp=None, ftmdl=None, n_components=128, saved_path='.', prefix='corpus', **kwargs):
+    extra_outputs = ()
+    print('Converting text to vectors with parameters: %s; %s' % (str(dict(txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, use_tfidf=use_tfidf, ftdecomp=ftdecomp, ftmdl=ftmdl, n_components=n_components, prefix=prefix, saved_path=saved_path)), str(kwargs)))
     from scipy.sparse import csr_matrix, hstack, issparse
     if opts.sentvec_path and os.path.isfile(opts.sentvec_path):
         import sent2vec
@@ -3208,7 +3207,7 @@ def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecom
         sentvec_model.load_model(opts.sentvec_path)
         sentvec = sentvec_model.embed_sentences(texts)
         print('Sentence vector dimension of dataset %s: %i' % (prefix, sentvec.shape[1]))
-        clf_h = hstack((csr_matrix(clf_h), txt_X)) if concat_tfidf else sentvec
+        clf_h = hstack((csr_matrix(clf_h), txt_X)) if clf_h is not None else sentvec
     if opts.do_tfidf:
         tfidf_cache_fpath = os.path.join(saved_path, '%s_tfidf.pkl' % prefix)
         if os.path.exists(tfidf_cache_fpath):
@@ -3217,17 +3216,22 @@ def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecom
         else:
             if txt_vctrz is None:
                 binary = (ftdecomp=='svd' or kwargs.setdefault('binary', False))
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                # txt_vctrz = AdvancedCountVectorizer(stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('ngram', (1,2)), binary=binary, dtype='int8' if binary else 'int32', lemma=kwargs.setdefault('lemma', False), stem=kwargs.setdefault('stem', False), synonym=kwargs.setdefault('synonym', False), keep_orig=kwargs.setdefault('keep_orig', False))
-                txt_vctrz = AdvancedTfidfVectorizer(stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('ngram', (1,2)), binary=binary, dtype='float32', use_idf=kwargs.setdefault('use_idf', True), sublinear_tf=kwargs.setdefault('sublinear_tf', False), lemma=kwargs.setdefault('lemma', False), stem=kwargs.setdefault('stem', False), phraser_fpath=kwargs.setdefault('phraser', False), keep_orig=kwargs.setdefault('keep_orig', False))
+                txt_vctrz = AdvancedTfidfVectorizer(stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('ngram', (1,1)), binary=binary, dtype='float32', use_idf=kwargs.setdefault('use_idf', True), sublinear_tf=kwargs.setdefault('sublinear_tf', False), lemma=kwargs.setdefault('lemma', False), stem=kwargs.setdefault('stem', False), synonym=kwargs.setdefault('synonym', False), w2v_fpath=kwargs.setdefault('w2v_fpath', None), w2v_topk=kwargs.setdefault('w2v_topk', 10), phraser_fpath=kwargs.setdefault('phraser', None), keep_orig=kwargs.setdefault('keep_orig', False)) if use_tfidf else AdvancedCountVectorizer(stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('ngram', (1,1)), binary=binary, dtype='int8' if binary else 'int32', lemma=kwargs.setdefault('lemma', False), stem=kwargs.setdefault('stem', False), synonym=kwargs.setdefault('synonym', False), w2v_fpath=kwargs.setdefault('w2v_fpath', None), w2v_topk=kwargs.setdefault('w2v_topk', 10), phraser_fpath=kwargs.setdefault('phraser', None), keep_orig=kwargs.setdefault('keep_orig', False))
                 txt_X = txt_vctrz.fit_transform(texts)
+                if len(kwargs.setdefault('ngram_weights', {})) == txt_vctrz.get_params()['ngram_range'][1] - txt_vctrz.get_params()['ngram_range'][0] + 1:
+                    ngram_types = np.array(list(map(lambda x: x.count(' ')+1, txt_vctrz.get_feature_names())))
+                    ngram_idx = dict((tp, np.where(ngram_types == tp)[0]) for tp in np.unique(ngram_types))
+                    if all([k in kwargs['ngram_weights'] for k in ngram_idx.keys()]):
+                        norm_weights = imath.normalize(list(kwargs['ngram_weights'].values()))
+                        for i, k in enumerate(kwargs['ngram_weights'].keys()): ngram_idx[k] = (ngram_idx[k], norm_weights[i])
+                        extra_outputs += (ngram_idx,)
             else:
                 print('Eval mode of TFIDF:')
                 txt_X = txt_vctrz.transform(texts)
             with open('%s_tfidf.pkl' % prefix, 'wb') as fd:
                 pickle.dump((txt_X, txt_vctrz), fd)
         print('TFIDF dimension of dataset %s: %i' % (prefix, txt_X.shape[1]))
-        clf_h = hstack((csr_matrix(clf_h), txt_X)) if concat_tfidf else txt_X
+        clf_h = hstack((csr_matrix(clf_h), txt_X)) if clf_h is not None else txt_X
     if opts.do_chartfidf:
         chartfidf_cache_fpath = os.path.join(saved_path, '%s_chartfidf.pkl' % prefix)
         if os.path.exists(chartfidf_cache_fpath):
@@ -3236,17 +3240,22 @@ def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecom
         else:
             if char_vctrz is None:
                 binary = (ftdecomp=='svd' or kwargs.setdefault('binary', False))
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                # char_vctrz = CountVectorizer(analyzer=kwargs.setdefault('char_analyzer', 'char_wb'), stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('char_ngram', (2,6)), binary=binary, dtype='int8' if binary else 'int32')
-                char_vctrz = TfidfVectorizer(analyzer=kwargs.setdefault('char_analyzer', 'char_wb'), stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('char_ngram', (2,6)), binary=binary, dtype='float32', use_idf=kwargs.setdefault('use_idf', True), sublinear_tf=kwargs.setdefault('sublinear_tf', False))
+                char_vctrz = AdvancedTfidfVectorizer(analyzer=kwargs.setdefault('char_analyzer', 'char_wb'), stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('char_ngram', (4,6)), binary=binary, dtype='float32', use_idf=kwargs.setdefault('use_idf', True), sublinear_tf=kwargs.setdefault('sublinear_tf', False)) if use_tfidf else AdvancedCountVectorizer(analyzer=kwargs.setdefault('char_analyzer', 'char_wb'), stop_words=kwargs.setdefault('stop_words', 'english'), ngram_range=kwargs.setdefault('char_ngram', (4,6)), binary=binary, dtype='int8' if binary else 'int32')
                 char_X = char_vctrz.fit_transform(texts)
+                if len(kwargs.setdefault('ngram_weights', {})) == char_vctrz.get_params()['ngram_range'][1] - char_vctrz.get_params()['ngram_range'][0] + 1:
+                    ngram_types = np.array(list(map(lambda x: x.count(' '), char_vctrz.get_feature_names())))
+                    ngram_idx = dict((tp, np.where(ngram_types == tp)[0]) for tp in np.unique(ngram_types))
+                    if all([k in kwargs['ngram_weights'] for k in ngram_idx.keys()]):
+                        norm_weights = imath.normalize(kwargs['ngram_weights'].values())
+                        for i, k in enumerate(kwargs['ngram_weights'].keys()): ngram_idx[k] = (ngram_idx[k], norm_weights[i])
+                        extra_outputs += (ngram_idx,)
             else:
                 print('Eval mode of Char TFIDF:')
                 char_X = char_vctrz.transform(texts)
             with open('%s_chartfidf.pkl' % prefix, 'wb') as fd:
                 pickle.dump((char_X, char_vctrz), fd)
         print('Char TFIDF dimension of dataset %s: %i' % (prefix, char_X.shape[1]))
-        clf_h = hstack((csr_matrix(clf_h), char_X)) if concat_chartfidf else char_X
+        clf_h = hstack((csr_matrix(clf_h), char_X)) if clf_h is not None else char_X
     if opts.do_bm25:
         bm25_cache_fpath = os.path.join(saved_path, '%s_bm25.pkl' % prefix)
         if os.path.exists(bm25_cache_fpath):
@@ -3258,7 +3267,7 @@ def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecom
             with open('%s_bm25.pkl' % prefix, 'wb') as fd:
                 pickle.dump(txt_bm25_X, fd)
         print('BM25 dimension of dataset %s: %i' % (prefix, txt_bm25_X.shape[1]))
-        clf_h = hstack((csr_matrix(clf_h), txt_bm25_X)) if concat_bm25 else txt_bm25_X
+        clf_h = hstack((csr_matrix(clf_h), txt_bm25_X)) if clf_h is not None else txt_bm25_X
     if type(ftdecomp) is str: ftdecomp = ftdecomp.lower()
     if issparse(clf_h) and ftdecomp != 'svd': clf_h = clf_h.toarray()
     # Feature reduction
@@ -3275,11 +3284,72 @@ def _txt2vec(texts, clf_h, concat=True, txt_vctrz=None, char_vctrz=None, ftdecom
     else:
         print('Eval mode of feature reduction:')
         clf_h = ftmdl.transform(clf_h).astype('float32')
-    return clf_h, txt_vctrz, char_vctrz, ftmdl
+    return (clf_h, txt_vctrz, char_vctrz, ftmdl) + extra_outputs
 
 
 def simsearch(dev_id=None):
     print('### Similarity Search Mode ###')
+    dict_fname, term_embd_fname = opts.corpus if opts.corpus else 'dict_df.csv', 'term_embd.pkl'
+    if os.path.exists(os.path.join(os.path.pardir, term_embd_fname)):
+        with open(os.path.join(os.path.pardir, term_embd_fname), 'rb') as fd:
+            term_embd, term_labels, txt_vctrz, char_vctrz, ftmdl = pickle.load(fd)
+    else:
+        dict_df = pd.read_csv(os.path.join(os.path.pardir, dict_fname), sep='\t').set_index('id')
+        term_labels, term_texts, term_types = zip(*[(idx, v, k) for idx, row in dict_df.iterrows() for k, v in row.items() if v is not np.nan])
+        print('Corpus size from file %s: %i' % (dict_fname, dict_df.shape[0]))
+        txt2vec_output = _txt2vec(term_texts, None, use_tfidf=opts.cfg.setdefault('use_tfidf', False), ftdecomp=None, saved_path=os.path.pardir, prefix='dict', **opts.cfg.setdefault('txt2vec_kwargs', {}))
+        term_embd, txt_vctrz, char_vctrz, ftmdl = txt2vec_output[:4]
+        feature_weights = txt2vec_output[4:]
+        with open(term_embd_fname, 'wb') as fd:
+            pickle.dump((term_embd, term_labels, txt_vctrz, char_vctrz, ftmdl), fd, protocol=4)
+
+    # Build dictionary embedding index
+    dict_embd_idx_fname = 'dict_embd_idx.pkl'
+    if os.path.exists(os.path.join(os.path.pardir, dict_embd_idx_fname)):
+        with open(os.path.join(os.path.pardir, dict_embd_idx_fname), 'rb') as fd:
+            dict_embd_idx = pickle.load(fd)
+    else:
+        import faiss
+        dimension = term_embd.shape[1]
+        print('Building faiss index with dimension %i' % dimension)
+        # dict_embd_idx = faiss.IndexFlatL2(dimension)
+        from bionlp.util.math import VectorDB
+        # dict_embd_idx = VectorDB(metric=lambda x, y: np.sqrt(np.sum(np.square(x*y-y)))/np.sqrt(np.sum(np.square(y))), feature_weights=feature_weights)
+        dict_embd_idx = VectorDB(metric=lambda x, y: np.sum(np.abs(x*y-y))/np.sum(y), feature_weights=feature_weights)
+        dict_embd_idx.add(term_embd.astype('float32'))
+        # with open(dict_embd_idx_fname, 'wb') as fd:
+        #     pickle.dump((dict_embd_idx), fd)
+    # dict_embd_idx = faiss.index_cpu_to_all_gpus(dict_embd_idx)
+
+    dev_df, test_df = pd.read_csv(os.path.join(DATA_PATH, opts.input, 'dev.%s' % opts.fmt), sep='\t', index_col='id'), pd.read_csv(os.path.join(DATA_PATH, opts.input, 'test.%s' % opts.fmt), sep='\t')
+    w2v_cache = None
+    for prefix, df in zip(['dev', 'test'], [dev_df, test_df]):
+        txt_corpus = df['text'].tolist()
+        enriched_texts, w2v_cache = enrich_txt_by_w2v(txt_corpus, w2v_model=opts.cfg.setdefault('w2v_model', None), w2v_cache=w2v_cache, topk=opts.cfg.setdefault('txt2vec_kwargs', {}).setdefault('w2v_topk', 10))
+        clf_h, _, _, _ = _txt2vec(enriched_texts, None, txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, use_tfidf=opts.cfg.setdefault('use_tfidf', False), ftdecomp=None, saved_path=os.path.pardir, prefix=prefix, **opts.cfg.setdefault('txt2vec_kwargs', {}))
+
+        # Search the topk similar labels
+        print('Searching dataset %s with size: %s...' % (prefix, str(clf_h.shape)))
+        clf_h = clf_h.astype('float32')
+        D, I = dict_embd_idx.search(clf_h[:,:dimension] if clf_h.shape[1] >= dimension else np.hstack((clf_h, np.zeros((clf_h.shape[0], dimension-clf_h.shape[1]), dtype=clf_h.dtype))), opts.topk, n_jobs=opts.np)
+        cand_preds = [[term_labels[idx] for idx in idxs] for idxs in I]
+        cand_lbs = [sorted(set(lbs)) for lbs in cand_preds]
+        df['preds'] = [';'.join(lbs) for lbs in cand_lbs]
+        df.to_csv('%s_preds.csv' % prefix, sep='\t')
+
+		# Evaluation
+        from sklearn.preprocessing import MultiLabelBinarizer
+        from bionlp.util import math as imath
+        true_lbs = [lbs_str.split(';') if type(lbs_str) is str and not lbs_str.isspace() else [] for lbs_str in df['labels']]
+        mlb = MultiLabelBinarizer()
+        mlb = mlb.fit(true_lbs + cand_lbs)
+        lbs = mlb.transform(true_lbs)
+        pred_lbs = mlb.transform(cand_lbs)
+        print('exmp-precision: %.3f' % imath.exmp_precision(lbs, pred_lbs) + '\texmp-recall: %.3f' % imath.exmp_recall(lbs, pred_lbs) + '\texmp-f1-score: %.3f' % imath.exmp_fscore(lbs, pred_lbs) + '\n')
+
+
+def simsearch_sentembd(dev_id=None):
+    print('### Similarity Search Mode using sentence embedding ###')
     orig_task = opts.task
     opts.task = opts.task + '_simsearch'
     # Prepare model related meta data
@@ -3340,13 +3410,12 @@ def simsearch(dev_id=None):
         print('Corpus size from file(s) %s: %i' % (corpus_fnames, corpus_df.shape[0]))
         if os.path.exists(os.path.join(os.path.pardir, corpus_embd_raw_fname)):
             with open(os.path.join(os.path.pardir, corpus_embd_raw_fname), 'rb') as fd:
-                # corpus_embd_raw, labels = pickle.load(fd)
                 corpus_embd_raw = pickle.load(fd)
         else:
             corpus_embd_raw = model(corpus_texts, embedding_mode=True, bsize=opts.bsize).numpy()
             with open(corpus_embd_raw_fname, 'wb') as fd:
                 pickle.dump(corpus_embd_raw, fd)
-        corpus_embd_raw, txt_vctrz, char_vctrz, ftmdl = _txt2vec(corpus_texts, corpus_embd_raw, concat=opts.cfg.setdefault('concat', True), ftdecomp=opts.cfg.setdefault('ftdecomp', 'pca'), n_components=opts.cfg.setdefault('n_components', 768), saved_path=os.path.pardir, prefix='corpus', **opts.cfg.setdefault('txt2vec_kwargs', {}))
+        corpus_embd_raw, txt_vctrz, char_vctrz, ftmdl = _txt2vec(corpus_texts, corpus_embd_raw if opts.cfg.setdefault('clf_h', True) else None, use_tfidf=opts.cfg.setdefault('use_tfidf', True), ftdecomp=opts.cfg.setdefault('ftdecomp', 'pca'), n_components=opts.cfg.setdefault('n_components', 768), saved_path=os.path.pardir, prefix='corpus', **opts.cfg.setdefault('txt2vec_kwargs', {}))
         corpus_df['embedding'] = [np.array(x).reshape((-1,)) for x in corpus_embd_raw]
         corpus_embd = {}
         # One label may has multiple notes
@@ -3372,7 +3441,6 @@ def simsearch(dev_id=None):
         #     pickle.dump((corpus_embd_idx, indices, rindices), fd)
     # corpus_embd_idx = faiss.index_cpu_to_all_gpus(corpus_embd_idx)
 
-    import scipy.spatial.distance as spdist
     embd_clf = EmbeddingHead(clf)
     for prefix, df in zip(['dev', 'test'], [dev_ds.df, test_ds.df]):
         txt_corpus = df['text'].tolist()
@@ -3385,7 +3453,7 @@ def simsearch(dev_id=None):
             clf_h = model(txt_corpus, embedding_mode=True, bsize=opts.bsize).numpy()
             with open(clf_h_cache_fname, 'wb') as fd:
                 pickle.dump(clf_h, fd)
-        clf_h, _, _, _ = _txt2vec(txt_corpus, clf_h, concat=opts.cfg.setdefault('concat', True), txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, ftdecomp=opts.cfg.setdefault('ftdecomp', 'pca'), ftmdl=ftmdl, n_components=opts.cfg.setdefault('n_components', 768), saved_path=os.path.pardir, prefix=prefix, **opts.cfg.setdefault('txt2vec_kwargs', {}))
+        clf_h, _, _, _ = _txt2vec(txt_corpus, clf_h if opts.cfg.setdefault('clf_h', True) else None, txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, use_tfidf=opts.cfg.setdefault('use_tfidf', True), ftdecomp=opts.cfg.setdefault('ftdecomp', 'pca'), ftmdl=ftmdl, n_components=opts.cfg.setdefault('n_components', 768), saved_path=os.path.pardir, prefix=prefix, **opts.cfg.setdefault('txt2vec_kwargs', {}))
 
         # Search the topk similar labels
         print('Searching dataset %s with size: %s...' % (prefix, str(clf_h.shape)))
