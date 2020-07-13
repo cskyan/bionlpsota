@@ -1,0 +1,29 @@
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  entrypoint: "bash"
+  args: ["-c", "docker login --username=${_DOCKER_HUB_USER} --password=${_DOCKER_HUB_PASSWD}"]
+- name: 'gcr.io/cloud-builders/docker'
+  entrypoint: 'bash'
+  args: ["-c", "echo \"docker pull return status $((`docker pull ${_DOCKER_HUB_USER}/${_IMAGE_REPO_NAME}:${_CACHED_IMAGE_TAG} >/dev/null 2>&1`))\""]
+- name: "gcr.io/cloud-builders/docker"
+  args: ["build", "-f", "${_DOCKER_FILE}", "-t", "${_DOCKER_HUB_USER}/${_IMAGE_REPO_NAME}:${_IMAGE_TAG}", "--cache-from", "${_DOCKER_HUB_USER}/${_IMAGE_REPO_NAME}:${_CACHED_IMAGE_TAG}", "."]
+  timeout: 24h
+- name: "gcr.io/cloud-builders/docker"
+  entrypoint: "bash"
+  args: ["-c", "docker login --username=${_DOCKER_HUB_USER} --password=${_DOCKER_HUB_PASSWD}"]
+- name: "gcr.io/cloud-builders/docker"
+  entrypoint: "bash"
+  args: ["-c", "docker push ${_DOCKER_HUB_USER}/${_IMAGE_REPO_NAME}:${_IMAGE_TAG}"]
+- name: "gcr.io/cloud-builders/docker"
+  args: ["tag", "${_DOCKER_HUB_USER}/${_IMAGE_REPO_NAME}:${_IMAGE_TAG}", "gcr.io/$PROJECT_ID/${_IMAGE_REPO_NAME}:${_IMAGE_TAG}"]
+substitutions: # default value
+  _DOCKER_FILE: Dockerfile
+  _IMAGE_REPO_NAME: repo_name
+  _IMAGE_TAG: img_tag
+  _CACHED_IMAGE_TAG: cached_img_tag
+  _DOCKER_HUB_USER: your_userid
+  _DOCKER_HUB_PASSWD: your_password
+images: [
+  "gcr.io/$PROJECT_ID/${_IMAGE_REPO_NAME}:${_IMAGE_TAG}"
+]
+timeout: 24h

@@ -2,8 +2,8 @@ FROM nvidia/cuda:10.1-devel-ubuntu18.04
 
 # Configure package versions of TensorFlow, PyTorch, MXNet, CUDA, cuDNN and NCCL
 ENV TENSORFLOW_VERSION=2.0.0
-ENV PYTORCH_VERSION=1.4.0
-ENV TORCHVISION_VERSION=0.5.0
+ENV PYTORCH_VERSION=1.5.1+cu101
+ENV TORCHVISION_VERSION=0.6.1+cu101
 ENV CUDNN_VERSION=7.6.5.32-1+cuda10.1
 ENV NCCL_VERSION=2.5.6-1+cuda10.1
 ENV MXNET_VERSION=1.5.1
@@ -114,9 +114,10 @@ RUN pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.2
 RUN pip install pytorch_pretrained_bert transformers
 
 # Install Faiss
+RUN apt-get install -y swig
 RUN git clone https://github.com/facebookresearch/faiss.git /tmp/faiss && \
     cd /tmp/faiss && \
-    ./configure --with-cuda=/usr/local/cuda && make -j $(nproc) && make install && \
+    ./configure --with-cuda=/usr/local/cuda && make SWIG=/usr/bin/swig -j $(nproc) && make install && \
     make -j $(nproc) -C python && make -C python install && \
     rm -rf /tmp/faiss
 
