@@ -448,7 +448,7 @@ class BERTClfHead(BaseClfHead):
         if (self.output_layer == -1 or self.output_layer == 11):
             self.lm_model.encoder.output_hidden_states = False
             last_hidden_state, pooled_output = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids.long(), attention_mask=pool_idx)
-            return sequence_output, pooled_output
+            return last_hidden_state, pooled_output
         else:
             self.lm_model.encoder.output_hidden_states = True
             outputs = self.lm_model.forward(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=pool_idx)
@@ -2340,7 +2340,7 @@ def train(clf, optimizer, dataset, special_tkns, scheduler=None, pad_val=0, weig
                 if task_type == 'nmt':
                     record_idx, extra_inputs = extra_inputs[0], extra_inputs[1:]
                     record_idx = [list(map(int, x.split(SC))) for x in record_idx]
-                extra_inputs = tuple([x.to('cuda') if use_gpu else x for x in extra_inputs])
+                # extra_inputs = tuple([x.to('cuda') if use_gpu else x for x in extra_inputs])
                 if len(idx) < 2: continue
                 if (mdl_name in LM_EMBED_MDL_MAP):
                     if task_type in ['entlmnt', 'sentsim']:
