@@ -102,7 +102,7 @@ RUN mkdir /tmp/pylucene && \
 RUN pip install pysolr ijson
 
 # Install NLP packages
-RUN pip install tqdm openpyxl pandas scikit-learn && \
+RUN pip install textdistance tqdm openpyxl pandas scikit-learn && \
     pip install nltk ftfy
 RUN pip install spacy==${SPACY_VERSION} scispacy==${SCISPACY_VERSION}
 RUN pip install allennlp==${ALLENNLP_VERSION}
