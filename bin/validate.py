@@ -9,30 +9,33 @@
 ###########################################################################
 #
 
-import os, sys, ast, time, copy, random, operator, pickle, string, logging, itertools
-from collections import OrderedDict
+import os, sys, ast, random, logging
 from optparse import OptionParser
 
 import numpy as np
-import scipy as sp
-from scipy.sparse import csc_matrix
 import pandas as pd
 
 import torch
+from torch.utils.data import DataLoader
 from torch.utils.data.sampler import WeightedRandomSampler
 
 from transformers import get_linear_schedule_with_warmup
 
 from bionlp.util import io
-from bionlp.util import math as imath
-
-from ..util.config import *
-from ..util.dataset import MaskedLMDataset, OntoDataset, BaseIterDataset, OntoIterDataset, MaskedLMIterDataset
-from ..util.trainer import train, eval
-from ..util.func import gen_mdl, gen_clf, save_model, load_model
 
 FILE_DIR = os.path.dirname(os.path.realpath(__file__))
 PAR_DIR = os.path.abspath(os.path.join(FILE_DIR, os.path.pardir))
+
+sys.path.insert(0, PAR_DIR)
+
+from modules.varclf import MultiClfTransformer
+
+from util.config import *
+from util.dataset import MaskedLMDataset, OntoDataset, BaseIterDataset, OntoIterDataset, MaskedLMIterDataset
+from util.processor import _adjust_encoder
+from util.trainer import train, eval
+from util.func import _update_cfgs, gen_mdl, gen_clf, save_model, load_model
+
 CONFIG_FILE = os.path.join(PAR_DIR, 'etc', 'config.yaml')
 DATA_PATH = os.path.join(os.path.expanduser('~'), 'data', 'bionlp')
 SC=';;'
@@ -44,10 +47,10 @@ cfgr = None
 
 def classify(dev_id=None):
     # Prepare model related meta data
-    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    mdl_name = opts.model.lower().replace(' ', '_')
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-    config_kwargs = dict([(k, v) for k, v in opts.__dict__.items() if not k.startswith('_') and k not in set(['dataset', 'model', 'template']) and v is not None and type(v) is not function])
+    config_kwargs = dict([(k, v) for k, v in opts.__dict__.items() if not k.startswith('_') and k not in set(['dataset', 'model', 'template']) and v is not None and not callable(v)])
     config = Configurable(opts.task, mdl_name, common_cfg=common_cfg, wsdir=PAR_DIR, sc=SC, **config_kwargs)
     params = pr('LM', config.lm_params) if mdl_name != 'none' else {}
     use_gpu = dev_id is not None
@@ -80,7 +83,7 @@ def classify(dev_id=None):
     # Prepare data
     if (not opts.distrb or opts.distrb and hvd.rank() == 0): print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name.startswith('bert'): train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds, config)
+    if mdl_name.startswith('bert'): train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
     if hasattr(train_ds, 'df'):
         train_ds.df[task_cols['y']] = ['false' if lb is None or lb is np.nan or (type(lb) is str and lb.isspace()) else lb for lb in train_ds.df[task_cols['y']]]
@@ -162,10 +165,10 @@ def classify(dev_id=None):
 
     if opts.noeval: return
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds, config)
+    if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds, config)
+    if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
@@ -193,7 +196,7 @@ def multi_clf(dev_id=None):
 
     print('### Multi Classifier Head Mode ###')
     # Prepare model related meta data
-    mdl_name = opts.model.split('_')[0].lower().replace(' ', '_')
+    mdl_name = opts.model.lower().replace(' ', '_')
     common_cfg = cfgr('validate', 'common')
     pr = io.param_reader(os.path.join(PAR_DIR, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
     config_kwargs = dict([(k, v) for k, v in opts.__dict__.items() if not k.startswith('_') and k not in set(['dataset', 'model', 'template']) and v is not None and type(v) is not function])
@@ -274,7 +277,7 @@ def multi_clf(dev_id=None):
             train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
             new_lbs = [k for k in train_ds.binlb.keys() if k not in all_binlb]
             all_binlb.update(dict([(k, v) for k, v in zip(new_lbs, range(len(all_binlb), len(all_binlb)+len(new_lbs)))]))
-            if mdl_name.startswith('bert'): train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds, config)
+            if mdl_name.startswith('bert'): train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
             lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
             if (not opts.weight_class or task_type == 'sentsim'):
                 class_count = None
@@ -297,10 +300,10 @@ def multi_clf(dev_id=None):
             train_loader = DataLoader(train_ds, batch_size=opts.bsize, shuffle=False, sampler=None, num_workers=opts.np, drop_last=opts.droplast)
 
             dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-            if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds, config)
+            if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
             dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
             test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-            if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds, config)
+            if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
             test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
             # print((len(train_ds.binlb), len(dev_ds.binlb), len(test_ds.binlb)))
 
@@ -311,7 +314,8 @@ def multi_clf(dev_id=None):
             train(clf, optimizer, train_loader, config, special_tknids_args, scheduler=scheduler, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), weights=class_weights, lmcoef=opts.lmcoef, clipmaxn=opts.clipmaxn, epochs=opts.epochs, earlystop=opts.earlystop, earlystop_delta=opts.es_delta, earlystop_patience=opts.es_patience, task_type=task_type, task_name=opts.task, mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, resume=resume if opts.resume else {}, chckpnt_kwargs=dict(mltclf_epochs=epoch))
 
             # Adjust the model
-            clf.merge_linear(num_linear=i+1)
+            clf_trnsfmr = MultiClfTransformer(clf)
+            clf_trnsfmr.merge_linear(num_linear=i+1)
             clf.linear = _handle_model(clf.linear, dev_id=dev_id, distrb=opts.distrb)
 
             # Evaluating on the accumulated dev and test sets
@@ -330,10 +334,10 @@ def multi_clf(dev_id=None):
 
     if opts.noeval: return
     dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds, config)
+    if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
     dev_loader = DataLoader(dev_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
-    if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds, config)
+    if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
 
     # Evaluation

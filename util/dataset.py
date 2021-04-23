@@ -18,7 +18,8 @@ import pandas as pd
 import pandas as pd
 
 import torch
-from torch.utils.data import Dataset, IterableDataset, DataLoader
+from torch import nn
+from torch.utils.data import Dataset, IterableDataset
 from torch.nn.parallel import replicate
 
 from bionlp.util import io
@@ -292,9 +293,9 @@ class NERDataset(BaseDataset):
 class MaskedLMDataset(BaseDataset):
     """Wrapper dataset class for masked language model"""
 
-    def __init__(self, dataset, config, special_tknids=[101, 102, 102, 103], masked_lm_prob=0.15):
-        self.config = config
+    def __init__(self, dataset, special_tknids=[101, 102, 102, 103], masked_lm_prob=0.15):
         self._ds = dataset
+        self.config = self._ds.config
         self.text_col = self._ds.text_col if hasattr(self._ds, 'text_col') else None
         self.label_col = self._ds.label_col if hasattr(self._ds, 'label_col') else None
         self.mltl = self._ds.mltl if hasattr(self._ds, 'mltl') else None
@@ -427,9 +428,15 @@ class EmbeddingPairDataset(BaseDataset):
 
 
 class OntoDataset(BaseDataset):
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, config, onto_fpath='onto.csv', onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
+    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, config, onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
         super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, config, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
-        self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
+        if hasattr(config, 'onto_df') and type(config.onto_df) is pd.DataFrame:
+            self.onto = config.onto_df
+        else:
+            onto_fpath = config.onto if hasattr(config, 'onto') and os.path.exists(config.onto) else 'onto.csv'
+            print('Reading ontology dictionary file [%s]...' % onto_fpath)
+            self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
+            setattr(config, 'onto_df', self.onto)
         print('Ontology DataFrame size: %s' % str(self.onto.shape))
         self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         self.onto_col = onto_col

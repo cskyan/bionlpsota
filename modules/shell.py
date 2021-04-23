@@ -11,8 +11,8 @@
 
 from torch.utils.data import DataLoader
 
-from ..util.dataset import MaskedLMDataset, MaskedLMIterDataset, BaseIterDataset, ShellDataset, DataParallel
-from transformer import BERTClfHead
+from util.dataset import MaskedLMDataset, MaskedLMIterDataset, BaseIterDataset, ShellDataset, DataParallel
+from . import transformer as T
 
 
 class BaseShell():
@@ -30,7 +30,7 @@ class BaseShell():
         use_gpu = next(self.model.parameters()).is_cuda
         batch_size, n_jobs, droplast = kwargs.setdefault('bsize', 16), kwargs.setdefault('n_jobs', 1), kwargs.setdefault('droplast', False)
         ds = ShellDataset(inputs[0], encode_func=self.encode_func, tokenizer=self.tokenizer, transforms=self.transforms, transforms_args=self.transforms_args, transforms_kwargs=self.transforms_kwargs)
-        if isinstance(self.model, BERTClfHead) or type(self.model) is DataParallel and isinstance(self.model.module, BERTClfHead): ds = MaskedLMIterDataset(ds) if isinstance(ds, BaseIterDataset) else MaskedLMDataset(ds)
+        if isinstance(self.model, T.BERTClfHead) or type(self.model) is DataParallel and isinstance(self.model.module, T.BERTClfHead): ds = MaskedLMIterDataset(ds) if isinstance(ds, BaseIterDataset) else MaskedLMDataset(ds)
         ds_loader = DataLoader(ds, batch_size=batch_size, shuffle=False, sampler=None, num_workers=n_jobs, drop_last=droplast)
         clf_tknids = self.special_tknids_args['clf_tknids']
         clf_h = []
@@ -40,7 +40,7 @@ class BaseShell():
             mask_tnsr = (~tkns_tnsr.eq(self.pad_val * torch.ones_like(tkns_tnsr))).long()
             pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
             if use_gpu: tkns_tnsr, pool_idx, mask_tnsr, extra_inputs = tkns_tnsr.to('cuda'), pool_idx.to('cuda'), mask_tnsr.to('cuda'), tuple([x.to('cuda') for x in extra_inputs])
-            h = self.model(tkns_tnsr, mask_tnsr if isinstance(self.model, BERTClfHead) or type(self.model) is DataParallel and isinstance(self.model.module, BERTClfHead) else pool_idx, *extra_inputs, embedding_mode=kwargs.setdefault('embedding_mode', False))
+            h = self.model(tkns_tnsr, mask_tnsr if isinstance(self.model, T.BERTClfHead) or type(self.model) is DataParallel and isinstance(self.model.module, T.BERTClfHead) else pool_idx, *extra_inputs, embedding_mode=kwargs.setdefault('embedding_mode', False))
             clf_h.append(h.detach().cpu().view(tkns_tnsr.size(0), -1))
             del tkns_tnsr, mask_tnsr, pool_idx, h
         return torch.cat(clf_h, dim=0)
@@ -66,4 +66,3 @@ class BaseShell():
                 transform_kwargs.update(transforms_args)
                 sample = transform(sample, **transform_kwargs) if callable(transform) else getattr(self.model, transform)(sample, **transform_kwargs)
         return sample
-

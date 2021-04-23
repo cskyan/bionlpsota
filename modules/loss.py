@@ -82,4 +82,3 @@ class PearsonCorrelationLoss(RegressionLoss):
         # loss = torch.sum(var_pred * var_true) / (torch.sqrt(torch.sum(var_pred ** 2)) * torch.sqrt(torch.sum(var_true ** 2)))
         loss = -1.0 * var_pred * var_true * torch.rsqrt(torch.sum(var_pred ** 2)) * torch.rsqrt(torch.sum(var_true ** 2))
         return loss if self.reduction == 'none' else torch.mean(loss)
-

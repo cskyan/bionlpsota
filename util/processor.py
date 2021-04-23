@@ -12,7 +12,6 @@
 import os, sys, pickle, itertools
 
 import numpy as np
-from scipy.sparse import csc_matrix
 
 import torch
 

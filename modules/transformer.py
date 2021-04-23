@@ -9,6 +9,8 @@
 ###########################################################################
 #
 
+import copy
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -18,16 +20,14 @@ from allennlp.modules.conditional_random_field import ConditionalRandomField
 from transformers.modeling_bert import BertPreTrainingHeads
 from transformers import GPT2LMHeadModel
 
-from ..util.config import NORM_TYPE_MAP, ACTVTN_MAP, RGRSN_LOSS_MAP, SIM_FUNC_MAP
-from ranking import SiameseRankHead
-from reduction import TransformerLayerMaxPool, TransformerLayerAvgPool, MaskedReduction, ThresholdEstimator
-from varclf import MultiClfHead
+from util import func as H
+from . import reduction as R
 
 
 class BaseClfHead(nn.Module):
     """ Classifier Head for the Basic Language Model """
 
-    def __init__(self, lm_model, config, task_type, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_extlin=False, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
+    def __init__(self, lm_model, lm_config, config, task_type, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_extlin=False, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
         super(BaseClfHead, self).__init__()
         self.task_params = task_params
         self.lm_model = lm_model
@@ -40,7 +40,7 @@ class BaseClfHead(nn.Module):
         self.dropout = nn.Dropout2d(pdrop) if task_type == 'nmt' else nn.Dropout(pdrop)
         self.last_dropout = nn.Dropout(pdrop) if do_lastdrop else None
         self.crf = ConditionalRandomField(num_lbs) if do_crf else None
-        self.thrshlder = ThresholdEstimator(last_hdim=kwargs['last_hdim']) if do_thrshld and 'last_hdim' in kwargs else None
+        self.thrshlder = R.ThresholdEstimator(last_hdim=kwargs['last_hdim']) if do_thrshld and 'last_hdim' in kwargs else None
         self.thrshld = 0.5
         self.constraints = [cnstrnt_cls(**cnstrnt_params) for cnstrnt_cls, cnstrnt_params in constraints]
         self.mlt_trnsfmr = mlt_trnsfmr # accept multiple streams of inputs, each of which will be input into the transformer
@@ -149,9 +149,10 @@ class BaseClfHead(nn.Module):
             loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
+            from util import config as C
             # print((clf_logits.size(), labels.size()))
-            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
-            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
+            loss_cls = C.RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
+            loss_func = loss_cls(reduction='none', x_mode=C.SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         if self.thrshlder:
             num_lbs = labels.view(-1, self.num_lbs).sum(1)
@@ -264,14 +265,6 @@ class BaseClfHead(nn.Module):
             self.linear = self.linears[idx]
             return self.linears[idx]
 
-    def merge_linear(self, num_linear=-1):
-        use_gpu = next(self.parameters()).is_cuda
-        self.linear = MultiClfHead(self.linears if num_linear <=0 else self.linears[:num_linear])
-        self.linear = self.linear.to('cuda') if use_gpu else self.linear
-        self.num_lbs = self._total_num_lbs
-        self.binlb = self.global_binlb
-        self.binlbr = self.global_binlbr
-
     def to_siamese(self, from_scratch=False):
         if not hasattr(self, 'clf_task_type') and self.task_type != 'sentsim': self.clf_task_type = self.task_type
         self.task_type = 'sentsim'
@@ -294,13 +287,6 @@ class BaseClfHead(nn.Module):
         self.linear = self.clf_linear if hasattr(self, 'clf_linear') and not from_scratch else self.__init_linear__()
         self.mode = 'clf'
 
-    def merge_siamese(self, tokenizer, encode_func, trnsfm, special_tknids_args, pad_val=0, thrshld_lnr=0.5, thrshld_sim=0.5, topk=None, lbnotes='lbnotes.csv'):
-        use_gpu = next(self.parameters()).is_cuda
-        self.task_type = self.clf_task_type
-        self.linear = SiameseRankHead(self.clf_linear, self.linear, self.binlbr, tokenizer=tokenizer, encode_func=encode_func, trnsfm=trnsfm, special_tknids_args=special_tknids_args, pad_val=pad_val, base_model=self, thrshld_lnr=thrshld_lnr, thrshld_sim=thrshld_sim, topk=topk, lbnotes=lbnotes)
-        self.linear = self.linear.to('cuda') if use_gpu else self.linear
-        self.mode = 'clf'
-
     def update_params(self, task_params={}, **kwargs):
         self.task_params.update(task_params)
         for k, v in kwargs.items():
@@ -312,32 +298,33 @@ class BaseClfHead(nn.Module):
 
 
 class BERTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
-        super(BERTClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, lm_config, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+        from util import config as C
+        super(BERTClfHead, self).__init__(lm_model, lm_config, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=lm_config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
         self.lm_head = BertPreTrainingHeads(config)
-        self.vocab_size = config.vocab_size
-        self.num_hidden_layers = config.num_hidden_layers
-        self.n_embd = kwargs.setdefault('n_embd', config.hidden_size)
+        self.vocab_size = lm_config.vocab_size
+        self.num_hidden_layers = lm_config.num_hidden_layers
+        self.n_embd = kwargs.setdefault('n_embd', lm_config.hidden_size)
         self.maxlen = self.task_params.setdefault('maxlen', 128)
-        self.norm = NORM_TYPE_MAP[norm_type](self.maxlen) if self.task_type == 'nmt' else NORM_TYPE_MAP[norm_type](self.n_embd)
-        self._int_actvtn = ACTVTN_MAP[iactvtn]
-        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self.norm = C.NORM_TYPE_MAP[norm_type](self.maxlen) if self.task_type == 'nmt' else C.NORM_TYPE_MAP[norm_type](self.n_embd)
+        self._int_actvtn = C.ACTVTN_MAP[iactvtn]
+        self._out_actvtn = C.ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = self.dim_mulriple * self.n_embd if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
         # self.linear = nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.task_type == 'sentsim' else nn.Linear(self.hdim, self.num_lbs)
         self.linear = self.__init_linear__()
-        if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+        if (initln): self.linear.apply(H._weights_init(mean=initln_mean, std=initln_std))
         # if (initln): self.lm_model.apply(self.lm_model.init_bert_weights)
         if self.do_extlin:
-            self.extlinear = nn.Sequential(nn.Linear(self.n_embd, self.n_embd), ACTVTN_MAP['tanh']())
-            if (initln): self.extlinear.apply(_weights_init(mean=initln_mean, std=initln_std))
+            self.extlinear = nn.Sequential(nn.Linear(self.n_embd, self.n_embd), C.ACTVTN_MAP['tanh']())
+            if (initln): self.extlinear.apply(H._weights_init(mean=initln_mean, std=initln_std))
         if (type(output_layer) is int):
             self.output_layer = output_layer if (output_layer >= -self.num_hidden_layers and output_layer < self.num_hidden_layers) else -1
         else:
             self.output_layer = [x for x in output_layer if (x >= -self.num_hidden_layers and x < self.num_hidden_layers)]
-            self.layer_pooler = TransformerLayerMaxPool(kernel_size=len(self.output_layer)) if layer_pooler == 'max' else TransformerLayerAvgPool(kernel_size=len(self.output_layer))
+            self.layer_pooler = R.TransformerLayerMaxPool(kernel_size=len(self.output_layer)) if layer_pooler == 'max' else R.TransformerLayerAvgPool(kernel_size=len(self.output_layer))
         if pooler is not None:
-            self.pooler = MaskedReduction(reduction=pooler, dim=1)
+            self.pooler = R.MaskedReduction(reduction=pooler, dim=1)
 
     def __init_linear__(self):
         use_gpu = next(self.parameters()).is_cuda
@@ -369,40 +356,42 @@ class BERTClfHead(BaseClfHead):
 
 
 class GPTClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(GPTClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type == 'sentsim', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, lm_config, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        from util import config as C
+        super(GPTClfHead, self).__init__(lm_model, lm_config, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type == 'sentsim', lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         if type(lm_model) is GPT2LMHeadModel:self.kwprop['past_paramname'] = 'past'
-        self.vocab_size = config.vocab_size
-        self.n_embd = config.n_embd
-        self.norm = NORM_TYPE_MAP[norm_type](config.n_embd)
+        self.vocab_size = lm_config.vocab_size
+        self.n_embd = lm_config.n_embd
+        self.norm = C.NORM_TYPE_MAP[norm_type](lm_config.n_embd)
         self.clf_h = self._mlt_clf_h if self.task_type in ['entlmnt', 'sentsim'] and self.mlt_trnsfmr and (task_params.setdefault('sentsim_func', None) is None) else self._clf_h
-        self._int_actvtn = ACTVTN_MAP[iactvtn]
-        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self._int_actvtn = C.ACTVTN_MAP[iactvtn]
+        self._out_actvtn = C.ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = self.dim_mulriple * self.n_embd if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
         self.linear = self.__init_linear__()
-        if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+        if (initln): self.linear.apply(H._weights_init(mean=initln_mean, std=initln_std))
         if self.do_extlin:
             self.extlinear = nn.Linear(self.n_embd, self.n_embd)
-            if (initln): self.extlinear.apply(_weights_init(mean=initln_mean, std=initln_std))
+            if (initln): self.extlinear.apply(H._weights_init(mean=initln_mean, std=initln_std))
 
     def __init_linear__(self):
         return nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs)
 
 
 class TransformXLClfHead(BaseClfHead):
-    def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
-        super(TransformXLClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
+    def __init__(self, lm_model, lm_config, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        from util import config as C
+        super(TransformXLClfHead, self).__init__(lm_model, lm_config, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         self.kwprop['past_paramname'] = 'mems'
-        self.vocab_size = config.n_token
-        self.n_embd = config.d_embed
-        self.norm = NORM_TYPE_MAP[norm_type](config.n_embd)
-        self._int_actvtn = ACTVTN_MAP[iactvtn]
-        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self.vocab_size = lm_config.n_token
+        self.n_embd = lm_config.d_embed
+        self.norm = C.NORM_TYPE_MAP[norm_type](lm_config.n_embd)
+        self._int_actvtn = C.ACTVTN_MAP[iactvtn]
+        self._out_actvtn = C.ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = self.dim_mulriple * self.n_embd if self.mlt_trnsfmr and self.task_type in ['sentsim'] else self.n_embd
         self.linear = self.__init_linear__()
-        if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
+        if (initln): self.linear.apply(H._weights_init(mean=initln_mean, std=initln_std))
 
     def __init_linear__(self):
         return nn.Linear(self.hdim, self.num_lbs)
@@ -427,4 +416,3 @@ class TransformXLClfHead(BaseClfHead):
 
     def transformer(self, input_ids, *extra_inputs, pool_idx=None):
         return self.lm_model.transformer(input_ids=input_ids.view(input_ids.size(0), -1))
-

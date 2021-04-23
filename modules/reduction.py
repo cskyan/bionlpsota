@@ -15,7 +15,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..util.config import ACTVTN_MAP
+from util import config as C
 
 
 class TransformerLayerMaxPool(nn.MaxPool1d):
@@ -105,8 +105,7 @@ class ThresholdEstimator(nn.Module):
     def __init__(self, last_hdim, fchdim=100, iactvtn='relu', oactvtn='sigmoid', init_thrshld=0.5):
         super(ThresholdEstimator, self).__init__()
         self.thrshld = init_thrshld
-        self.linear = nn.Sequential(nn.Linear(last_hdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, fchdim), ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, 1), ACTVTN_MAP[oactvtn]()) if fchdim else nn.Sequential(nn.Linear(last_hdim, 1), ACTVTN_MAP[oactvtn]())
+        self.linear = nn.Sequential(nn.Linear(last_hdim, fchdim), C.ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, fchdim), C.ACTVTN_MAP[iactvtn](), nn.Linear(fchdim, 1), C.ACTVTN_MAP[oactvtn]()) if fchdim else nn.Sequential(nn.Linear(last_hdim, 1), C.ACTVTN_MAP[oactvtn]())
 
     def forward(self, logits):
         return self.linear(logits)
-

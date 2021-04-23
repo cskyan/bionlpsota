@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, copy, pickle, itertools
+import os, sys, time, copy, pickle, itertools
 from tqdm import tqdm
 
 import numpy as np
@@ -22,9 +22,10 @@ from sklearn import metrics
 
 from bionlp.util import system
 
-from ..modules.common import EarlyStopping
-from dataset import DataParallel
-from processor import nlp, _batch2ids_w2v
+from modules.common import EarlyStopping
+from .dataset import DataParallel
+from .processor import nlp, _batch2ids_w2v
+from .func import _sprmn_cor, _prsn_cor, save_model
 
 
 def train(clf, optimizer, dataset, config, special_tkns, scheduler=None, pad_val=0, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, task_type='mltc-clf', task_name='classification', mdl_name='sota', use_gpu=False, devq=None, distrb=False, resume={}, chckpnt_kwargs={}):
@@ -125,20 +126,20 @@ def train(clf, optimizer, dataset, config, special_tkns, scheduler=None, pad_val
                 print(e)
                 train_time = time.time() - t0
                 print('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
-                save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 raise e
             if (killer.kill_now):
                 train_time = time.time() - t0
                 print('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
                 if (not distrb or distrb and hvd.rank() == 0):
-                    save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                    save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 sys.exit(0)
         avg_loss = total_loss / (step + 1)
         print('Train loss in %i epoch(s): %f' % (epoch + 1, avg_loss))
         if epoch % 5 == 0:
             try:
                 if (not distrb or distrb and hvd.rank() == 0):
-                    save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=opts.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
+                    save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
             except Exception as e:
                 print(e)
         if earlystop:
@@ -150,7 +151,7 @@ def train(clf, optimizer, dataset, config, special_tkns, scheduler=None, pad_val
     try:
         if (not distrb or distrb and hvd.rank() == 0):
             if os.path.exists(chckpnt_fname): os.remove(chckpnt_fname)
-            save_model(clf, optimizer, model_fname, devq=devq, distrb=opts.distrb)
+            save_model(clf, optimizer, model_fname, devq=devq, distrb=config.distrb)
     except Exception as e:
         print(e)
 
@@ -248,7 +249,7 @@ def eval(clf, dataset, config, binlbr, special_tkns, pad_val=0, task_type='mltc-
             loss_func = nn.BCEWithLogitsLoss(reduction='none')
             loss = loss_func(logits.view(-1, len(binlbr)), lb_tnsr.view(-1, len(binlbr)).float())
             prob = torch.sigmoid(logits).data.view(-1, len(binlbr))
-            pred = (prob > (clf.thrshld if opts.do_thrshld else opts.pthrshld)).int()
+            pred = (prob > (clf.thrshld if config.do_thrshld else config.pthrshld)).int()
             # print(('logits, prob:', logits, prob))
         elif task_type == 'nmt':
             loss_func = nn.CrossEntropyLoss(reduction='none')

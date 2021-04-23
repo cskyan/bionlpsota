@@ -10,12 +10,13 @@
 #
 
 import numpy as np
+from scipy.sparse import csc_matrix
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from transformer import BERTClfHead
+from . import transformer as T
 
 
 class SiameseRankHead(nn.Module):
@@ -65,7 +66,7 @@ class SiameseRankHead(nn.Module):
                     tkns_tnsr = torch.tensor(batch_tkns, dtype=torch.long).to('cuda') if use_gpu else torch.tensor(batch_tkns, dtype=torch.long)
                     mask_tnsr = (~tkns_tnsr.eq(self.base_model['pad_val'] * torch.ones_like(tkns_tnsr))).long()
                     pool_idx = tkns_tnsr.eq(clf_tknids[0] * torch.ones_like(tkns_tnsr)).int().argmax(-1)
-                    note_clf_h = self.base_model['model'](tkns_tnsr, mask_tnsr if type(self.base_model['model']) is BERTClfHead else pool_idx, embedding_mode=True)
+                    note_clf_h = self.base_model['model'](tkns_tnsr, mask_tnsr if type(self.base_model['model']) is T.BERTClfHead else pool_idx, embedding_mode=True)
                     # note_clf_h = hidden_states[:1]
                     for j, clf_h in enumerate(note_clf_h):
                         for orig_id in orig_indices[j]:
@@ -108,3 +109,14 @@ class SiameseRankHead(nn.Module):
                 sample = transform(sample, **transform_kwargs) if callable(transform) else getattr(self, transform)(sample, **transform_kwargs)
         return sample
 
+
+class SiameseRankTransformer(object):
+    def __init__(self, clf):
+        self.clf = clf
+
+    def merge_siamese(self, tokenizer, encode_func, trnsfm, special_tknids_args, pad_val=0, thrshld_lnr=0.5, thrshld_sim=0.5, topk=None, lbnotes='lbnotes.csv'):
+        use_gpu = next(self.clf.parameters()).is_cuda
+        self.clf.task_type = self.clf.clf_task_type
+        self.clf.linear = SiameseRankHead(self.clf.clf_linear, self.clf.linear, self.clf.binlbr, tokenizer=tokenizer, encode_func=encode_func, trnsfm=trnsfm, special_tknids_args=special_tknids_args, pad_val=pad_val, base_model=self.clf, thrshld_lnr=thrshld_lnr, thrshld_sim=thrshld_sim, topk=topk, lbnotes=lbnotes)
+        self.clf.linear = self.clf.linear.to('cuda') if use_gpu else self.clf.linear
+        self.clf.mode = 'clf'

@@ -9,8 +9,15 @@
 ###########################################################################
 #
 
-from reduction import TransformerLayerWeightedReduce
-from loss import CrossEntropyLoss
+import os, sys
+
+import pandas as pd
+
+import torch
+from torch import nn
+
+from . import reduction as R
+from . import transformer as T
 
 
 class MultiClfHead(nn.Module):
@@ -27,7 +34,20 @@ class MultiClfHead(nn.Module):
         return self
 
 
-class OntoBERTClfHead(BERTClfHead):
+class MultiClfTransformer(object):
+    def __init__(self, clf):
+        self.clf = clf
+
+    def merge_linear(self, num_linear=-1):
+        use_gpu = next(self.clf.parameters()).is_cuda
+        self.clf.linear = MultiClfHead(self.clf.linears if num_linear <=0 else self.clf.linears[:num_linear])
+        self.clf.linear = self.clf.linear.to('cuda') if use_gpu else self.clf.linear
+        self.clf.num_lbs = self.clf._total_num_lbs
+        self.clf.binlb = self.clf.global_binlb
+        self.clf.binlbr = self.clf.global_binlbr
+
+
+class OntoBERTClfHead(T.BERTClfHead):
     from bionlp.util.func import DFSVertex, stack_dfs
     class _PyTorchModuleVertex(DFSVertex):
         @property
@@ -39,12 +59,18 @@ class OntoBERTClfHead(BERTClfHead):
             for k, v in config.items():
                 if hasattr(self.module, k): setattr(self.module, k, v)
 
-    def __init__(self, lm_model, config, task_type, onto='onto.csv', embeddim=128, onto_fchdim=128, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
+    def __init__(self, lm_model, config, task_type, embeddim=128, onto_fchdim=128, iactvtn='relu', oactvtn='sigmoid', fchdim=0, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
         config.output_hidden_states = True
         output_layer = list(range(config.num_hidden_layers))
-        BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
+        T.BERTClfHead.__init__(self, lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, constraints=constraints, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, output_layer=output_layer, pooler=pooler, layer_pooler=layer_pooler, n_embd=config.hidden_size+int(config.hidden_size/config.num_attention_heads), **kwargs)
         self.num_attention_heads = config.num_attention_heads
-        self.onto = pd.read_csv(onto, sep=kwargs.setdefault('sep', '\t'), index_col='id')
+        if hasattr(config, 'onto_df') and type(config.onto_df) is pd.DataFrame:
+            self.onto = config.onto_df
+        else:
+            onto_fpath = config.onto if hasattr(config, 'onto') and os.path.exists(config.onto) else 'onto.csv'
+            print('Reading ontology dictionary file [%s]...' % onto_fpath)
+            self.onto = pd.read_csv(onto_fpath, sep=kwargs.setdefault('sep', '\t'), index_col='id')
+            setattr(config, 'onto_df', self.onto)
         self.embeddim = embeddim
         self.embedding = nn.Embedding(self.onto.shape[0]+1, embeddim)
         self.onto_fchdim = onto_fchdim
@@ -53,7 +79,7 @@ class OntoBERTClfHead(BERTClfHead):
         self.halflen = config.num_hidden_layers
         if (type(output_layer) is not int):
             self.output_layer = [x for x in output_layer if (x >= -self.num_hidden_layers and x < self.num_hidden_layers)]
-            self.layer_pooler = TransformerLayerWeightedReduce(reduction=layer_pooler)
+            self.layer_pooler = R.TransformerLayerWeightedReduce(reduction=layer_pooler)
         self.att2spans = nn.Linear(self.maxlen, 2)
 
     def forward(self, input_ids, pool_idx, *extra_inputs, labels=None, past=None, weights=None, embedding_mode=False, ret_ftspans=False, ret_attention=False):
@@ -63,7 +89,7 @@ class OntoBERTClfHead(BERTClfHead):
             extra_inputs = list(extra_inputs)
             extra_inputs.insert(1 if self.sample_weights else 0, torch.zeros(input_ids.size()[0], dtype=torch.long).to('cuda') if use_gpu else torch.zeros(input_ids.size()[0], dtype=torch.long))
             extra_inputs = tuple(extra_inputs)
-        outputs = BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights, embedding_mode=embedding_mode)
+        outputs = T.BERTClfHead.forward(self, input_ids, pool_idx, *extra_inputs, labels=labels, past=past, weights=weights, embedding_mode=embedding_mode)
         setattr(self, 'num_attention_heads', 12)
         sys.stdout.flush()
         if embedding_mode: return outputs[:,:int(-self.hdim/(self.num_attention_heads+1))]
@@ -88,7 +114,7 @@ class OntoBERTClfHead(BERTClfHead):
         if labels is not None:
             if spans is not None:
                 start_positions, end_positions = spans.split(1, dim=-1)
-                loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+                loss_fct = nn.CrossEntropyLoss(ignore_index=ignored_index)
                 start_loss = loss_fct(start_logits, start_positions)
                 end_loss = loss_fct(end_logits, end_positions)
                 clf_loss = clf_loss + (start_loss + end_loss) / 2

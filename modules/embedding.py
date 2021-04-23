@@ -14,12 +14,14 @@ from torch import nn
 
 from allennlp.modules.conditional_random_field import ConditionalRandomField
 
-from ..util.config import NORM_TYPE_MAP, ACTVTN_MAP, RGRSN_LOSS_MAP, SIM_FUNC_MAP, SEQ2VEC_MAP, SEQ2VEC_DIM_INFER, SEQ2VEC_TASK_PARAMS, SEQ2VEC_MDL_PARAMS, SEQ2VEC_LM_PARAMS_MAP, SEQ2SEQ_MAP, SEQ2SEQ_DIM_INFER, SEQ2SEQ_TASK_PARAMS, SEQ2SEQ_MDL_PARAMS
-from ..util.func import gen_pytorch_wrapper
+from util.func import gen_pytorch_wrapper
+
+from . import transformer as T
 
 
-class EmbeddingClfHead(BaseClfHead):
+class EmbeddingClfHead(T.BaseClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        from util import config as C
         super(EmbeddingClfHead, self).__init__(lm_model, config, task_type, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=task_type in ['entlmnt', 'sentsim'], pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         self.dim_mulriple = 2 if self.task_type in ['entlmnt', 'sentsim'] and (self.task_params.setdefault('sentsim_func', None) is None or self.task_params['sentsim_func'] == 'concat') else 1
         self.embed_type = embed_type
@@ -39,8 +41,8 @@ class EmbeddingClfHead(BaseClfHead):
             assert(self.w2v_model)
             self.vocab_size = 793471
             self.n_embd = self.w2v_model.syn0.shape[1] + config['elmoedim'] * 2 + (self.n_embd if hasattr(self, 'n_embd') else 0)
-        self._int_actvtn = ACTVTN_MAP[iactvtn]
-        self._out_actvtn = ACTVTN_MAP[oactvtn]
+        self._int_actvtn = C.ACTVTN_MAP[iactvtn]
+        self._out_actvtn = C.ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.crf = ConditionalRandomField(num_lbs) if do_crf else None
 
@@ -116,8 +118,9 @@ class EmbeddingClfHead(BaseClfHead):
             loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
-            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive')]
-            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
+            from util import config as C
+            loss_cls = C.RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive')]
+            loss_func = loss_cls(reduction='none', x_mode=C.SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else nn.MSELoss(reduction='none')
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         return clf_loss, None
 
@@ -128,16 +131,17 @@ class EmbeddingClfHead(BaseClfHead):
 class EmbeddingPool(EmbeddingClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, pooler=None, pool_params={'kernel_size':8, 'stride':4}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         assert(task_type != 'nmt')
+        from util import config as C
         super(EmbeddingPool, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         self.maxlen = self.task_params.setdefault('maxlen', 128)
         if pooler:
             self.pooler = nn.MaxPool2d(**pool_params) if pooler == 'max' else nn.AvgPool2d(**pool_params)
             encoder_odim = int((2 * self.maxlen + 2 * pool_params.setdefault('padding', 0) - pool_params.setdefault('dilation', 1) * (pool_params['kernel_size'] - 1) - 1) / pool_params['stride'] + 1) * int((int(0.5 * self.n_embd) + 2 * pool_params.setdefault('padding', 0) - pool_params.setdefault('dilation', 1) * (pool_params['kernel_size'] - 1) - 1) / pool_params['stride'] + 1) if pooler == 'max' else int((2 * self.maxlen + 2 * pool_params.setdefault('padding', 0) - pool_params['kernel_size']) / pool_params['stride'] + 1) * int((int(0.5 * self.n_embd) + 2 * pool_params.setdefault('padding', 0) - pool_params['kernel_size']) / pool_params['stride'] + 1)
-            self.norm = NORM_TYPE_MAP[norm_type](encoder_odim)
+            self.norm = C.NORM_TYPE_MAP[norm_type](encoder_odim)
             self.hdim = self.dim_mulriple * encoder_odim if self.task_type in ['entlmnt', 'sentsim'] else encoder_odim
         else:
             self.pooler = None
-            self.norm = NORM_TYPE_MAP[norm_type](self.n_embd)
+            self.norm = C.NORM_TYPE_MAP[norm_type](self.n_embd)
             self.hdim = self.n_embd
         self.linear = self.__init_linear__()
         if (initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
@@ -160,32 +164,33 @@ class EmbeddingPool(EmbeddingClfHead):
 class EmbeddingSeq2Vec(EmbeddingClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2vec=None, s2v_params={'hdim':768}, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         assert(task_type != 'nmt')
+        from util import config as C
         super(EmbeddingSeq2Vec, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         if seq2vec:
             params = {}
             if seq2vec.startswith('pytorch-'):
                 pth_mdl = '-'.join(seq2vec.split('-')[1:])
-                _ = [params.update(x) for x in [SEQ2VEC_MDL_PARAMS.setdefault('pytorch', {}).setdefault(embed_type, {}), SEQ2VEC_TASK_PARAMS.setdefault('pytorch', {}).setdefault(task_type, {})]]
-                _ = [params.update({p:s2v_params[k]}) for k, p in SEQ2VEC_LM_PARAMS_MAP.setdefault('pytorch', []) if k in s2v_params]
+                _ = [params.update(x) for x in [C.SEQ2VEC_MDL_PARAMS.setdefault('pytorch', {}).setdefault(embed_type, {}), C.SEQ2VEC_TASK_PARAMS.setdefault('pytorch', {}).setdefault(task_type, {})]]
+                _ = [params.update({p:s2v_params[k]}) for k, p in C.SEQ2VEC_LM_PARAMS_MAP.setdefault('pytorch', []) if k in s2v_params]
                 if (embed_type == 'w2v'): params[pth_mdl]['input_size'] = self.w2v_model.syn0.shape[1]
                 if (embed_type == 'elmo_w2v'): params[pth_mdl]['input_size'] = params[pth_mdl]['input_size'] + self.w2v_model.syn0.shape[1]
                 self.seq2vec = gen_pytorch_wrapper('seq2vec', pth_mdl, **params[pth_mdl])
-                encoder_odim = SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
+                encoder_odim = C.SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
             else:
-                _ = [params.update(x) for x in [SEQ2VEC_MDL_PARAMS.setdefault(seq2vec, {}).setdefault(embed_type, {}), SEQ2VEC_TASK_PARAMS.setdefault(seq2vec, {}).setdefault(task_type, {})]]
-                _ = [params.update({p:s2v_params[k]}) for k, p in SEQ2VEC_LM_PARAMS_MAP.setdefault(seq2vec, []) if k in s2v_params]
+                _ = [params.update(x) for x in [C.SEQ2VEC_MDL_PARAMS.setdefault(seq2vec, {}).setdefault(embed_type, {}), C.SEQ2VEC_TASK_PARAMS.setdefault(seq2vec, {}).setdefault(task_type, {})]]
+                _ = [params.update({p:s2v_params[k]}) for k, p in C.SEQ2VEC_LM_PARAMS_MAP.setdefault(seq2vec, []) if k in s2v_params]
                 if (embed_type == 'w2v'): params['embedding_dim'] = self.w2v_model.syn0.shape[1]
                 if (embed_type == 'elmo_w2v'): params['embedding_dim'] = params['embedding_dim'] + self.w2v_model.syn0.shape[1]
-                self.seq2vec = SEQ2VEC_MAP[seq2vec](**params)
+                self.seq2vec = C.SEQ2VEC_MAP[seq2vec](**params)
                 if hasattr(self.seq2vec, 'get_output_dim') and seq2vec != 'boe':
                     encoder_odim = self.seq2vec.get_output_dim()
                 else:
-                    encoder_odim = SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params])
+                    encoder_odim = C.SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params])
         else:
             self.seq2vec = None
             encoder_odim = self.n_embd
         self.maxlen = self.task_params.setdefault('maxlen', 128)
-        self.norm = NORM_TYPE_MAP[norm_type](encoder_odim)
+        self.norm = C.NORM_TYPE_MAP[norm_type](encoder_odim)
         self.hdim = self.dim_mulriple * encoder_odim if self.task_type in ['entlmnt', 'sentsim'] else encoder_odim
         self.linear = self.__init_linear__()
         if (self.linear and initln): self.linear.apply(_weights_init(mean=initln_mean, std=initln_std))
@@ -206,26 +211,27 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
 
 class EmbeddingSeq2Seq(EmbeddingClfHead):
     def __init__(self, lm_model, config, task_type, iactvtn='relu', oactvtn='sigmoid', fchdim=0, embed_type='w2v', w2v_path=None, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, pdrop=0.2, seq2seq=None, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
+        from util import config as C
         super(EmbeddingSeq2Seq, self).__init__(lm_model, config, task_type, iactvtn=iactvtn, oactvtn=oactvtn, fchdim=fchdim, embed_type=embed_type, w2v_path=w2v_path, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, pdrop=pdrop, do_norm=do_norm, norm_type=norm_type, do_lastdrop=do_lastdrop, do_crf=do_crf, initln=initln, initln_mean=initln_mean, initln_std=initln_std, task_params=task_params, **kwargs)
         if seq2seq:
             params = {}
             if seq2seq.startswith('pytorch-'):
                 pth_mdl = '-'.join(seq2seq.split('-')[1:])
-                _ = [params.update(x) for x in [SEQ2SEQ_MDL_PARAMS.setdefault('pytorch', {}).setdefault('elmo', {}), SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(task_type, {})]]
+                _ = [params.update(x) for x in [C.SEQ2SEQ_MDL_PARAMS.setdefault('pytorch', {}).setdefault('elmo', {}), C.SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(task_type, {})]]
                 self.seq2seq = gen_pytorch_wrapper('seq2seq', pth_mdl, **params[pth_mdl])
-                encoder_odim = SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
+                encoder_odim = C.SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
             else:
-                _ = [params.update(x) for x in [SEQ2SEQ_MDL_PARAMS.setdefault(seq2seq, {}).setdefault('elmo', {}), SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(task_type, {})]]
-                self.seq2seq = SEQ2SEQ_MAP[seq2seq](**params)
+                _ = [params.update(x) for x in [C.SEQ2SEQ_MDL_PARAMS.setdefault(seq2seq, {}).setdefault('elmo', {}), C.SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(task_type, {})]]
+                self.seq2seq = C.SEQ2SEQ_MAP[seq2seq](**params)
                 if hasattr(self.seq2seq, 'get_output_dim'):
                     encoder_odim = self.seq2seq.get_output_dim()
                 else:
-                    encoder_odim = SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params])
+                    encoder_odim = C.SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params])
         else:
             self.seq2seq = None
             encoder_odim = self.n_embd
         self.maxlen = self.task_params.setdefault('maxlen', 128)
-        self.norm = NORM_TYPE_MAP[norm_type](self.maxlen)
+        self.norm = C.NORM_TYPE_MAP[norm_type](self.maxlen)
         # self.norm = nn.LayerNorm([128,2048])
         self.hdim = encoder_odim
         self.linear = self.__init_linear__()
@@ -318,12 +324,12 @@ class EmbeddingHead(nn.Module):
             loss_func = nn.BCEWithLogitsLoss(pos_weight=10*weights if weights is not None else None, reduction='none')
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
-            loss_cls = RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
-            loss_func = loss_cls(reduction='none', x_mode=SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
+            from util import config as C
+            loss_cls = C.RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
+            loss_func = loss_cls(reduction='none', x_mode=C.SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
         if self.thrshlder:
             num_lbs = labels.view(-1, self.num_lbs).sum(1)
             clf_loss = 0.8 * clf_loss + 0.2 * F.mse_loss(self.thrshld, torch.sigmoid(torch.topk(clf_logits, k=num_lbs.max(), dim=1, sorted=True)[0][:,num_lbs-1]), reduction='mean')
         if sample_weights is not None: clf_loss *= sample_weights
         return clf_loss, lm_loss
-

@@ -14,20 +14,19 @@ import os, sys, copy
 import scipy as sp
 
 import torch
+from torch import nn
 
 from allennlp.modules.seq2vec_encoders import PytorchSeq2VecWrapper
 from allennlp.modules.seq2seq_encoders import PytorchSeq2SeqWrapper
 
-from config import PYTORCH_WRAPPER, CNSTRNTS_MAP, CNSTRNT_PARAMS_MAP
-
 from bionlp.util import io
-
-from dataset import DataParallel
+from . import config as C
+from .dataset import DataParallel
 
 
 def gen_pytorch_wrapper(mdl_type, mdl_name, **kwargs):
     wrapper_cls = PytorchSeq2SeqWrapper if mdl_type == 'seq2seq' else PytorchSeq2VecWrapper
-    mdl_cls = PYTORCH_WRAPPER[mdl_name]
+    mdl_cls = C.PYTORCH_WRAPPER[mdl_name]
     return wrapper_cls(module=mdl_cls(**kwargs))
 
 
@@ -55,14 +54,14 @@ def gen_mdl(mdl_name, config, pretrained=True, use_gpu=False, distrb=False, dev_
             params = pr('LM', config.lm_params)
             for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
                 if pname in params: del params[pname]
-            config = config.config(**params)
+            lm_config = config.lm_config(**params)
             if (mdl_name == 'elmo'):
-                pos_params = [config[k] for k in ['options_file','weight_file', 'num_output_representations']]
-                kw_params = dict([(k, config[k]) for k in config.keys() if k not in ['options_file','weight_file', 'num_output_representations', 'elmoedim']])
+                pos_params = [lm_config[k] for k in ['options_file','weight_file', 'num_output_representations']]
+                kw_params = dict([(k, lm_config[k]) for k in lm_config.keys() if k not in ['options_file','weight_file', 'num_output_representations', 'elmoedim']])
                 print('ELMo model parameters: %s %s' % (pos_params, kw_params))
                 model = config.lm_model(*pos_params, **kw_params)
             else:
-                model = config.lm_model(config)
+                model = config.lm_model(lm_config)
         except Exception as e:
             print(e)
             print('Cannot find the pretrained model file, using online model instead.')
@@ -80,12 +79,12 @@ def gen_clf(mdl_name, config, encoder='pool', constraints=[], use_gpu=False, dis
     params = pr('LM', config.lm_params) if lm_mdl_name != 'none' else {}
     for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
         if pname in params: del params[pname]
-    kwargs['config'] = config.config(**params) if lm_mdl_name != 'none' else {}
+    kwargs['config'] = config.lm_config(**params) if lm_mdl_name != 'none' else {}
 
     lvar = locals()
     for x in constraints:
-        cnstrnt_cls, cnstrnt_params = copy.deepcopy(CNSTRNTS_MAP[x])
-        constraint_params = pr('Constraint', CNSTRNT_PARAMS_MAP[x])
+        cnstrnt_cls, cnstrnt_params = copy.deepcopy(C.CNSTRNTS_MAP[x])
+        constraint_params = pr('Constraint', C.CNSTRNT_PARAMS_MAP[x])
         cnstrnt_params.update(dict([((k, p), constraint_params[p]) for k, p in cnstrnt_params.keys() if p in constraint_params]))
         cnstrnt_params.update(dict([((k, p), kwargs[p]) for k, p in cnstrnt_params.keys() if p in kwargs]))
         cnstrnt_params.update(dict([((k, p), lvar[p]) for k, p in cnstrnt_params.keys() if p in lvar]))
@@ -130,12 +129,12 @@ def _weights_init(mean=0., std=0.02):
     return _wi
 
 
-def _prsn_cor(trues, preds):
-    return sp.stats.pearsonr(trues, preds)[0]
-
-
 def _sprmn_cor(trues, preds):
     return sp.stats.spearmanr(trues, preds)[0]
+
+
+def _prsn_cor(trues, preds):
+    return sp.stats.pearsonr(trues, preds)[0]
 
 
 def _handle_model(model, dev_id=None, distrb=False):

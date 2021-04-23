@@ -15,7 +15,6 @@ from optparse import OptionParser
 from tqdm import tqdm
 
 import numpy as np
-from scipy.sparse import csc_matrix
 import pandas as pd
 
 import torch
@@ -28,11 +27,15 @@ from transformers import get_linear_schedule_with_warmup
 from bionlp.nlp import enrich_txt_by_w2v
 from bionlp.util import io, system
 
-from ..util.dataset import EmbeddingPairDataset
-from ..modules.embedding import EmbeddingHead
-
 FILE_DIR = os.path.dirname(os.path.realpath(__file__))
 PAR_DIR = os.path.abspath(os.path.join(FILE_DIR, os.path.pardir))
+
+sys.path.insert(0, PAR_DIR)
+
+from modules.embedding import EmbeddingHead
+from modules.ranking import SiameseRankTransformer
+from util.dataset import EmbeddingPairDataset
+
 CONFIG_FILE = os.path.join(PAR_DIR, 'etc', 'config.yaml')
 DATA_PATH = os.path.join(os.path.expanduser('~'), 'data', 'bionlp')
 SC=';;'
@@ -147,7 +150,8 @@ def siamese_rank(dev_id=None):
     eval(clf, test_loader, test_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='test_siamese', mdl_name=opts.model, use_gpu=use_gpu, ignored_label=task_extparms.setdefault('ignored_label', None))
 
     # Adjust the model
-    clf.merge_siamese(tokenizer=tokenizer, encode_func=config.encode_func, trnsfm=[trsfms, {}, trsfms_kwargs], special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), topk=128, lbnotes='../lbnotes.csv')
+    clf_trnsfmr = SiameseRankTransformer(clf)
+    clf_trnsfmr.merge_siamese(tokenizer=tokenizer, encode_func=config.encode_func, trnsfm=[trsfms, {}, trsfms_kwargs], special_tknids_args=special_tknids_args, pad_val=task_extparms.setdefault('xpad_val', 0), topk=128, lbnotes='../lbnotes.csv')
 
     # Recover the original task
     opts.task = orig_task
