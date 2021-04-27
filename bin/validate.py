@@ -81,7 +81,7 @@ def classify(dev_id=None):
         ds_kwargs['onto_col'] = task_cols['ontoid']
 
     # Prepare data
-    if (not opts.distrb or opts.distrb and hvd.rank() == 0): print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
+    if (not opts.distrb or opts.distrb and hvd.rank() == 0): logging.info('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name.startswith('bert'): train_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(train_ds)
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
@@ -115,18 +115,18 @@ def classify(dev_id=None):
     if hasattr(config, 'embed_type'): ext_params['embed_type'] = config.embed_type
     task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
     if (not opts.distrb or opts.distrb and hvd.rank() == 0):
-        print('Classifier hyper-parameters: %s' % ext_params)
-        print('Classifier task-related parameters: %s' % task_params)
+        logging.info('Classifier hyper-parameters: %s' % ext_params)
+        logging.info('Classifier task-related parameters: %s' % task_params)
     if (opts.resume):
         # Load model
         clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
         if opts.refresh:
-            print('Refreshing and saving the model with newest code...')
+            logging.info('Refreshing and saving the model with newest code...')
             try:
                 if (not distrb or distrb and hvd.rank() == 0):
                     save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
             except Exception as e:
-                print(e)
+                logging.warning(e)
         # Update parameters
         clf.update_params(task_params=task_params, **ext_params)
         if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=opts.distrb)
@@ -136,7 +136,7 @@ def classify(dev_id=None):
         if prv_optimizer: optimizer.load_state_dict(prv_optimizer.state_dict())
         training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(opts.wrmprop*training_steps), num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
-        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print((optimizer, scheduler))
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, config, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
@@ -146,7 +146,7 @@ def classify(dev_id=None):
         optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
         training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
-        if (not opts.distrb or opts.distrb and hvd.rank() == 0): print((optimizer, scheduler))
+        if (not opts.distrb or opts.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
 
     if opts.distrb:
         # Add Horovod Distributed Optimizer
@@ -170,7 +170,7 @@ def classify(dev_id=None):
     test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % opts.fmt), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
     if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
     test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-    # print((train_ds.binlb, dev_ds.binlb, test_ds.binlb))
+    logging.debug(('binlb', train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
     # Evaluation
     eval(clf, dev_loader, config, dev_ds.binlbr, special_tknids_args, pad_val=(task_extparms.setdefault('xpad_val', 0), train_ds.binlb[task_extparms.setdefault('ypad_val', 0)]) if task_type=='nmt' else task_extparms.setdefault('xpad_val', 0), task_type=task_type, task_name=opts.task, ds_name='dev', mdl_name=opts.model, use_gpu=use_gpu, devq=dev_id, distrb=opts.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
@@ -194,7 +194,7 @@ def multi_clf(dev_id=None):
     from bionlp.util import fs
     iflteng = inflect.engine()
 
-    print('### Multi Classifier Head Mode ###')
+    logging.info('### Multi Classifier Head Mode ###')
     # Prepare model related meta data
     mdl_name = opts.model.lower().replace(' ', '_')
     common_cfg = cfgr('validate', 'common')
@@ -230,19 +230,19 @@ def multi_clf(dev_id=None):
     ext_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) else (k, v) for k, v in config.clf_ext_params.items()])
     if hasattr(config, 'embed_type') and config.embed_type: ext_params['embed_type'] = config.embed_type
     task_params = dict([(k, getattr(opts, k)) if hasattr(opts, k) and getattr(opts, k) is not None else (k, v) for k, v in task_extparms.setdefault('mdlcfg', {}).items()])
-    print('Classifier hyper-parameters: %s' % ext_params)
-    print('Classifier task-related parameters: %s' % task_params)
+    logging.info('Classifier hyper-parameters: %s' % ext_params)
+    logging.info('Classifier task-related parameters: %s' % task_params)
     orig_epochs = mltclf_epochs = opts.epochs
     elapsed_mltclf_epochs, opts.epochs = 0, 1
     if (opts.resume):
         # Load model
         clf, prv_optimizer, resume, chckpnt = load_model(opts.resume)
         if opts.refresh:
-            print('Refreshing and saving the model with newest code...')
+            logging.info('Refreshing and saving the model with newest code...')
             try:
                 save_model(clf, prv_optimizer, '%s_%s.pth' % (opts.task, opts.model))
             except Exception as e:
-                print(e)
+                logging.warning(e)
         elapsed_mltclf_epochs, all_binlb = chckpnt.setdefault('mltclf_epochs', 0), clf.binlb
         # Update parameters
         clf.update_params(task_params=task_params, **ext_params)
@@ -253,7 +253,7 @@ def multi_clf(dev_id=None):
         if prv_optimizer: optimizer.load_state_dict(prv_optimizer.state_dict())
         training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
-        print((optimizer, scheduler))
+        logging.info((optimizer, scheduler))
     else:
         # Build model
         lm_model = gen_mdl(mdl_name, config, pretrained=True if type(opts.pretrained) is str and opts.pretrained.lower() == 'true' else opts.pretrained, use_gpu=use_gpu, distrb=opts.distrb, dev_id=dev_id) if mdl_name != 'none' else None
@@ -263,17 +263,17 @@ def multi_clf(dev_id=None):
         optimizer = optmzr_cls[0](clf.parameters(), lr=opts.lr, weight_decay=opts.wdecay, **optmzr_cls[1]) if opts.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=opts.lr, momentum=0.9)
         training_steps = int(len(train_ds) / opts.bsize) if hasattr(train_ds, '__len__') else opts.trainsteps
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=opts.wrmprop, num_training_steps=training_steps) if not opts.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
-        print((optimizer, scheduler))
+        logging.info((optimizer, scheduler))
 
     # Prepare data
-    print('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
+    logging.info('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
     num_clfs = min([len(fs.listf(os.path.join(DATA_PATH, task_path), pattern='%s_\d.csv' % x)) for x in ['train', 'dev', 'test']])
     for epoch in range(elapsed_mltclf_epochs, mltclf_epochs):
-        print('Global %i epoch(s)...' % epoch)
+        logging.info('Global %i epoch(s)...' % epoch)
         clf.reset_global_binlb()
         all_binlb = {}
         for i in range(num_clfs):
-            print('Training on the %s sub-dataset...' % iflteng.ordinal(i+1))
+            logging.info('Training on the %s sub-dataset...' % iflteng.ordinal(i+1))
             train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms else None, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
             new_lbs = [k for k in train_ds.binlb.keys() if k not in all_binlb]
             all_binlb.update(dict([(k, v) for k, v in zip(new_lbs, range(len(all_binlb), len(all_binlb)+len(new_lbs)))]))
@@ -305,7 +305,7 @@ def multi_clf(dev_id=None):
             test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test_%i.%s' % (i, opts.fmt)), task_cols['X'], task_cols['y'], config.encode_func, tokenizer, config, sep='\t', index_col=task_cols['index'], binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else all_binlb, transforms=trsfms, transforms_kwargs=trsfms_kwargs, mltl=task_extparms.setdefault('mltl', False), **ds_kwargs)
             if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
             test_loader = DataLoader(test_ds, batch_size=opts.bsize, shuffle=False, num_workers=opts.np)
-            # print((len(train_ds.binlb), len(dev_ds.binlb), len(test_ds.binlb)))
+            logging.debug(('binlb', train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
             # Adjust the model
             clf.get_linear(binlb=train_ds.binlb, idx=i)
@@ -329,7 +329,7 @@ def multi_clf(dev_id=None):
             try:
                 save_model(clf, optimizer, '%s_%s.pth' % (opts.task, opts.model), devq=dev_id, distrb=opts.distrb)
             except Exception as e:
-                print(e)
+                logging.warning(e)
     opts.epochs = orig_epochs
 
     if opts.noeval: return
@@ -487,7 +487,7 @@ if __name__ == '__main__':
     	plot_common = cfgr('bionlp.util.plot', 'common')
     	# txtclf.init(plot_cfg=plot_cfg, plot_common=plot_common)
     else:
-        print('Config file `%s` does not exist!' % CONFIG_FILE)
+        logging.error('Config file `%s` does not exist!' % CONFIG_FILE)
 
     if (opts.gpuq is not None and not opts.gpuq.strip().isspace()):
     	opts.gpuq = list(range(torch.cuda.device_count())) if (opts.gpuq == 'auto' or opts.gpuq == 'all') else [int(x) for x in opts.gpuq.split(',') if x]

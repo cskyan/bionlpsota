@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys
+import os, sys, logging
 
 import pandas as pd
 
@@ -68,7 +68,7 @@ class OntoBERTClfHead(T.BERTClfHead):
             self.onto = config.onto_df
         else:
             onto_fpath = config.onto if hasattr(config, 'onto') and os.path.exists(config.onto) else 'onto.csv'
-            print('Reading ontology dictionary file [%s]...' % onto_fpath)
+            logging.info('Reading ontology dictionary file [%s]...' % onto_fpath)
             self.onto = pd.read_csv(onto_fpath, sep=kwargs.setdefault('sep', '\t'), index_col='id')
             setattr(config, 'onto_df', self.onto)
         self.embeddim = embeddim

@@ -155,12 +155,12 @@ def _step_gpt(model, optimizer, padtrim_X, padtrim_M, use_gpu=False):
 def train(dev_id=None):
     use_gpu = dev_id is not None
     if opts.resume:
-        print('Loading previously trained model...')
+        logging.info('Loading previously trained model...')
         checkpoint = torch.load(opts.resume)
         model = checkpoint['model']
         model.load_state_dict(checkpoint['state_dict'])
         if ('resume' in checkpoint):
-            print('Resuming from %i epoch(s) and %i sentence(s)' % (checkpoint['resume']['epoch']+1, checkpoint['resume']['sample']))
+            logging.info('Resuming from %i epoch(s) and %i sentence(s)' % (checkpoint['resume']['epoch']+1, checkpoint['resume']['sample']))
     else:
         model = MODEL_MAP[opts.model].from_pretrained(MODEL_NAME_MAP[opts.model])
         # try:
@@ -211,21 +211,21 @@ def train(dev_id=None):
                         total_loss += _step_gpt(model, optimizer, padtrim_X, padtrim_M, use_gpu=use_gpu)
                         break
                     except Exception as e:
-                        print(e)
+                        logging.warning(e)
                 else:
                     train_time = time.time() - t0
-                    print('Interrupted! training time for %i epoch(s), %i batch(s) and %i sentence(s): %0.3fs' % (epoch + 1, batch_count, sent_count, train_time))
+                    logging.info('Interrupted! training time for %i epoch(s), %i batch(s) and %i sentence(s): %0.3fs' % (epoch + 1, batch_count, sent_count, train_time))
                     save_model(model, optimizer, '%s_checkpoint.pth' % opts.model, in_wrapper=in_wrapper, devq=opts.devq, resume={'epoch':epoch, 'sample':batch_count * opts.bsize})
                     sys.exit(0)
                 batch_tkns = []
                 batch_count += 1
                 if (opts.autosave > 0 and batch_count % opts.autosave == 0):
-                    print('Autosaving model...')
+                    logging.info('Autosaving model...')
                     chkpt_fname ='%s_autosave_checkpoint.pth' % opts.model
                     save_model(model, optimizer, chkpt_fname, in_wrapper=in_wrapper, devq=opts.devq, resume={'epoch':epoch, 'sample':batch_count * opts.bsize})
                     del model
                     torch.cuda.empty_cache()
-                    print('Loading autosaved model...')
+                    logging.info('Loading autosaved model...')
                     checkpoint = torch.load(chkpt_fname)
                     model = checkpoint['model']
                     model.load_state_dict(checkpoint['state_dict'])
@@ -236,7 +236,7 @@ def train(dev_id=None):
             sent_count += 1
             if (killer.kill_now):
                 train_time = time.time() - t0
-                print('Interrupted! training time for %i epoch(s), %i batch(s) and %i sentence(s): %0.3fs' % (epoch + 1, batch_count, sent_count, train_time))
+                logging.info('Interrupted! training time for %i epoch(s), %i batch(s) and %i sentence(s): %0.3fs' % (epoch + 1, batch_count, sent_count, train_time))
                 save_model(model, optimizer, '%s_checkpoint.pth' % opts.model, in_wrapper=in_wrapper, devq=opts.devq, resume={'epoch':epoch, 'sample':batch_count * opts.bsize})
                 sys.exit(0)
         if (len(batch_tkns) > 0):
@@ -245,7 +245,7 @@ def train(dev_id=None):
             total_loss += _step_gpt(model, optimizer, padtrim_X, padtrim_M, use_gpu=use_gpu)
         scheduler.step()
         train_time = time.time() - t0
-        print('Training time for %i epoch(s): %0.3fs' % (epoch + 1, train_time))
+        logging.info('Training time for %i epoch(s): %0.3fs' % (epoch + 1, train_time))
 
     save_model(model, optimizer, '%s_checkpoint.pth' % opts.model, opts.devq)
 
@@ -325,7 +325,7 @@ if __name__ == '__main__':
     	plot_common = cfgr('bionlp.util.plot', 'common')
     	# txtclf.init(plot_cfg=plot_cfg, plot_common=plot_common)
     else:
-        print('Config file `%s` does not exist!' % CONFIG_FILE)
+        logging.error('Config file `%s` does not exist!' % CONFIG_FILE)
 
     if (opts.gpuq is not None and not opts.gpuq.strip().isspace()):
     	opts.gpuq = list(range(torch.cuda.device_count())) if (opts.gpuq == 'auto' or opts.gpuq == 'all') else [int(x) for x in opts.gpuq.split(',') if x]

@@ -9,6 +9,8 @@
 ###########################################################################
 #
 
+import logging
+
 import torch
 from torch import nn
 
@@ -304,7 +306,7 @@ class EmbeddingHead(nn.Module):
             if self.crf:
                 tag_seq, score = zip(*self.crf.viterbi_tags(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), torch.ones_like(input_ids)))
                 tag_seq = torch.tensor(tag_seq).to('cuda') if use_gpu else torch.tensor(tag_seq)
-                print((tag_seq.min(), tag_seq.max(), score))
+                logging.debug((tag_seq.min(), tag_seq.max(), score))
                 clf_logits = torch.zeros((*tag_seq.size(), self.num_lbs)).to('cuda') if use_gpu else torch.zeros((*tag_seq.size(), self.num_lbs))
                 clf_logits = clf_logits.scatter(-1, tag_seq.unsqueeze(-1), 1)
                 return clf_logits

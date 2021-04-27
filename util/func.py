@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, copy
+import os, sys, copy, logging
 
 import scipy as sp
 
@@ -35,19 +35,19 @@ def gen_mdl(mdl_name, config, pretrained=True, use_gpu=False, distrb=False, dev_
     wsdir = config.wsdir if hasattr(config, 'wsdir') and os.path.isdir(config.wsdir) else '.'
     if distrb: import horovod.torch as hvd
     if (type(pretrained) is str):
-        if (not distrb or distrb and hvd.rank() == 0): print('Using pretrained model from `%s`' % pretrained)
+        if (not distrb or distrb and hvd.rank() == 0): logging.info('Using pretrained model from `%s`' % pretrained)
         checkpoint = torch.load(pretrained, map_location='cpu')
         model = checkpoint['model']
         model.load_state_dict(checkpoint['state_dict'])
     elif (pretrained):
-        if (not distrb or distrb and hvd.rank() == 0): print('Using pretrained model...')
+        if (not distrb or distrb and hvd.rank() == 0): logging.info('Using pretrained model...')
         mdl_name = mdl_name.split('_')[0]
         common_cfg = config.common_cfg if hasattr(config, 'common_cfg') else {}
         pr = io.param_reader(os.path.join(wsdir, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
         params = pr('LM', config.lm_params)
         model = config.lm_model.from_pretrained(params['pretrained_mdl_path'] if 'pretrained_mdl_path' in params else config.lm_mdl_name)
     else:
-        if (not distrb or distrb and hvd.rank() == 0): print('Using untrained model...')
+        if (not distrb or distrb and hvd.rank() == 0): logging.info('Using untrained model...')
         try:
             common_cfg = config.common_cfg if hasattr(config, 'common_cfg') else {}
             pr = io.param_reader(os.path.join(wsdir, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
@@ -58,13 +58,13 @@ def gen_mdl(mdl_name, config, pretrained=True, use_gpu=False, distrb=False, dev_
             if (mdl_name == 'elmo'):
                 pos_params = [lm_config[k] for k in ['options_file','weight_file', 'num_output_representations']]
                 kw_params = dict([(k, lm_config[k]) for k in lm_config.keys() if k not in ['options_file','weight_file', 'num_output_representations', 'elmoedim']])
-                print('ELMo model parameters: %s %s' % (pos_params, kw_params))
+                logging.info('ELMo model parameters: %s %s' % (pos_params, kw_params))
                 model = config.lm_model(*pos_params, **kw_params)
             else:
                 model = config.lm_model(lm_config)
         except Exception as e:
-            print(e)
-            print('Cannot find the pretrained model file, using online model instead.')
+            logging.warning(e)
+            logging.warning('Cannot find the pretrained model file, using online model instead.')
             model = config.lm_model.from_pretrained(config.lm_mdl_name)
     if (use_gpu): model = model.to('cuda')
     return model
@@ -96,7 +96,7 @@ def gen_clf(mdl_name, config, encoder='pool', constraints=[], use_gpu=False, dis
 
 
 def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=None, distrb=False, **kwargs):
-    print('Saving trained model...')
+    logging.info('Saving trained model...')
     use_gpu, multi_gpu = (devq and len(devq) > 0), (devq and len(devq) > 1)
     if not distrb and (in_wrapper or multi_gpu): model = model.module
     model = model.cpu() if use_gpu else model
@@ -107,7 +107,7 @@ def save_model(model, optimizer, fpath='checkpoint.pth', in_wrapper=False, devq=
 
 
 def load_model(mdl_path):
-    print('Loading previously trained model...')
+    logging.info('Loading previously trained model...')
     checkpoint = torch.load(mdl_path, map_location='cpu')
     model, optimizer = checkpoint['model'], checkpoint['optimizer']
     model.load_state_dict(checkpoint['state_dict'])

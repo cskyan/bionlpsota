@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, pickle, itertools
+import os, sys, pickle, itertools, logging
 
 import numpy as np
 
@@ -19,11 +19,11 @@ import ftfy, spacy
 try:
     nlp = spacy.load('en_core_sci_md')
 except Exception as e:
-    print(e)
+    logging.warning(e)
     try:
         nlp = spacy.load('en_core_sci_sm')
     except Exception as e:
-        print(e)
+        logging.warning(e)
         nlp = spacy.load('en_core_web_sm')
 
 from bionlp.nlp import AdvancedCountVectorizer, AdvancedTfidfVectorizer
@@ -43,8 +43,15 @@ def _entlmnt_transform(sample, options=None, model=None, seqlen=32, start_tknids
     X, y = sample
     if model == 'bert':
         if kwargs.setdefault('sentsim_func', None) is None:
-            trim_len = int(np.ceil((sum([len(v) for v in [start_tknids, X[0], delim_tknids, X[1], delim_tknids]]) - seqlen) / 2.0))
-            X = [x[:len(x)-trim_len] for x in X]
+            if kwargs.setdefault('keep_left', False):
+                keep_len = seqlen - sum([len(v) for v in [start_tknids, X[0], delim_tknids, delim_tknids])
+                X = [X[0], X[1][:keep_len]]
+            elif kwargs.setdefault('keep_right', False):
+                keep_len = seqlen - sum([len(v) for v in [start_tknids, delim_tknids, X[1], delim_tknids])
+                X = [X[0][:keep_len], X[1]]
+            else:
+                trim_len = int(np.ceil((sum([len(v) for v in [start_tknids, X[0], delim_tknids, X[1], delim_tknids]]) - seqlen) / 2.0))
+                X = [x[:len(x)-trim_len] for x in X]
             X = start_tknids + X[0] + delim_tknids + X[1] + delim_tknids
         else:
             pass
@@ -149,8 +156,8 @@ def _base_encode(text, tokenizer):
             record.extend(tokenizer.convert_tokens_to_ids(tokens))
             records.append(record)
     except Exception as e:
-        print(e)
-        print('Cannot encode %s' % str(text).encode('ascii', 'replace').decode('ascii'))
+        logging.warning(e)
+        logging.warning('Cannot encode %s' % str(text).encode('ascii', 'replace').decode('ascii'))
         return []
     return records[0] if (type(text) is str or not hasattr(text, '__iter__')) else records
 
@@ -162,26 +169,26 @@ def _gpt2_encode(text, tokenizer):
         try:
             records = list(itertools.chain(*[tokenizer.encode(w.text) for w in nlp(ftfy.fix_text(str(text)))])) if (type(text) is str or not hasattr(text, '__iter__')) else list(itertools.chain(*[list(itertools.chain(*[tokenizer.encode(w.text) for w in nlp(ftfy.fix_text(str(line)))])) for line in text]))
         except Exception as e:
-            print(e)
-            print('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
+            logging.warning(e)
+            logging.warning('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
             return []
     except Exception as e:
-        print(e)
-        print('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
+        logging.warning(e)
+        logging.warning('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
         return []
     return records
 
 
 def _txt2vec(texts, config, clf_h=None, txt_vctrz=None, char_vctrz=None, use_tfidf=True, ftdecomp=None, ftmdl=None, n_components=128, saved_path='.', prefix='corpus', **kwargs):
     extra_outputs = ()
-    print('Converting text to vectors with parameters: %s; %s' % (str(dict(txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, use_tfidf=use_tfidf, ftdecomp=ftdecomp, ftmdl=ftmdl, n_components=n_components, prefix=prefix, saved_path=saved_path)), str(kwargs)))
+    logging.info('Converting text to vectors with parameters: %s; %s' % (str(dict(txt_vctrz=txt_vctrz, char_vctrz=char_vctrz, use_tfidf=use_tfidf, ftdecomp=ftdecomp, ftmdl=ftmdl, n_components=n_components, prefix=prefix, saved_path=saved_path)), str(kwargs)))
     from scipy.sparse import csr_matrix, hstack, issparse
     if config.sentvec_path and os.path.isfile(config.sentvec_path):
         import sent2vec
         sentvec_model = sent2vec.Sent2vecModel()
         sentvec_model.load_model(config.sentvec_path)
         sentvec = sentvec_model.embed_sentences(texts)
-        print('Sentence vector dimension of dataset %s: %i' % (prefix, sentvec.shape[1]))
+        logging.info('Sentence vector dimension of dataset %s: %i' % (prefix, sentvec.shape[1]))
         clf_h = hstack((csr_matrix(clf_h), txt_X)) if clf_h is not None else sentvec
     if config.do_tfidf:
         tfidf_cache_fpath = os.path.join(saved_path, '%s_tfidf.pkl' % prefix)
@@ -201,11 +208,11 @@ def _txt2vec(texts, config, clf_h=None, txt_vctrz=None, char_vctrz=None, use_tfi
                         for i, k in enumerate(kwargs['ngram_weights'].keys()): ngram_idx[k] = (ngram_idx[k], norm_weights[i])
                         extra_outputs += (ngram_idx,)
             else:
-                print('Eval mode of TFIDF:')
+                logging.info('Eval mode of TFIDF:')
                 txt_X = txt_vctrz.transform(texts)
             with open('%s_tfidf.pkl' % prefix, 'wb') as fd:
                 pickle.dump((txt_X, txt_vctrz), fd)
-        print('TFIDF dimension of dataset %s: %i' % (prefix, txt_X.shape[1]))
+        logging.info('TFIDF dimension of dataset %s: %i' % (prefix, txt_X.shape[1]))
         clf_h = hstack((csr_matrix(clf_h), txt_X)) if clf_h is not None else txt_X
     if config.do_chartfidf:
         chartfidf_cache_fpath = os.path.join(saved_path, '%s_chartfidf.pkl' % prefix)
@@ -225,11 +232,11 @@ def _txt2vec(texts, config, clf_h=None, txt_vctrz=None, char_vctrz=None, use_tfi
                         for i, k in enumerate(kwargs['ngram_weights'].keys()): ngram_idx[k] = (ngram_idx[k], norm_weights[i])
                         extra_outputs += (ngram_idx,)
             else:
-                print('Eval mode of Char TFIDF:')
+                logging.info('Eval mode of Char TFIDF:')
                 char_X = char_vctrz.transform(texts)
             with open('%s_chartfidf.pkl' % prefix, 'wb') as fd:
                 pickle.dump((char_X, char_vctrz), fd)
-        print('Char TFIDF dimension of dataset %s: %i' % (prefix, char_X.shape[1]))
+        logging.info('Char TFIDF dimension of dataset %s: %i' % (prefix, char_X.shape[1]))
         clf_h = hstack((csr_matrix(clf_h), char_X)) if clf_h is not None else char_X
     if config.do_bm25:
         bm25_cache_fpath = os.path.join(saved_path, '%s_bm25.pkl' % prefix)
@@ -241,7 +248,7 @@ def _txt2vec(texts, config, clf_h=None, txt_vctrz=None, char_vctrz=None, use_tfi
             txt_bm25_X = np.array(get_bm25_weights(texts, n_jobs=config.np))
             with open('%s_bm25.pkl' % prefix, 'wb') as fd:
                 pickle.dump(txt_bm25_X, fd)
-        print('BM25 dimension of dataset %s: %i' % (prefix, txt_bm25_X.shape[1]))
+        logging.info('BM25 dimension of dataset %s: %i' % (prefix, txt_bm25_X.shape[1]))
         clf_h = hstack((csr_matrix(clf_h), txt_bm25_X)) if clf_h is not None else txt_bm25_X
     if type(ftdecomp) is str: ftdecomp = ftdecomp.lower()
     if issparse(clf_h) and ftdecomp != 'svd': clf_h = clf_h.toarray()
@@ -254,10 +261,10 @@ def _txt2vec(texts, config, clf_h=None, txt_vctrz=None, char_vctrz=None, use_tfi
         elif ftdecomp == 'svd':
             from sklearn.decomposition import TruncatedSVD
             ftmdl = TruncatedSVD(n_components=n_components)
-        print('Using %s feature reduction...' % ftdecomp.upper())
+        logging.info('Using %s feature reduction...' % ftdecomp.upper())
         clf_h = ftmdl.fit_transform(clf_h).astype('float32')
     else:
-        print('Eval mode of feature reduction:')
+        logging.info('Eval mode of feature reduction:')
         clf_h = ftmdl.transform(clf_h).astype('float32')
     return (clf_h, txt_vctrz, char_vctrz, ftmdl) + extra_outputs
 
@@ -267,8 +274,8 @@ def _tokenize(text, tokenizer):
     try:
         records = [w.text for w in nlp(ftfy.fix_text(text))] if (type(text) is str) else [[w.text for w in nlp(ftfy.fix_text(line))] for line in text]
     except Exception as e:
-        print(e)
-        print('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
+        logging.warning(e)
+        logging.warning('Cannot encode %s' % str(text.encode('ascii', 'replace').decode('ascii')))
         return []
     return records
 

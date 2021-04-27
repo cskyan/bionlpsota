@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, random, operator, pickle, itertools
+import os, sys, random, operator, pickle, itertools, logging
 from collections import OrderedDict
 
 import numpy as np
@@ -76,7 +76,7 @@ class DatasetInterface(object):
             else:
                 filled_df[saved_col] = lbs
         except Exception as e:
-            print(e)
+            logging.warning(e)
             with open('pred_lbs.tmp', 'wb') as fd:
                 pickle.dump((filled_df, index, self.label_col, lbs), fd)
             raise e
@@ -129,7 +129,7 @@ class BaseDataset(DatasetInterface, Dataset):
         self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
         # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
         self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
-        print('Input DataFrame size: %s' % str(self.df.shape))
+        logging.info('Input DataFrame size: %s' % str(self.df.shape))
         if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
         self.df.columns = self.df.columns.astype(str, copy=False)
         self.mltl = mltl
@@ -434,10 +434,10 @@ class OntoDataset(BaseDataset):
             self.onto = config.onto_df
         else:
             onto_fpath = config.onto if hasattr(config, 'onto') and os.path.exists(config.onto) else 'onto.csv'
-            print('Reading ontology dictionary file [%s]...' % onto_fpath)
+            logging.info('Reading ontology dictionary file [%s]...' % onto_fpath)
             self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
             setattr(config, 'onto_df', self.onto)
-        print('Ontology DataFrame size: %s' % str(self.onto.shape))
+        logging.info('Ontology DataFrame size: %s' % str(self.onto.shape))
         self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
         self.onto_col = onto_col
 
@@ -518,7 +518,7 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
         try:
             super(EntlmntMltlIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, config, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, mltl=False, sampw=sampw, **kwargs)
         except Exception as e:
-            print(e)
+            logging.warning(e)
         if type(binlb) is str and binlb.startswith('mltl'):
             self.data, preproc_data = itertools.tee(self.data)
             labels = set([])

@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import copy
+import copy, logging
 
 import torch
 from torch import nn
@@ -25,28 +25,28 @@ from . import reduction as R
 
 
 class BaseClfHead(nn.Module):
-    """ Classifier Head for the Basic Language Model """
+    """ All-in-one Classifier Head for the Basic Language Model """
 
-    def __init__(self, lm_model, lm_config, config, task_type, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=True, do_extlin=False, do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, **kwargs):
+    def __init__(self, lm_model, lm_config, config, task_type, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, pdrop=0.2, do_norm=False, do_extlin=False, do_lastdrop=False, do_crf=False, do_thrshld=False, constraints=[], task_params={}, binlb={}, binlbr={}, debug=False, **kwargs):
         super(BaseClfHead, self).__init__()
-        self.task_params = task_params
         self.lm_model = lm_model
         self.lm_loss = lm_loss
         self.task_type = task_type
+        self.task_params = task_params
         self.sample_weights = sample_weights
+        self.num_lbs = num_lbs
         self.do_norm = do_norm
         self.do_extlin = do_extlin
         self.do_lastdrop = do_lastdrop
         self.dropout = nn.Dropout2d(pdrop) if task_type == 'nmt' else nn.Dropout(pdrop)
         self.last_dropout = nn.Dropout(pdrop) if do_lastdrop else None
         self.crf = ConditionalRandomField(num_lbs) if do_crf else None
-        self.thrshlder = R.ThresholdEstimator(last_hdim=kwargs['last_hdim']) if do_thrshld and 'last_hdim' in kwargs else None
-        self.thrshld = 0.5
         self.constraints = [cnstrnt_cls(**cnstrnt_params) for cnstrnt_cls, cnstrnt_params in constraints]
+        self.thrshlder = R.ThresholdEstimator(last_hdim=kwargs['last_hdim']) if do_thrshld and 'last_hdim' in kwargs else None
+        self.thrshld = kwargs.setdefault('thrshld', 0.5)
         self.mlt_trnsfmr = mlt_trnsfmr # accept multiple streams of inputs, each of which will be input into the transformer
         self.lm_logit = self._mlt_lm_logit if mlt_trnsfmr else self._lm_logit
         self.clf_h = self._clf_h
-        self.num_lbs = num_lbs
         self.dim_mulriple = 2 if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] and self.task_params.setdefault('sentsim_func', None) is not None and self.task_params['sentsim_func'] == 'concat' else 1 # two or one sentence
         if self.dim_mulriple > 1 and self.task_params.setdefault('concat_strategy', 'normal') == 'diff': self.dim_mulriple = 4
         self.kwprop = {}
@@ -57,6 +57,7 @@ class BaseClfHead(nn.Module):
         for k, v in kwargs.items():
             setattr(self, k, v)
         self.mode = 'clf'
+        self.debug = debug
 
     def __init_linear__(self):
         raise NotImplementedError
@@ -65,9 +66,11 @@ class BaseClfHead(nn.Module):
         use_gpu = next(self.parameters()).is_cuda
         sample_weights = extra_inputs[0] if self.sample_weights and len(extra_inputs) > 0 else None
         # mask = torch.arange(input_ids.size()[1]).to('cuda').unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2]) if use_gpu else torch.arange(input_ids.size()[1]).unsqueeze(0).expand(input_ids.size()[:2]) <= pool_idx.unsqueeze(1).expand(input_ids.size()[:2])
-        # print(('input_ids', [x.size() for x in input_ids] if type(input_ids) is list else input_ids.size()))
-        # print(('input_ids', [[','.join(map(str, s.tolist())) for s in x] for x in input_ids] if type(input_ids) is list else [','.join(map(str, s.tolist())) for s in input_ids]))
-        # print(('pool_idx', [x.sum(dim=1).float()/x.size()[1] for x in pool_idx] if type(pool_idx) is list else pool_idx.sum(dim=1).float()/pool_idx.size()[1]))
+        # pool_idx is the index of the last encoded token in each sample
+        if self.debug:
+            logging.debug(('size of input_ids', [x.size() for x in input_ids] if type(input_ids) is list else input_ids.size()))
+            logging.debug(('input_ids', [[','.join(map(str, s.tolist())) for s in x] for x in input_ids] if type(input_ids) is list else [','.join(map(str, s.tolist())) for s in input_ids]))
+            logging.debug(('pool_idx', [x.sum(dim=1).float()/x.size()[1] for x in pool_idx] if type(pool_idx) is list else pool_idx.sum(dim=1).float()/pool_idx.size()[1]))
         if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim']:
             trnsfm_output = [self.transformer(input_ids[x], *extra_inputs, pool_idx=pool_idx[x]) for x in [0,1]]
             (hidden_states, past) = zip(*[trnsfm_output[x][:2] if type(trnsfm_output[x]) is tuple else (trnsfm_output[x], None) for x in [0,1]])
@@ -79,7 +82,7 @@ class BaseClfHead(nn.Module):
             (hidden_states, past) = trnsfm_output[:2] if type(trnsfm_output) is tuple else (trnsfm_output, None)
             extra_outputs = trnsfm_output[2:] if type(trnsfm_output) is tuple and len(trnsfm_output) > 2 else ()
         extra_inputs += extra_outputs
-        # print(('after transformer', trnsfm_output))
+        if self.debug: logging.debug(('after transformer', trnsfm_output))
         if (self.lm_loss):
             lm_logits, lm_target = self.lm_logit(input_ids, hidden_states, *extra_inputs, past=past, pool_idx=pool_idx)
             lm_loss_func = nn.CrossEntropyLoss(ignore_index=-1, reduction='none')
@@ -88,54 +91,58 @@ class BaseClfHead(nn.Module):
         else:
             lm_loss = None
 
-        # print(('hdstat: ', [x.size() for x in hidden_states] if type(hidden_states) is list else hidden_states.size()))
+        if self.debug: logging.debug(('hdstat: ', [x.size() for x in hidden_states] if type(hidden_states) is list else hidden_states.size()))
         clf_h, pool_idx = self.clf_h(hidden_states, pool_idx, past=past)
-        # print(('after clf_h', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
+        if self.debug: logging.debug(('after clf_h', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
         pooled_output = self.pool(input_ids, pool_idx, clf_h, *extra_inputs)
         if type(pooled_output) is tuple:
             clf_h = pooled_output[0]
             extra_outputs += pooled_output[1:]
         else:
             clf_h = pooled_output
-        # print(('after pool', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
+        if self.debug: logging.debug(('after pool', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
         if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] and (self.task_params.setdefault('sentsim_func', None) is not None): # default sentsim mode of gpt* is mlt_trnsfmr+_mlt_clf_h
             if self.do_norm: clf_h = [self.norm(clf_h[x]) for x in [0,1]]
             clf_h = [self.dropout(clf_h[x]) for x in [0,1]]
             if self.do_extlin and hasattr(self, 'extlinear'): clf_h = [self.extlinear(clf_h[x]) for x in [0,1]]
             if embedding_mode: return clf_h
             if (self.task_params.setdefault('sentsim_func', None) == 'concat'):
-                # clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
-                clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1]), clf_h[0]*clf_h[1]], dim=-1) if self.task_params.setdefault('concat_strategy', 'normal') == 'diff' else torch.cat(clf_h, dim=-1)
+                if self.task_params.setdefault('concat_strategy', 'normal') == 'reverse'):
+                    clf_h = (torch.cat(clf_h, dim=-1) + torch.cat(clf_h[::-1], dim=-1))
+                elif self.task_params['concat_strategy'] == 'diff':
+                    clf_h = torch.cat(clf_h+[torch.abs(clf_h[0]-clf_h[1]), clf_h[0]*clf_h[1]], dim=-1)
+                else:
+                    clf_h = torch.cat(clf_h, dim=-1)
                 clf_logits = self.linear(clf_h) if self.linear else clf_h
             elif self.task_type == 'sentsim':
                 clf_logits = clf_h = F.pairwise_distance(self.linear(clf_h[0]), self.linear(clf_h[1]), 2, eps=1e-12) if self.task_params['sentsim_func'] == 'dist' else F.cosine_similarity(self.linear(clf_h[0]), self.linear(clf_h[1]), dim=1, eps=1e-12)
         else:
             if self.do_norm: clf_h = self.norm(clf_h)
-            # print(('before dropout:', clf_h.size()))
+            if self.debug: logging.debug(('before dropout:', clf_h.size()))
             clf_h = self.dropout(clf_h)
             if self.do_extlin and hasattr(self, 'extlinear'): clf_h = self.extlinear(clf_h)
             if embedding_mode: return clf_h
-            # print(('after dropout:', clf_h.size()))
-            # print(('linear', self.linear))
+            if self.debug: logging.debug(('after dropout:', clf_h.size()))
+            if self.debug: logging.debug(('linear', self.linear))
             clf_logits = self.linear(clf_h.view(-1, self.n_embd) if self.task_type == 'nmt' else clf_h)
-        # print(('after linear:', clf_logits.size()))
+        if self.debug: logging.debug(('after linear:', clf_logits.size()))
         if self.thrshlder: self.thrshld = self.thrshlder(clf_h)
         if self.do_lastdrop: clf_logits = self.last_dropout(clf_logits)
-        # print(('after lastdrop:', clf_logits))
+        if self.debug: logging.debug(('after lastdrop:', clf_logits))
 
 
         if (labels is None):
             if self.crf:
                 tag_seq, score = zip(*self.crf.viterbi_tags(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), torch.ones_like(input_ids)))
                 tag_seq = torch.tensor(tag_seq).to('cuda') if use_gpu else torch.tensor(tag_seq)
-                print((tag_seq.min(), tag_seq.max(), score))
+                if self.debug: logging.debug((tag_seq.min(), tag_seq.max(), score))
                 clf_logits = torch.zeros((*tag_seq.size(), self.num_lbs)).to('cuda') if use_gpu else torch.zeros((*tag_seq.size(), self.num_lbs))
                 clf_logits = clf_logits.scatter(-1, tag_seq.unsqueeze(-1), 1)
                 return clf_logits if len(extra_outputs) == 0 else ((clf_logits,) + extra_outputs)
             for cnstrnt in self.constraints: clf_logits = cnstrnt(clf_logits)
             if (self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] and self.task_params.setdefault('sentsim_func', None) is not None and self.task_params['sentsim_func'] != 'concat' and self.task_params['sentsim_func'] != self.task_params.setdefault('ymode', 'sim')): return 1 - clf_logits.view(-1, self.num_lbs)
             return clf_logits.view(-1, self.num_lbs) if len(extra_outputs) == 0 else ((clf_logits.view(-1, self.num_lbs),) + extra_outputs)
-        # print((labels.max(), labels.size()))
+        if self.debug: logging.debug(('label max: ', labels.max(), 'label size: ' labels.size()))
         if self.crf:
             clf_loss = -self.crf(clf_logits.view(input_ids.size()[0], -1, self.num_lbs), pool_idx)
             if sample_weights is not None: clf_loss *= sample_weights
@@ -150,7 +157,7 @@ class BaseClfHead(nn.Module):
             clf_loss = loss_func(clf_logits.view(-1, self.num_lbs), labels.view(-1, self.num_lbs).float())
         elif self.task_type == 'sentsim':
             from util import config as C
-            # print((clf_logits.size(), labels.size()))
+            if self.debug: logging.debug(('clf logits: ', clf_logits.size()))
             loss_cls = C.RGRSN_LOSS_MAP[self.task_params.setdefault('loss', 'contrastive' if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else 'mse')]
             loss_func = loss_cls(reduction='none', x_mode=C.SIM_FUNC_MAP.setdefault(self.task_params['sentsim_func'], 'dist'), y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else (loss_cls(reduction='none', x_mode='sim', y_mode=self.task_params.setdefault('ymode', 'sim')) if self.task_params['sentsim_func'] == 'concat' else nn.MSELoss(reduction='none'))
             clf_loss = loss_func(clf_logits.view(-1), labels.view(-1))
@@ -311,7 +318,6 @@ class BERTClfHead(BaseClfHead):
         self._out_actvtn = C.ACTVTN_MAP[oactvtn]
         self.fchdim = fchdim
         self.hdim = self.dim_mulriple * self.n_embd if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else self.n_embd
-        # self.linear = nn.Sequential(nn.Linear(self.hdim, self.num_lbs), nn.Sigmoid()) if self.task_type == 'sentsim' else nn.Linear(self.hdim, self.num_lbs)
         self.linear = self.__init_linear__()
         if (initln): self.linear.apply(H._weights_init(mean=initln_mean, std=initln_std))
         # if (initln): self.lm_model.apply(self.lm_model.init_bert_weights)

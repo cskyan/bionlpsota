@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import os, sys, time, copy, pickle, itertools
+import os, sys, time, copy, pickle, itertools, logging
 from tqdm import tqdm
 
 import numpy as np
@@ -123,37 +123,37 @@ def train(clf, optimizer, dataset, config, special_tkns, scheduler=None, pad_val
                 optimizer.step()
                 if scheduler: scheduler.step()
             except Exception as e:
-                print(e)
+                logging.warning(e)
                 train_time = time.time() - t0
-                print('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
+                logging.warning('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
                 save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 raise e
             if (killer.kill_now):
                 train_time = time.time() - t0
-                print('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
+                logging.info('Interrupted! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
                 if (not distrb or distrb and hvd.rank() == 0):
                     save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 sys.exit(0)
         avg_loss = total_loss / (step + 1)
-        print('Train loss in %i epoch(s): %f' % (epoch + 1, avg_loss))
+        logging.info('Train loss in %i epoch(s): %f' % (epoch + 1, avg_loss))
         if epoch % 5 == 0:
             try:
                 if (not distrb or distrb and hvd.rank() == 0):
                     save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
             except Exception as e:
-                print(e)
+                logging.warning(e)
         if earlystop:
             do_stop = earlystoper.step(avg_loss)
             if distrb: do_stop = hvd.broadcast(torch.tensor(do_stop).type(torch.ByteTensor), 0).type(torch.BoolTensor)
             if do_stop:
-                print('Early stop!')
+                logging.info('Early stop!')
                 break
     try:
         if (not distrb or distrb and hvd.rank() == 0):
             if os.path.exists(chckpnt_fname): os.remove(chckpnt_fname)
             save_model(clf, optimizer, model_fname, devq=devq, distrb=config.distrb)
     except Exception as e:
-        print(e)
+        logging.warning(e)
 
 
 def eval(clf, dataset, config, binlbr, special_tkns, pad_val=0, task_type='mltc-clf', task_name='classification', ds_name='', mdl_name='sota', clipmaxn=0.25, use_gpu=False, devq=None, distrb=False, ignored_label=None):
@@ -277,7 +277,7 @@ def eval(clf, dataset, config, binlbr, special_tkns, pad_val=0, task_type='mltc-
 
         all_logits.append(logits.view(_lb_tnsr.size(0), -1, logits.size(-1)).detach().cpu().numpy())
     total_loss = total_loss / (step + 1)
-    print('Evaluation loss on %s dataset: %.2f' % (ds_name, total_loss))
+    logging.info('Evaluation loss on %s dataset: %.2f' % (ds_name, total_loss))
 
     all_logits = np.concatenate(all_logits, axis=0)
     if task_type == 'nmt':
@@ -307,13 +307,13 @@ def eval(clf, dataset, config, binlbr, special_tkns, pad_val=0, task_type='mltc-
         preds = np.squeeze(preds)
     if task_type == 'sentsim':
         if (np.isnan(preds).any()):
-            print('Predictions contain NaN values! Please try to decrease the learning rate!')
+            logging.info('Predictions contain NaN values! Please try to decrease the learning rate!')
             return
         try:
             metric_names, metrics_funcs = ['Mean Absolute Error', 'Mean Squared Error', 'Mean Squared Log Error', 'Median Absolute Error', 'R2', 'Spearman Correlation', 'Pearson Correlation'], [metrics.mean_absolute_error, metrics.mean_squared_error, metrics.mean_squared_log_error, metrics.median_absolute_error, metrics.r2_score, _sprmn_cor, _prsn_cor]
             perf_df = pd.DataFrame(dict([(k, [f(trues, preds)]) for k, f in zip(metric_names, metrics_funcs)]), index=[mdl_name])[metric_names]
         except Exception as e:
-            print(e)
+            logging.warning(e)
             metric_names, metrics_funcs = ['Mean Absolute Error', 'Median Absolute Error', 'R2', 'Spearman Correlation', 'Pearson Correlation'], [metrics.mean_absolute_error, metrics.median_absolute_error, metrics.r2_score, _sprmn_cor, _prsn_cor]
             perf_df = pd.DataFrame(dict([(k, [f(trues, preds)]) for k, f in zip(metric_names, metrics_funcs)]), index=[mdl_name])[metric_names]
     elif task_type in ['mltl-clf', 'nmt']:
@@ -322,11 +322,11 @@ def eval(clf, dataset, config, binlbr, special_tkns, pad_val=0, task_type='mltc-
     else:
         labels = [x for x in (list(binlbr.keys()-[clf.binlb[ignored_label]]) if ignored_label else list(binlbr.keys())) if x in preds or x in trues] if len(binlbr) > 1 else [0, 1]
         perf_df = pd.DataFrame(metrics.classification_report(trues, preds, labels=labels, target_names=[binlbr[x] for x in labels], output_dict=True)).T[['precision', 'recall', 'f1-score', 'support']]
-    print('Results for %s dataset is:\n%s' % (ds_name.title(), perf_df))
+    logging.info('Results for %s dataset is:\n%s' % (ds_name.title(), perf_df))
     perf_df.to_excel('perf_%s.xlsx' % resf_prefix)
 
     try:
         dataset.dataset.fill_labels(preds, saved_path='pred_%s.csv' % resf_prefix, index=indices)
     except Exception as e:
         raise e
-        print(e)
+        logging.warning(e)
