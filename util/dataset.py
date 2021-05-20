@@ -24,8 +24,8 @@ from torch.nn.parallel import replicate
 
 from bionlp.util import io
 
-
-SC=';;'
+global FALSE_LABELS
+FALSE_LABELS = [0, '0', 'false', 'False', 'F']
 
 
 class DatasetInterface(object):
@@ -41,28 +41,22 @@ class DatasetInterface(object):
                 sample = transform(sample, **transform_kwargs) if callable(transform) else getattr(self, transform)(sample, **transform_kwargs)
         return sample
 
-    def _nmt_transform(self, sample, options=None, binlb={}):
-        if (len(binlb) > 0): self.binlb = binlb
-        # if any([y not in self.binlb for y  in sample[1]]): print([y for y  in sample[1] if y not in self.binlb])
-        # return sample[0], [self.binlb.setdefault(y, len(self.binlb)) for y in sample[1]]
-        return sample[0], [self.binlb[y] if y in self.binlb else len(self.binlb) - 1 for y in sample[1]]
+    def _nmt_transform(self, sample):
+        return sample[0], [self.binlb.setdefault(y, len(self.binlb)) for y in sample[1]]
 
-    def _mltl_nmt_transform(self, sample, options=None, binlb={}, get_lb=lambda x: x.split(SC)):
-        if (len(binlb) > 0): self.binlb = binlb
+    def _mltl_nmt_transform(self, sample, get_lb=None):
+        get_lb = (lambda x: x.split(self.sc)) if get_lb is None else get_lb
         labels = [get_lb(lb) for lb in sample[1]]
-        # return sample[0], [[self.binlb.setdefault(y, len(self.binlb)) for y in lbs] if type(lbs) is list else self.binlb.setdefault(lbs, len(self.binlb)) for lbs in labels]
-        return sample[0], [[self.binlb[y] if y in self.binlb else len(self.binlb) - 1 for y in lbs] if type(lbs) is list else self.binlb[lbs] if lbs in self.binlb else len(self.binlb) - 1 for lbs in labels]
+        return sample[0], [[self.binlb.setdefault(y, len(self.binlb)) for y in lbs] if type(lbs) is list else self.binlb.setdefault(lbs, len(self.binlb)) for lbs in labels]
 
-    def _binc_transform(self, sample, options=None, binlb={}):
-        if (len(binlb) > 0): self.binlb = binlb
+    def _binc_transform(self, sample):
         return sample[0], 1 if sample[1] in self.binlb else 0
 
-    def _mltc_transform(self, sample, options=None, binlb={}):
-        if (len(binlb) > 0): self.binlb = binlb
+    def _mltc_transform(self, sample):
         return sample[0], self.binlb.setdefault(sample[1], len(self.binlb))
 
-    def _mltl_transform(self, sample, options=None, binlb={}, get_lb=lambda x: x.split(SC)):
-        if (len(binlb) > 0): self.binlb = binlb
+    def _mltl_transform(self, sample, get_lb=None):
+        get_lb = (lambda x: x.split(self.sc)) if get_lb is None else get_lb
         labels = get_lb(sample[1])
         return sample[0], [1 if lb in labels else 0 for lb in self.binlb.keys()]
 
@@ -86,7 +80,7 @@ class DatasetInterface(object):
 
     def rebalance(self):
         if (self.binlb is None): return
-        task_cols, task_trsfm, task_extparms = self.config.task_col, self.config.task_trsfm, self.config.task_ext_trsfm
+        task_cols, task_trsfm = self.config.task_col, self.config.task_trsfm
         lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
         self.df = self._df
         if len(lb_trsfm) > 0:
@@ -94,7 +88,7 @@ class DatasetInterface(object):
         else:
             lb_df = self.df[task_cols['y']]
         if (type(lb_df.iloc[0]) is list):
-            lb_df[:] = [self._mltl_transform((None, SC.join(lbs)))[1] for lbs in lb_df]
+            lb_df[:] = [self._mltl_transform((None, self.sc.join(lbs)))[1] for lbs in lb_df]
             max_lb_df = lb_df.loc[[idx for idx, lbs in lb_df.iteritems() if np.sum(list(map(int, lbs))) == 0]]
             max_num, avg_num = max_lb_df.shape[0], 1.0 * lb_df[~lb_df.index.isin(max_lb_df.index)].shape[0] / len(lb_df.iloc[0])
         else:
@@ -107,7 +101,7 @@ class DatasetInterface(object):
 
     def remove_mostfrqlb(self):
         if (self.binlb is None or self.binlb == 'rgrsn'): return
-        task_cols, task_trsfm, task_extparms = self.config.task_col, self.config.task_trsfm, self.config.task_ext_trsfm
+        task_cols, task_trsfm = self.config.task_col, self.config.task_trsfm
         lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
         self.df = self._df
         if len(lb_trsfm) > 0:
@@ -123,63 +117,77 @@ class DatasetInterface(object):
 class BaseDataset(DatasetInterface, Dataset):
     """Basic dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, config, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampw=False, sampfrac=None, **kwargs):
+    def __init__(self, csv_file, tokenizer, config, sampw=False, sampfrac=None, **kwargs):
+        self.sc = config.sc
         self.config = config
-        self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
-        self.label_col = [str(s) for s in label_col] if hasattr(label_col, '__iter__') and type(label_col) is not str else str(label_col)
-        # self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, encoding='utf-8', engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
-        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=sep, engine='python', error_bad_lines=False, dtype={self.label_col:'float' if binlb == 'rgrsn' else str}, **kwargs)
+        self.text_col = [str(s) for s in config.task_col['X']] if hasattr(config.task_col['X'], '__iter__') and type(config.task_col['X']) is not str else str(config.task_col['X'])
+        self.label_col = [str(s) for s in config.task_col['y']] if hasattr(config.task_col['y'], '__iter__') and type(config.task_col['y']) is not str else str(config.task_col['y'])
+        self.df = self._df = csv_file if type(csv_file) is pd.DataFrame else pd.read_csv(csv_file, sep=config.dfsep, engine='python', error_bad_lines=False, index_col=config.task_col['index'])
+        self.df[config.task_col['y']] = ['false' if lb is None or lb is np.nan or (type(lb) is str and lb.isspace()) else lb for lb in self.df[config.task_col['y']]] # convert all absent labels to negative
         logging.info('Input DataFrame size: %s' % str(self.df.shape))
         if sampfrac: self.df = self._df = self._df.sample(frac=float(sampfrac))
         self.df.columns = self.df.columns.astype(str, copy=False)
-        self.mltl = mltl
+        self.mltl = config.task_ext_params.setdefault('mltl', False)
         self.sample_weights = sampw
-        if (binlb == 'rgrsn'):
+
+        # Construct the binary label mapping
+        binlb = config.task_ext_params['binlb'] if 'binlb' in config.task_ext_params else None
+        if (binlb == 'rgrsn'): # regression tasks
+            self.df[self.label_col] = self.df[self.label_col].astype('float')
             self.binlb = None
             self.binlbr = None
             self.df = self.df[self.df[self.label_col].notnull()]
-        elif (type(binlb) is str and binlb.startswith('mltl')):
-            sc = binlb.split(SC)[-1]
+        elif (type(binlb) is str and binlb.startswith('mltl')): # multi-label classification tasks
+            sc = binlb.split(self.sc)[-1]
             self.df = self.df[self.df[self.label_col].notnull()]
             lb_df = self.df[self.label_col]
             labels = sorted(set([lb for lbs in lb_df for lb in lbs.split(sc)])) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
             self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
             self.mltl = True
-        elif (binlb is None):
+        elif (binlb is None): # normal cases
             lb_df = self.df[self.df[self.label_col].notnull()][self.label_col]
             labels = sorted(set(lb_df)) if type(lb_df.iloc[0]) is not list else sorted(set([lb for lbs in lb_df for lb in lbs]))
             if len(labels) == 1: labels = ['false'] + labels
             self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(labels)])
-        else:
+        else: # previously constructed
             self.binlb = binlb
         if self.binlb: self.binlbr = OrderedDict([(i, lb) for lb, i in self.binlb.items()])
-        self.encode_func = encode_func
+        self.encode_func = config.encode_func
+        self.tknz_kwargs = config.tknz_kwargs
         self.tokenizer = tokenizer
         if hasattr(tokenizer, 'vocab'):
             self.vocab_size = len(tokenizer.vocab)
         elif hasattr(tokenizer, 'vocab_size'):
             self.vocab_size = tokenizer.vocab_size
-        self.transforms = transforms
-        self.transforms_args = transforms_args
-        self.transforms_kwargs = transforms_kwargs
+        # Combine all the data transformers
+        self.transforms = config.task_trsfm[0] + config.mdl_trsfm[0]
+        self.transforms_kwargs = config.task_trsfm[1] + config.mdl_trsfm[1]
+        self.transforms_args = kwargs.setdefault('transforms_args', {}) # Common transformer kwargs
+        config.register_callback('mdl_trsfm', BaseDataset.callback_update_trsfm(self))
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
+        sample = self.encode_func(record[self.text_col], self.tokenizer, self.tknz_kwargs), record[self.label_col]
         sample = self._transform_chain(sample)
-        return (self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
+        return (self.df.index[idx], torch.tensor(sample[0][0]) if type(sample[0][0]) is not str else sample[0], torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]] if type(sample[0][0]) is not str else [torch.tensor(x) if x[0] is not str else x[0] for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
+    @classmethod
+    def callback_update_trsfm(cls, dataset):
+        def _callback(config):
+            dataset.transforms = config.task_trsfm[0] + config.mdl_trsfm[0]
+            dataset.transforms_kwargs = config.task_trsfm[1] + config.mdl_trsfm[1]
+        return _callback
 
 class _Extext(object):
-    def __init__(self, extext_path):
+    def __init__(self, extext_path, config):
         if os.path.isdir(extext_path):
             self.extext_path = extext_path
         elif extext_path.startswith('http://') and 'solr' in extext_path:
             import pysolr
-            self.solr_url, self.solr_txt_field = self.extext_path.split(SC)
+            self.solr_url, self.solr_txt_field = self.extext_path.split(config.sc)
             self.solr = pysolr.Solr(self.solr_url, results_cls=dict)
         else:
             self.extext_path = '.'
@@ -199,29 +207,29 @@ class _Extext(object):
 
 
 class ExtextBaseDataset(BaseDataset):
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, config, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampw=False, sampfrac=None, extext_path='.', **kwargs):
+    def __init__(self, csv_file, tokenizer, config, sampw=False, sampfrac=None, extext_path='.', **kwargs):
         super(ExtextBaseDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, config, sep=sep, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, mltl=mltl, sampw=sampw, sampfrac=sampfrac, **kwargs)
         self.extext = _Extext(extext_path)
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = self.encode_func(self.extext.get_txt(record[self.text_col], ret_list=False), self.tokenizer), record[self.label_col]
+        sample = self.encode_func(self.extext.get_txt(record[self.text_col], ret_list=False), self.tokenizer, self.tknz_kwargs), record[self.label_col]
         sample = self._transform_chain(sample)
-        return (self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
+        return (self.df.index[idx], torch.tensor(sample[0][0]) if type(sample[0][0]) is not str else sample[0], torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]] if type(sample[0][0]) is not str else []) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class SentSimDataset(BaseDataset):
     """Sentence Similarity task dataset class"""
 
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, config, sep='\t', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, ynormfunc=None, **kwargs):
+    def __init__(self, csv_file, tokenizer, config, sampw=False, sampfrac=None, **kwargs):
         super(SentSimDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, config, sep=sep, skip_blank_lines=False, keep_default_na=False, na_values=[], binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
-        self.ynormfunc, self.ynormfuncr = ynormfunc if ynormfunc is not None else (None, None)
+        self.ynormfunc, self.ynormfuncr = config.ynormfunc if hasattr(config, 'ynormfunc') else (None, None)
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col]
+        sample = [self.encode_func(record[sent_idx], self.tokenizer, self.tknz_kwargs) for sent_idx in self.text_col], record[self.label_col]
         sample = self._transform_chain(sample)
-        return (self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(0. if sample[1] is np.nan else (float(sample[1]) if self.ynormfunc is None else self.ynormfunc(float(sample[1]))))) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
+        return (self.df.index[idx], torch.tensor(sample[0][0]), torch.tensor(0. if sample[1] is np.nan else (float(sample[1]) if self.ynormfunc is None else self.ynormfunc(float(sample[1]))))) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
         lbs = lbs if self.ynormfuncr is None else list(map(self.ynormfuncr, lbs))
@@ -240,9 +248,9 @@ class EntlmntDataset(BaseDataset):
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
+        sample = self.encode_func([record[sent_idx] for sent_idx in self.text_col], self.tokenizer, self.tknz_kwargs), record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in FALSE_LABELS if k in self.binlb][0]
         sample = self._transform_chain(sample)
-        return (self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
+        return (self.df.index[idx], torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class NERDataset(BaseDataset):
@@ -265,16 +273,16 @@ class NERDataset(BaseDataset):
 
     def __getitem__(self, idx):
         record = self.df.iloc[self.boundaries[idx]:self.boundaries[idx+1]].dropna()
-        sample = self.encode_func(record[self.text_col].values.tolist(), self.tokenizer), record[self.label_col].values.tolist()
+        sample = self.encode_func(record[self.text_col].values.tolist(), self.tokenizer, self.tknz_kwargs), record[self.label_col].values.tolist()
         sample = list(map(list, zip(*[(x, y) for x, y in zip(*sample) if x and y])))
         num_samples = [len(x) for x in sample[0]] if (len(sample[0]) > 0 and type(sample[0][0]) is list) else [1] * len(sample[0])
         record_idx = [0] + np.cumsum(num_samples).tolist()
         is_empty = (type(sample[0]) is list and len(sample[0]) == 0) or (type(sample[0]) is list and len(sample[0]) > 0 and all([type(x) is list and len(x) == 0 for x in sample[0]]))
-        if (is_empty): return SC.join(map(str, record.index.values.tolist())), '' if self.encode_func == _tokenize else torch.LongTensor([-1]*self.config.maxlen), '' if self.encode_func == _tokenize else torch.LongTensor([-1]*self.config.maxlen), SC.join(map(str, record_idx))
+        if (is_empty): return self.sc.join(map(str, record.index.values.tolist())), '' if self.encode_func == _tokenize else torch.LongTensor([-1]*self.config.maxlen), '' if self.encode_func == _tokenize else torch.LongTensor([-1]*self.config.maxlen), self.sc.join(map(str, record_idx))
         is_encoded = (type(sample[0]) is list and type(sample[0][0]) is int) or (type(sample[0]) is list and len(sample[0]) > 0 and type(sample[0][0]) is list and len(sample[0][0]) > 0 and type(sample[0][0][0]) is int)
         sample = list(itertools.chain.from_iterable(sample[0])) if is_encoded else sample[0], list(itertools.chain.from_iterable([[x] * ns for x, ns in zip(sample[1], num_samples)]))
         sample = self._transform_chain(sample)
-        return SC.join(map(str, record.index.values.tolist())), (torch.tensor(sample[0]) if is_encoded else SC.join(sample[0])), (torch.tensor(sample[1]) if is_encoded else SC.join(map(str, sample[1]))), SC.join(map(str, record_idx))
+        return (self.sc.join(map(str, record.index.values.tolist())), (torch.tensor(sample[0][0]) if is_encoded else self.sc.join(sample[0][0])), (torch.tensor(sample[1]) if is_encoded else self.sc.join(map(str, sample[1]))), self.sc.join(map(str, record_idx))) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
     def fill_labels(self, lbs, saved_path=None, binlb=True, index=None, **kwargs):
         if binlb and self.binlbr is not None:
@@ -364,10 +372,10 @@ class ConceptREDataset(BaseDataset):
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
+        sample = self.encode_func(record[self.text_col], self.tokenizer, self.tknz_kwargs), record[self.label_col]
         sample = self._transform_chain(sample)
         cncpt_ids = [self.cw2v_model.vocab[record[col]].index for col in ['cid1', 'cid2']] if self.cw2v_model else []
-        return self.df.index[idx], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1]), torch.tensor(cncpt_ids)
+        return (self.df.index[idx], torch.tensor(sample[0][0]), torch.tensor(sample[1]), torch.tensor(cncpt_ids)) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class ShellDataset(BaseDataset):
@@ -390,9 +398,9 @@ class ShellDataset(BaseDataset):
 
     def __getitem__(self, idx):
         text = self.text[idx]
-        sample = self.encode_func(text, self.tokenizer), None
+        sample = self.encode_func(text, self.tokenizer, self.tknz_kwargs), None
         sample = self._transform_chain(sample)
-        return (idx, sample[0] if type(sample[0]) is str or (type(sample[0]) is list and type(sample[0][0]) is str) else torch.tensor(sample[0]), torch.tensor(0))
+        return (idx, torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]])
 
 
 class EmbeddingDataset(BaseDataset):
@@ -443,15 +451,16 @@ class OntoDataset(BaseDataset):
 
     def __getitem__(self, idx):
         record = self.df.iloc[idx]
-        sample = [self.encode_func(record[sent_idx], self.tokenizer) for sent_idx in self.text_col], record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
+        sample = self.encode_func([record[sent_idx] for sent_idx in self.text_col], self.tokenizer, self.tknz_kwargs), record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
         sample = self._transform_chain(sample)
-        return (self.df.index[idx], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]]),)
+        return (self.df.index[idx], torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]]),)
 
 
 class BaseIterDataset(DatasetInterface, IterableDataset):
     """ Basic iterable dataset """
 
     def __init__(self, fpath, text_col, label_col, encode_func, tokenizer, config, sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], mltl=False, sampw=False, **kwargs):
+        self.sc = self.config.sc
         self.config = config
         self.index_col = index_col
         self.text_col = [str(s) for s in text_col] if hasattr(text_col, '__iter__') and type(text_col) is not str else str(text_col)
@@ -476,7 +485,7 @@ class BaseIterDataset(DatasetInterface, IterableDataset):
             self.binlb = None
             self.binlbr = None
         elif (type(binlb) is str and binlb.startswith('mltl')):
-            sc = binlb.split(SC)[-1]
+            sc = binlb.split(self.sc)[-1]
             for record in preproc_data:
                 labels |= set(record[self.label_col].split(sc))
             self.binlb = OrderedDict([(lb, i) for i, lb in enumerate(sorted(labels))])
@@ -490,9 +499,9 @@ class BaseIterDataset(DatasetInterface, IterableDataset):
         if self.binlb: self.binlbr = OrderedDict([(i, lb) for lb, i in self.binlb.items()])
 
     def _transform(self, record):
-        sample = self.encode_func(record[self.text_col], self.tokenizer), record[self.label_col]
+        sample = self.encode_func(record[self.text_col], self.tokenizer, self.tknz_kwargs), record[self.label_col]
         sample = self._transform_chain(sample)
-        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
+        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
     def __iter__(self):
         return iter((self._transform(record) for record in self.data))
@@ -506,9 +515,9 @@ class EntlmntIterDataset(BaseIterDataset):
     """Entailment task iterable dataset class"""
 
     def _transform(self, record):
-        sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
+        sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer, self.tknz_kwargs), self.encode_func(record[self.text_col[-1]], self.tokenizer, self.tknz_kwargs)], record[self.label_col]
         sample = self._transform_chain(sample)
-        return (record[self.index_col], (sample[0] if type(sample[0][0]) is str or (type(sample[0][0]) is list and type(sample[0][0][0]) is str) else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
+        return (record[self.index_col], torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class EntlmntMltlIterDataset(EntlmntIterDataset):
@@ -522,7 +531,7 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
         if type(binlb) is str and binlb.startswith('mltl'):
             self.data, preproc_data = itertools.tee(self.data)
             labels = set([])
-            sc = binlb.split(SC)[-1]
+            sc = binlb.split(self.sc)[-1]
             for record in preproc_data:
                 labels |= set(record[kwargs['origlb']] if type(record[kwargs['origlb']]) is list else (record[kwargs['origlb']].split(sc) if type(record[kwargs['origlb']]) is str else []))
             self.orig_binlb = OrderedDict([(lb, i) for i, lb in enumerate(sorted(labels))])
@@ -538,8 +547,8 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
         self.binlbr = OrderedDict([(0, 'false'), (1, 'include')])
 
     @classmethod
-    def _mltl2entlmnt(cls, data, text_col, orig_lb_col, dest_lb_col, local_lb_col='local_label', ref_lb_col=None, binlb=None, lbtxt=None, sampw=False, neglbs=None):
-        sc = binlb.split(SC)[-1]
+    def _mltl2entlmnt(cls, data, text_col, orig_lb_col, dest_lb_col, local_lb_col='local_label', ref_lb_col=None, binlb=None, lbtxt=None, sampw=False, neglbs=None, record_sc=';;'):
+        sc = binlb.split(record_sc)[-1]
         for record in data:
             ref_lbs = set(record[ref_lb_col] if type(record[ref_lb_col]) is list else (record[ref_lb_col].split(sc) if type(record[ref_lb_col]) is str else [])) if ref_lb_col is not None and ref_lb_col in record else None
             for lb in sorted(filter(lambda x: x, set(record[orig_lb_col] if type(record[orig_lb_col]) is list else (record[orig_lb_col].split(sc) if type(record[orig_lb_col]) is str else [])))):
@@ -602,7 +611,7 @@ class EntlmntMltlIterDataset(EntlmntIterDataset):
 
     def fill_labels(self, lbs, binlb=True, index=None, saved_col='preds', saved_path=None, **kwargs):
         if self._df is None: return
-        sc = self.binlb_str.split(SC)[-1]
+        sc = self.binlb_str.split(self.sc)[-1]
         num_underline =  list(str(self._df.index[0])).count('_')
         index = ['_'.join(str(idx).split('_')[:num_underline+1]) for idx in index]
         combined_df = pd.DataFrame({'id':index, 'lbs':lbs}).groupby('id').apply(lambda x: sc.join(map(str, x['lbs'].values)))
@@ -629,7 +638,7 @@ class OntoIterDataset(EntlmntMltlIterDataset):
                     return (notes, [0.5]*len(notes)) if sampw else notes
             elif onto_df is not None and lb in onto_df.index:
                 return (onto_df.loc[lb]['label'], 0.5) if sampw else onto_df.loc[lb]['label']
-        onto_fpaths = onto_fpath.split(SC) if onto_fpath and type(onto_fpath) is str else None
+        onto_fpaths = onto_fpath.split(self.sc) if onto_fpath and type(onto_fpath) is str else None
         onto_fpath, onto_dict_fpath = (onto_fpaths[0], onto_fpaths[1] if len(onto_fpaths) > 1 else None) if onto_fpath is not None else (None, None)
         if onto_fpath and os.path.exists(onto_fpath):
             self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
@@ -641,9 +650,9 @@ class OntoIterDataset(EntlmntMltlIterDataset):
         super(OntoIterDataset, self).__init__(fpath, text_col, label_col, encode_func, tokenizer, config, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sent_mode=sent_mode, **kwargs)
 
     def _transform(self, record):
-        sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer), self.encode_func(record[self.text_col[-1]], self.tokenizer)], record[self.label_col]
+        sample = [self.encode_func(' '.join([record[sent_idx] for sent_idx in self.text_col[:-1]]), self.tokenizer, self.tknz_kwargs), self.encode_func(record[self.text_col[-1]], self.tokenizer, self.tknz_kwargs)], record[self.label_col]
         sample = self._transform_chain(sample)
-        return (record[self.index_col], (sample[0] if type(sample[0]) is str or type(sample[0][0]) is str else torch.tensor(sample[0])), torch.tensor(sample[1])) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]] if hasattr(self, 'onto_col') and self.onto_col in record else 0),)
+        return (record[self.index_col], torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]] if hasattr(self, 'onto_col') and self.onto_col in record else 0),)
 
     def fill_labels(self, lbs, index=None, saved_path=None, **kwargs):
         return EntlmntMltlIterDataset.fill_labels(self, lbs, index=index, saved_col='rerank_preds', saved_path=saved_path, **kwargs)

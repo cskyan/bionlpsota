@@ -30,9 +30,14 @@ def gen_pytorch_wrapper(mdl_type, mdl_name, **kwargs):
     return wrapper_cls(module=mdl_cls(**kwargs))
 
 
-def gen_mdl(mdl_name, config, pretrained=True, use_gpu=False, distrb=False, dev_id=None):
-    if mdl_name == 'none': return None
+def gen_mdl(config, use_gpu=False, distrb=False, dev_id=None):
+    mdl_name, pretrained = config.model, True if type(config.pretrained) is str and config.pretrained.lower() == 'true' else config.pretrained
+    if mdl_name == 'none': return None, None
     wsdir = config.wsdir if hasattr(config, 'wsdir') and os.path.isdir(config.wsdir) else '.'
+    common_cfg = config.common_cfg if hasattr(config, 'common_cfg') else {}
+    pr = io.param_reader(os.path.join(wsdir, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
+    params = pr('LM', config.lm_params)
+    lm_config = config.lm_config(**params)
     if distrb: import horovod.torch as hvd
     if (type(pretrained) is str):
         if (not distrb or distrb and hvd.rank() == 0): logging.info('Using pretrained model from `%s`' % pretrained)
@@ -42,19 +47,12 @@ def gen_mdl(mdl_name, config, pretrained=True, use_gpu=False, distrb=False, dev_
     elif (pretrained):
         if (not distrb or distrb and hvd.rank() == 0): logging.info('Using pretrained model...')
         mdl_name = mdl_name.split('_')[0]
-        common_cfg = config.common_cfg if hasattr(config, 'common_cfg') else {}
-        pr = io.param_reader(os.path.join(wsdir, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-        params = pr('LM', config.lm_params)
         model = config.lm_model.from_pretrained(params['pretrained_mdl_path'] if 'pretrained_mdl_path' in params else config.lm_mdl_name)
     else:
         if (not distrb or distrb and hvd.rank() == 0): logging.info('Using untrained model...')
         try:
-            common_cfg = config.common_cfg if hasattr(config, 'common_cfg') else {}
-            pr = io.param_reader(os.path.join(wsdir, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
-            params = pr('LM', config.lm_params)
             for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
                 if pname in params: del params[pname]
-            lm_config = config.lm_config(**params)
             if (mdl_name == 'elmo'):
                 pos_params = [lm_config[k] for k in ['options_file','weight_file', 'num_output_representations']]
                 kw_params = dict([(k, lm_config[k]) for k in lm_config.keys() if k not in ['options_file','weight_file', 'num_output_representations', 'elmoedim']])
@@ -67,19 +65,18 @@ def gen_mdl(mdl_name, config, pretrained=True, use_gpu=False, distrb=False, dev_
             logging.warning('Cannot find the pretrained model file, using online model instead.')
             model = config.lm_model.from_pretrained(config.lm_mdl_name)
     if (use_gpu): model = model.to('cuda')
-    return model
+    return model, lm_config
 
-
-def gen_clf(mdl_name, config, encoder='pool', constraints=[], use_gpu=False, distrb=False, dev_id=None, **kwargs):
+def gen_clf(config, lm_model, lm_config, use_gpu=False, distrb=False, dev_id=None, **kwargs):
+    mdl_name, constraints = config.model, config.cnstrnts.split(',') if hasattr(config, 'cnstrnts') and config.cnstrnts else []
     lm_mdl_name = mdl_name.split('_')[0]
-    kwargs['lm_mdl_name'] = lm_mdl_name
+    kwargs.update(dict(config=config, lm_model=lm_model, lm_config=lm_config))
     common_cfg = config.common_cfg if hasattr(config, 'common_cfg') else {}
     wsdir = config.wsdir if hasattr(config, 'wsdir') and os.path.isdir(config.wsdir) else '.'
     pr = io.param_reader(os.path.join(wsdir, 'etc', '%s.yaml' % common_cfg.setdefault('mdl_cfg', 'mdlcfg')))
     params = pr('LM', config.lm_params) if lm_mdl_name != 'none' else {}
     for pname in ['pretrained_mdl_path', 'pretrained_vocab_path']:
         if pname in params: del params[pname]
-    kwargs['config'] = config.lm_config(**params) if lm_mdl_name != 'none' else {}
 
     lvar = locals()
     for x in constraints:
@@ -90,7 +87,7 @@ def gen_clf(mdl_name, config, encoder='pool', constraints=[], use_gpu=False, dis
         cnstrnt_params.update(dict([((k, p), lvar[p]) for k, p in cnstrnt_params.keys() if p in lvar]))
         kwargs.setdefault('constraints', []).append((cnstrnt_cls, dict([(k, v) for (k, p), v in cnstrnt_params.items()])))
 
-    clf = config.clf[encoder](**kwargs) if hasattr(config, 'embed_type') and config.embed_type else config.clf(**kwargs)
+    clf = config.clf[config.encoder](**kwargs) if hasattr(config, 'embed_type') and config.embed_type else config.clf(**kwargs)
     if use_gpu: clf = _handle_model(clf, dev_id=dev_id, distrb=distrb)
     return clf
 

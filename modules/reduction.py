@@ -75,6 +75,13 @@ class MaskedReduction(nn.Module):
 
     def _forward(self, hidden_states, mask):
         hidden_states_size, mask_size = hidden_states.size(), mask.size()
+        while True:
+            try:
+            	sq_idx = mask_size.index(1)
+            	mask = mask.squeeze(sq_idx)
+            	mask_size = mask.size()
+            except Exception as e:
+            	break
         missed_dim = hidden_states_size[len(mask_size):]
         for x, d in zip(missed_dim, range(len(mask_size), len(hidden_states_size))):
             mask = mask.unsqueeze(-1).expand(*([-1] * d), x)
