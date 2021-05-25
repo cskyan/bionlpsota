@@ -216,15 +216,20 @@ class Configurable(object):
     PREDEFINED_MODEL_CONFIG_EXPRESSION = {
         'bert': [('input_keys', P._bert_input_keys, {'task_type':'property'})],
         'elmo': [('encoder', lambda encoder: encoder if encoder is not None and not encoder.isspace() else 'pool', {'encoder':'property'})],
+        'none': [('input_keys', P._embed_input_keys, {'embed_type':'property'})]
     }
-    def set_elmo_transform(param, val): param[0][0]=P._elmo_transform
-    def set_embed_transform(param, val): param[0][0]=P._embedding_transform
+    def set_elmo_transform(param, val):
+        param[0][0]=P._elmo_transform
+    def set_embed_transform(param, val):
+        param[0][0]=P._embedding_transform
+        param[1][0].update({'embed_type':val['embed_type']})
     PREDEFINED_MODEL_CONFIG_UPDATES = {
         'bert': [('clf_ext_params', lambda param, val: param.update({'do_drop':val['do_drop']}), {'do_drop':'property'})],
-        'elmo': [('mdl_trsfm', set_elmo_transform, {})],
-        'none': [('mdl_trsfm', set_embed_transform, {})]
+        'elmo': [('mdl_trsfm', set_elmo_transform, {'lm_config':'property'})],
+        'none': [('mdl_trsfm', set_embed_transform, {'embed_type':'property'})]
     }
     PREDEFINED_MODEL_CONFIG_DELAYED_UPDATES = {
+        'elmo': [('mdl_trsfm', lambda param, val: param[1][0].update({'lm_config':val['lm_config']}), {'lm_config':'property'})],
         'none': [('mdl_trsfm', lambda param, val: param[1][0].update({'w2v_model':val['w2v_model']}), {'w2v_model':'property'})]
     }
     # Common parameters

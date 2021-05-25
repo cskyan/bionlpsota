@@ -45,6 +45,11 @@ def _gpt_input_keys(task_type=None):
     return ['input_ids', 'attention_mask']
 
 
+def _embed_input_keys(embed_type='w2v'):
+    embed_types = embed_type.split('_')
+    return ['input_ids', 'mask'] + (embed_types[1:] if len(embed_types) > 1 else [])
+
+
 def _nn_transform(sample, **kwargs):
     maxlen = kwargs.setdefault('maxlen', 128)
     pad_token = kwargs.setdefault('pad_token', '<PAD>')
@@ -56,7 +61,7 @@ def _nn_transform(sample, **kwargs):
                 pad_idx[x] = X[x].index(pad_token)
             except ValueError as e:
                 pass
-        mask = [[1] * pad_idx[x] + [0] * (len(X[x]) - pad_idx[x]) for x in [0,1]]
+        mask = [[1] * pad_idx[x] + [0] * (len(X[x]) - pad_idx[x]) for x in range(len(X))]
     else:
         try:
             pad_idx = X.index(pad_token)
@@ -81,24 +86,44 @@ def _w2v_transform(sample, **kwargs):
 def _elmo_transform(sample, **kwargs):
     maxlen = kwargs.setdefault('maxlen', 128)
     pad_token = kwargs.setdefault('pad_token', '<PAD>')
+    lm_config = kwargs.setdefault('lm_config', {})
+    num_layers = lm_config.setdefault('num_output_representations', 2)
     X, y = sample
     X = _trimming(X, maxlen=maxlen)
     dummy_sent = [pad_token] * maxlen
     from allennlp.modules.elmo import batch_to_ids
     _X = batch_to_ids(X+[dummy_sent]).tolist() if type(X[0]) is not str else batch_to_ids([X, dummy_sent]).tolist()
     X = _X[:-1] if len(_X) > 2 else _X[0]
-    kwargs['pad_token'] = _X[-1][0][-1]
-    (X, mask), y = _nn_transform([X, y], **kwargs)
-    return [X, mask[0]], y
+    kwargs['pad_token'] = _X[-1][0][-1] if num_layers > 1 else _X[-1][-1]
+    if num_layers > 1:
+        if len(_X) > 2:
+            (_, mask), y = _nn_transform([[X[x][0] for x in range(len(X))], y], **kwargs)
+        else:
+            (_, mask), y = _nn_transform([X[0], y], **kwargs)
+    else:
+        (_, mask), y = _nn_transform([X, y], **kwargs)
+    return [X, mask], y
+
+
+def sentvec_transform(sample, **kwargs):
+    X, y = sample
+    import sent2vec
+    sentvec_model = kwargs['sentvec_model'] if 'sentvec_model' in kwargs and kwargs['sentvec_model'] else sent2vec.Sent2vecModel()
+    X = sentvec_model.embed_sentences([' '.join(x) for x in X]) if type(X[0]) is not str else sentvec_model.embed_sentences([' '.join(X)])[0]
+    mask = [1]*len(X) if type(X[0]) is not str else [[1]*len(X[x]) for x in range(len(X))]
+    return [X, mask], y
 
 
 def _embedding_transform(sample, **kwargs):
     embed_types = kwargs.setdefault('embed_type', 'w2v').split('_')
-    embedding, y = [], 0
+    embedding_ids, masks, y = [], [], 0
     for embed_t in embed_types:
         X, y = EMBED_TRANSFORM[embed_t](sample, **kwargs)
-        embedding.extend(X)
-    return embedding, y
+        embedding_ids.append(X[0])
+        masks.append(X[1])
+    inputs = dict(zip(embed_types, embedding_ids))
+    X = inputs[embed_types[0]]
+    return [X, masks[0]]+[inputs[x] for x in embed_types[1:]], y
 
 
 EMBED_TRANSFORM = {'w2v': _w2v_transform}

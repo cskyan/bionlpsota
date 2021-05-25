@@ -68,7 +68,7 @@ def train(clf, optimizer, dataset, config, scheduler=None, weights=None, lmcoef=
             except Exception as e:
                 logging.warning(e)
                 train_time = time.time() - t0
-                logging.warning('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
+                logging.error('Exception raised! training time for %i epoch(s), %i batch(s): %0.3fs' % (epoch + 1, step, train_time))
                 save_model(clf, optimizer, chckpnt_fname, in_wrapper=in_wrapper, devq=devq, distrb=config.distrb, resume={'epoch':epoch, 'batch':step}, **chckpnt_kwargs)
                 raise e
             # Save model when program is terminated
