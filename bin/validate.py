@@ -55,15 +55,15 @@ def classify(dev_id=None):
     _adjust_encoder(tokenizer, config)
 
     # Prepare task related meta data.
-    task_path, task_type, task_dstype, task_cols, task_trsfm, task_extparms = args.input if args.input and os.path.isdir(os.path.join(DATA_PATH, args.input)) else config.task_path, config.task_type, config.task_ds, config.task_col, config.task_trsfm, config.task_ext_params
+    task_path, task_type, task_dstype, task_cols, task_trsfm, task_extparms = config.input if config.input and os.path.isdir(os.path.join(DATA_PATH, config.input)) else config.task_path, config.task_type, config.task_ds, config.task_col, config.task_trsfm, config.task_ext_params
     ds_kwargs = config.ds_kwargs
 
     # Prepare data
-    if (not args.distrb or args.distrb and hvd.rank() == 0): logging.info('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
-    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % args.fmt), tokenizer, config, **ds_kwargs)
+    if (not config.distrb or config.distrb and hvd.rank() == 0): logging.info('Dataset path: %s' % os.path.join(DATA_PATH, task_path))
+    train_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'train.%s' % config.fmt), tokenizer, config, **ds_kwargs)
     # Calculate the class weights if needed
     lb_trsfm = [x['get_lb'] for x in task_trsfm[1] if 'get_lb' in x]
-    if (not args.weight_class or task_type == 'sentsim'):
+    if (not config.weight_class or task_type == 'sentsim'):
         class_count = None
     elif len(lb_trsfm) > 0:
         lb_df = train_ds.df[task_cols['y']].apply(lb_trsfm[0])
@@ -78,80 +78,82 @@ def classify(dev_id=None):
     else:
         class_weights = torch.Tensor(1.0 / class_count)
         class_weights /= class_weights.sum()
-        sampler = WeightedRandomSampler(weights=class_weights, num_samples=args.bsize, replacement=True)
-        if not args.distrb and type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
+        sampler = WeightedRandomSampler(weights=class_weights, num_samples=config.bsize, replacement=True)
+        if not config.distrb and type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
 
     # Partition dataset among workers using DistributedSampler
-    if args.distrb: sampler = torch.utils.data.distributed.DistributedSampler(train_ds, num_replicas=hvd.size(), rank=hvd.rank())
+    if config.distrb: sampler = torch.utils.data.distributed.DistributedSampler(train_ds, num_replicas=hvd.size(), rank=hvd.rank())
 
-    train_loader = DataLoader(train_ds, batch_size=args.bsize, shuffle=sampler is None and args.droplast, sampler=sampler, num_workers=args.np, drop_last=args.droplast)
+    train_loader = DataLoader(train_ds, batch_size=config.bsize, shuffle=sampler is None and config.droplast, sampler=sampler, num_workers=config.np, drop_last=config.droplast)
 
     # Classifier
-    if (not args.distrb or args.distrb and hvd.rank() == 0):
+    if (not config.distrb or config.distrb and hvd.rank() == 0):
         logging.info('Language model input fields: %s' % config.input_keys)
         logging.info('Classifier hyper-parameters: %s' % config.clf_ext_params)
         logging.info('Classifier task-related parameters: %s' % task_extparms['mdlaware'])
-    if (args.resume):
+    if (config.resume):
         # Load model
-        clf, prv_optimizer, resume, chckpnt = load_model(args.resume)
-        if args.refresh:
+        clf, prv_optimizer, resume, chckpnt = load_model(config.resume)
+        if config.refresh:
             logging.info('Refreshing and saving the model with newest code...')
             try:
                 if (not distrb or distrb and hvd.rank() == 0):
-                    save_model(clf, prv_optimizer, '%s_%s.pth' % (args.task, args.model))
+                    save_model(clf, prv_optimizer, '%s_%s.pth' % (config.task, config.model))
             except Exception as e:
                 logging.warning(e)
         # Update parameters
         clf.update_params(task_params=task_extparms['mdlaware'], **config.clf_ext_params)
-        if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=args.distrb)
+        if (use_gpu): clf = _handle_model(clf, dev_id=dev_id, distrb=config.distrb)
         # Construct optimizer
         optmzr_cls = config.optmzr if config.optmzr else (torch.optim.Adam, {}, None)
-        optimizer = optmzr_cls[0](clf.parameters(), lr=args.lr, weight_decay=args.wdecay, **optmzr_cls[1]) if args.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=args.lr, momentum=0.9)
+        optimizer = optmzr_cls[0](clf.parameters(), lr=config.lr, weight_decay=config.wdecay, **optmzr_cls[1]) if config.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=config.lr, momentum=0.9)
         if prv_optimizer: optimizer.load_state_dict(prv_optimizer.state_dict())
-        training_steps = int(len(train_ds) / args.bsize) if hasattr(train_ds, '__len__') else args.trainsteps
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(args.wrmprop*training_steps), num_training_steps=training_steps) if not args.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
-        if (not args.distrb or args.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
+        training_steps = int(len(train_ds) / config.bsize) if hasattr(train_ds, '__len__') else config.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(config.wrmprop*training_steps), num_training_steps=training_steps) if not config.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        if (not config.distrb or config.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
     else:
         # Build model
-        lm_model, lm_config = gen_mdl(config, use_gpu=use_gpu, distrb=args.distrb, dev_id=dev_id)
-        clf = gen_clf(config, lm_model, lm_config, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_extparms['mdlaware'].setdefault('sentsim_func', None) is not None else False, task_params=task_extparms['mdlaware'], binlb=train_ds.binlb, binlbr=train_ds.binlbr, use_gpu=use_gpu, distrb=args.distrb, dev_id=dev_id, **config.clf_ext_params)
+        lm_model, lm_config = gen_mdl(config, use_gpu=use_gpu, distrb=config.distrb, dev_id=dev_id)
+        clf = gen_clf(config, lm_model, lm_config, num_lbs=len(train_ds.binlb) if train_ds.binlb else 1, mlt_trnsfmr=True if task_type in ['entlmnt', 'sentsim'] and task_extparms['mdlaware'].setdefault('sentsim_func', None) is not None else False, task_params=task_extparms['mdlaware'], binlb=train_ds.binlb, binlbr=train_ds.binlbr, use_gpu=use_gpu, distrb=config.distrb, dev_id=dev_id, **config.clf_ext_params)
         optmzr_cls = config.optmzr if config.optmzr else (torch.optim.Adam, {}, None)
-        optimizer = optmzr_cls[0](clf.parameters(), lr=args.lr, weight_decay=args.wdecay, **optmzr_cls[1]) if args.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=args.lr, momentum=0.9)
-        training_steps = int(len(train_ds) / args.bsize) if hasattr(train_ds, '__len__') else args.trainsteps
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.wrmprop, num_training_steps=training_steps) if not args.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
-        if (not args.distrb or args.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
+        optimizer = optmzr_cls[0](clf.parameters(), lr=config.lr, weight_decay=config.wdecay, **optmzr_cls[1]) if config.optim == 'adam' else torch.optim.SGD(clf.parameters(), lr=config.lr, momentum=0.9)
+        training_steps = int(len(train_ds) / config.bsize) if hasattr(train_ds, '__len__') else config.trainsteps
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=config.wrmprop, num_training_steps=training_steps) if not config.noschdlr and len(optmzr_cls) > 2 and optmzr_cls[2] and optmzr_cls[2] == 'linwarm' else None
+        if (not config.distrb or config.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
 
     config.execute_all_callback()
     if config.verbose: logging.debug(config.__dict__)
+    if config.configfmt == 'yaml':
+        config.to_yaml()
+    else:
+        config.to_json()
 
-    if args.distrb:
+    if config.distrb:
         # Add Horovod Distributed Optimizer
         optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=clf.named_parameters())
         # Broadcast parameters from rank 0 to all other processes.
         hvd.broadcast_parameters(clf.state_dict(), root_rank=0)
 
     # Training
-    train(clf, optimizer, train_loader, config, scheduler, weights=class_weights, lmcoef=args.lmcoef, clipmaxn=args.clipmaxn, epochs=args.epochs, earlystop=args.earlystop, earlystop_delta=args.es_delta, earlystop_patience=args.es_patience, use_gpu=use_gpu, devq=dev_id, distrb=args.distrb, resume=resume if args.resume else {})
+    train(clf, optimizer, train_loader, config, scheduler, weights=class_weights, lmcoef=config.lmcoef, clipmaxn=config.clipmaxn, epochs=config.epochs, earlystop=config.earlystop, earlystop_delta=config.es_delta, earlystop_patience=config.es_patience, use_gpu=use_gpu, devq=dev_id, distrb=config.distrb, resume=resume if config.resume else {})
 
-    if args.distrb:
+    if config.distrb:
         if hvd.rank() == 0:
             clf = _handle_model(clf, dev_id=dev_id, distrb=False)
         else:
             return
 
-    if args.noeval: return
-    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % args.fmt), tokenizer, config, binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, **ds_kwargs)
-    if mdl_name.startswith('bert'): dev_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(dev_ds)
-    dev_loader = DataLoader(dev_ds, batch_size=args.bsize, shuffle=False, num_workers=args.np)
-    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % args.fmt), tokenizer, config, binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, **ds_kwargs)
-    if mdl_name.startswith('bert'): test_ds = MaskedLMIterDataset(train_ds) if isinstance(train_ds, BaseIterDataset) else MaskedLMDataset(test_ds)
-    test_loader = DataLoader(test_ds, batch_size=args.bsize, shuffle=False, num_workers=args.np)
+    if config.noeval: return
+    dev_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'dev.%s' % config.fmt), tokenizer, config, binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, **ds_kwargs)
+    dev_loader = DataLoader(dev_ds, batch_size=config.bsize, shuffle=False, num_workers=config.np)
+    test_ds = task_dstype(os.path.join(DATA_PATH, task_path, 'test.%s' % config.fmt), tokenizer, config, binlb=task_extparms['binlb'] if 'binlb' in task_extparms and type(task_extparms['binlb']) is not str else train_ds.binlb, **ds_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=config.bsize, shuffle=False, num_workers=config.np)
     logging.debug(('binlb', train_ds.binlb, dev_ds.binlb, test_ds.binlb))
 
     # Evaluation
-    eval(clf, dev_loader, config, ds_name='dev', use_gpu=use_gpu, devq=dev_id, distrb=args.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
-    if args.traindev: train(clf, optimizer, dev_loader, config, scheduler=scheduler, weights=class_weights, lmcoef=args.lmcoef, clipmaxn=args.clipmaxn, epochs=args.epochs, earlystop=args.earlystop, earlystop_delta=args.es_delta, earlystop_patience=args.es_patience, use_gpu=use_gpu, devq=dev_id, distrb=args.distrb)
-    eval(clf, test_loader, config, ds_name='test', use_gpu=use_gpu, devq=dev_id, distrb=args.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
+    eval(clf, dev_loader, config, ds_name='dev', use_gpu=use_gpu, devq=dev_id, distrb=config.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
+    if config.traindev: train(clf, optimizer, dev_loader, config, scheduler=scheduler, weights=class_weights, lmcoef=config.lmcoef, clipmaxn=config.clipmaxn, epochs=config.epochs, earlystop=config.earlystop, earlystop_delta=config.es_delta, earlystop_patience=config.es_patience, use_gpu=use_gpu, devq=dev_id, distrb=config.distrb)
+    eval(clf, test_loader, config, ds_name='test', use_gpu=use_gpu, devq=dev_id, distrb=config.distrb, ignored_label=task_extparms.setdefault('ignored_label', None))
 
 
 def mltphz_clf(dev_id=None):
@@ -337,7 +339,7 @@ if __name__ == '__main__':
     parser.add_argument('-k', '--kfold', default=10, type=int, help='indicate the K fold cross validation')
     parser.add_argument('-p', '--pid', default=0, type=int, help='indicate the process ID')
     parser.add_argument('-n', '--np', default=1, type=int, help='indicate the number of processes used for training')
-    parser.add_argument('-f', '--fmt', default='csv', help='data stored format: tsv or csv [default: %default]')
+    parser.add_argument('-f', '--fmt', choices=['csv', 'tsv'], default='csv', help='data stored format: tsv or csv [default: %default]')
     # parser.add_argument('-a', '--avg', default='micro', help='averaging strategy for performance metrics: micro or macro [default: %default]')
     parser.add_argument('-j', '--epochs', default=1, type=int, help='indicate the epoch used in deep learning')
     parser.add_argument('-z', '--bsize', default=64, type=int, help='indicate the batch size used in deep learning')
@@ -416,6 +418,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', help='manually set the random seed')
     parser.add_argument('--dfsep', default='\t', help='separate character for pandas dataframe')
     parser.add_argument('--sc', default=';;', help='separate character for multiple-value records')
+    parser.add_argument('--configfmt', choices=['json', 'yaml'], default='json', help='config data stored format: json or yaml [default: %default]')
     parser.add_argument('-c', '--cfg', help='config string used to update the settings, format: {\'param_name1\':param_value1[, \'param_name1\':param_value1]}')
     parser.add_argument('-m', '--method', default='classify', help='main method to run')
     parser.add_argument('-v', '--verbose', default=False, action='store_true', dest='verbose', help='display detailed information')

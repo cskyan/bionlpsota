@@ -16,8 +16,6 @@ from torch import nn
 
 from allennlp.modules.conditional_random_field import ConditionalRandomField
 
-from util.func import gen_pytorch_wrapper
-
 from util import func as H
 from . import transformer as T
 
@@ -228,7 +226,7 @@ class EmbeddingSeq2Vec(EmbeddingClfHead):
                 _ = [params.update({p:s2v_params[k]}) for k, p in C.SEQ2VEC_LM_PARAMS_MAP.setdefault('pytorch', []) if k in s2v_params]
                 if (embed_type == 'w2v'): params[pth_mdl]['input_size'] = self.w2v_model.syn0.shape[1]
                 if (embed_type == 'elmo_w2v'): params[pth_mdl]['input_size'] = params[pth_mdl]['input_size'] + self.w2v_model.syn0.shape[1]
-                self.seq2vec = gen_pytorch_wrapper('seq2vec', pth_mdl, **params[pth_mdl])
+                self.seq2vec = H.gen_pytorch_wrapper('seq2vec', pth_mdl, **params[pth_mdl])
                 encoder_odim = C.SEQ2VEC_DIM_INFER[seq2vec]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
             else:
                 _ = [params.update(x) for x in [C.SEQ2VEC_MDL_PARAMS.setdefault(seq2vec, {}).setdefault(embed_type, {}), C.SEQ2VEC_TASK_PARAMS.setdefault(seq2vec, {}).setdefault(self.task_type, {})]]
@@ -272,7 +270,7 @@ class EmbeddingSeq2Seq(EmbeddingClfHead):
             if seq2seq.startswith('pytorch-'):
                 pth_mdl = '-'.join(seq2seq.split('-')[1:])
                 _ = [params.update(x) for x in [C.SEQ2SEQ_MDL_PARAMS.setdefault('pytorch', {}).setdefault('elmo', {}), C.SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(self.task_type, {})]]
-                self.seq2seq = gen_pytorch_wrapper('seq2seq', pth_mdl, **params[pth_mdl])
+                self.seq2seq = H.gen_pytorch_wrapper('seq2seq', pth_mdl, **params[pth_mdl])
                 encoder_odim = C.SEQ2SEQ_DIM_INFER[seq2seq]([self.n_embd, self.dim_mulriple, params[pth_mdl]])
             else:
                 _ = [params.update(x) for x in [C.SEQ2SEQ_MDL_PARAMS.setdefault(seq2seq, {}).setdefault('elmo', {}), C.SEQ2SEQ_TASK_PARAMS.setdefault(seq2seq, {}).setdefault(self.task_type, {})]]

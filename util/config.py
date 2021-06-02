@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import copy, logging
+import copy, json, logging
 from collections import OrderedDict
 
 import numpy as np
@@ -108,6 +108,7 @@ class Configurable(object):
     }
     TASK_CONFIG_TEMPLATE_DEFAULTS = TASK_CONFIG_TEMPLATE_VALUES['mltc-base']
     TASK_CONFIG_TEMPLATE_EXPRESSION = {
+        'all': [('fmt', lambda fmt, dataset: 'tsv' if dataset in Configurable.PREDEFINED_TASK_CONFIG_VALUES and Configurable.PREDEFINED_TASK_CONFIG_VALUES[dataset][0] is not None and Configurable.PREDEFINED_TASK_CONFIG_VALUES[dataset][0].startswith('blue') else fmt, {'fmt':'property', 'dataset':'property'})]
     }
     TASK_CONFIG_TEMPLATE_UPDATES = {
         'all': [
@@ -211,7 +212,7 @@ class Configurable(object):
         'trsfmxl': ['transformer-base', 'transfo-xl-wt103', TransfoXLModel, TransfoXLConfig, 'TransformXL', TransformXLClfHead, TransfoXLTokenizer, {}],
         # Transformer-based approach should not have embed_type attribute
         'elmo': ['nn-base', 'elmo', Elmo, elmo_config, 'ELMo', {'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}, None, {'embed_type':'elmo'}],
-        'none': ['nn-base', 'embedding', None, None, 'Embedding', {'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}, None, {'embed_type':'w2v'}], # all the embedding-based approaches without ELMo
+        'none': ['nn-base', 'embedding', None, None, 'Embedding', {'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}, None, {'embed_type':'w2v', 'skip_paths':['/w2v_model', '/mdl_trsfm/1/0/w2v_model']}], # all the embedding-based approaches without ELMo
     }
     PREDEFINED_MODEL_CONFIG_EXPRESSION = {
         'bert': [('input_keys', P._bert_input_keys, {'task_type':'property'})],
@@ -235,7 +236,7 @@ class Configurable(object):
     # Common parameters
     TEMPLATE_VALUES_TYPE_MAP = {'task':TASK_CONFIG_TEMPLATE_VALUES, 'model':MODEL_CONFIG_TEMPLATE_VALUES}
 
-    def __init__(self, dataset, model, template='', **kwargs):
+    def __init__(self, dataset, model, **kwargs):
         self.dataset = dataset
         self.model = model
         self._callbacks = {}
@@ -310,12 +311,46 @@ class Configurable(object):
         if self.verbose: logging.debug(dict([(k, v) for k, v in self.__dict__.items() if not k.startswith('_') and not callable(v)]))
 
 
+    def _get_attributes(self, params):
+        param_vals = {}
+        for k, v in params.items():
+            if v is not None and v.startswith('property'):
+                try:
+                    param_vals.update({k:getattr(self, k)})
+                except Exception as e:
+                    if v.startswith('property-default-'):
+                        _, default_value = v.split('-default-')
+                        param_vals[k] = None if default_value.isspace() else default_value
+                    elif v != 'property-skipna':
+                        logging.warning('Unable to get the attribute `%s` from config object' % k)
+            else:
+                param_vals.update({k:v})
+        return param_vals
+
+    def _get_template_value(self, name, idx):
+        try:
+        	return Configurable.TASK_CONFIG_TEMPLATE_VALUES[Configurable.PREDEFINED_TASK_CONFIG_VALUES[self.dataset][0]][idx] if self.dataset in Configurable.PREDEFINED_TASK_CONFIG_VALUES else self.__dict__.setdefault(name, Configurable.TASK_CONFIG_TEMPLATE_DEFAULTS[idx])
+        except ValueError as e:
+        	return Configurable.MODEL_CONFIG_TEMPLATE_VALUES[Configurable.PREDEFINED_MODEL_CONFIG_VALUES[self.model][0]][idx] if self.model in Configurable.PREDEFINED_MODEL_CONFIG_VALUES else self.__dict__.setdefault(name, Configurable.MODEL_CONFIG_TEMPLATE_DEFAULTS[idx])
+
     def _update_template_values(type, template_name, values={}):
         template_values = copy.deepcopy(Configurable.TEMPLATE_VALUES_TYPE_MAP[type][template_name])
         key_map = dict(zip(Configurable.TASK_CONFIG_TEMPLATE_KEYS, range(len(Configurable.TASK_CONFIG_TEMPLATE_KEYS))))
         for k, v in values.items():
             template_values[key_map[k]] = v
         return template_values
+
+    def __getattr__(self, name):
+        if name in self.__dict__: return self.__dict__[name]
+        try:
+            try:
+                attr_idx = Configurable.TASK_CONFIG_TEMPLATE_KEYS.index(name)
+            except ValueError as e:
+                attr_idx = Configurable.MODEL_CONFIG_TEMPLATE_KEYS.index(name)
+            return self.__dict__.setdefault(name, self._get_template_value(name, attr_idx))
+        except ValueError as e:
+            return self.__dict__.setdefault(name, self.__dict__['_'+name] if '_'+name in self.__dict__ else None)
+
 
     # Config complex attributes (partial updates) at a delayed time
     def delayed_update(self, updates):
@@ -345,35 +380,80 @@ class Configurable(object):
             for func in func_stack[::-1]:
                 func(self)
 
-    def _get_attributes(self, params):
-        param_vals = {}
-        for k, v in params.items():
-            if v is not None and v.startswith('property'):
-                try:
-                    param_vals.update({k:getattr(self, k)})
-                except Exception as e:
-                    if v != 'property-skipna': logging.warning('Unable to get the attribute `%s` from config object' % k)
-            else:
-                param_vals.update({k:v})
-        return param_vals
 
-    def _get_template_value(self, name, idx):
-        try:
-        	return Configurable.TASK_CONFIG_TEMPLATE_VALUES[Configurable.PREDEFINED_TASK_CONFIG_VALUES[self.dataset][0]][idx] if self.dataset in Configurable.PREDEFINED_TASK_CONFIG_VALUES else self.__dict__.setdefault(name, Configurable.TASK_CONFIG_TEMPLATE_DEFAULTS[idx])
-        except ValueError as e:
-        	return Configurable.MODEL_CONFIG_TEMPLATE_VALUES[Configurable.PREDEFINED_MODEL_CONFIG_VALUES[self.model][0]][idx] if self.model in Configurable.PREDEFINED_MODEL_CONFIG_VALUES else self.__dict__.setdefault(name, Configurable.MODEL_CONFIG_TEMPLATE_DEFAULTS[idx])
+    def to_yaml(self, fpath='config.yaml', pkl_fpath='config.pkl'):
+        from bionlp.util.io import write_yaml
+        # write_yaml(dict([(k,v) for k, v in self.__dict__.items() if not k.startswith('_') and not callable(v)]), fpath)
+        # TODO: serialize object to pkl and replace the value with path, return the file path of the pkl
+        write_yaml(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else []), fpath=fpath)
+
+    def to_json(self, fpath='config.json', pkl_fpath='config.pkl'):
+        from bionlp.util.io import write_json
+        write_json(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else []), fpath=fpath)
 
 
-    def __getattr__(self, name):
-        if name in self.__dict__: return self.__dict__[name]
-        try:
+    def serialize(self, pkl_fpath='config.pkl', skip_paths=[]):
+        def _rec_serialize(data, path='', external_dict={}, skip_paths=[]):
+            if path in skip_paths:
+                if self.verbose: logging.debug('Skip serializing attribute path [%s]' % path)
+                return ''
             try:
-                attr_idx = Configurable.TASK_CONFIG_TEMPLATE_KEYS.index(name)
-            except ValueError as e:
-                attr_idx = Configurable.MODEL_CONFIG_TEMPLATE_KEYS.index(name)
-            return self.__dict__.setdefault(name, self._get_template_value(name, attr_idx))
-        except ValueError as e:
-            return self.__dict__.setdefault(name, self.__dict__['_'+name] if '_'+name in self.__dict__ else None)
+                json.dumps(data)
+                return data
+            except (TypeError, OverflowError):
+                if type(data) is dict:
+                    for k, v in data.items():
+                        data[k] = _rec_serialize(v, path='/'.join([path, k]), external_dict=external_dict, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else [])
+                elif type(data) is tuple or type(data) is list or type(data) is set:
+                    new_data = []
+                    for i, x in enumerate(data):
+                        new_data.append(_rec_serialize(x, path='/'.join([path, str(i)]), external_dict=external_dict, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else []))
+                    data = new_data
+                else:
+                    external_dict[path] = data
+                    data = path
+            return data
+        from bionlp.util.io import write_obj
+        attributes = dict([(k,copy.deepcopy(v)) for k, v in self.__dict__.items() if not k.startswith('_') and (not callable(v) or not hasattr(v, '__self__'))])
+        pkl_obj, skip_paths = {}, set(skip_paths)
+        serialized_attrs = _rec_serialize(attributes, path='', external_dict=pkl_obj, skip_paths=skip_paths)
+        write_obj(pkl_obj, fpath=pkl_fpath)
+        return serialized_attrs
+
+
+class SimpleConfig():
+    def __init__(self, attributes, pkl_fpath='config.pkl'):
+        def _rec_deserialize(data, path='', external_dict={}):
+            if type(data) is dict:
+                for k, v in data.items():
+                    data[k] = _rec_deserialize(v, path='/'.join([path, k]), external_dict=external_dict)
+            elif type(data) is tuple or type(data) is list or type(data) is set:
+                new_data = []
+                for i, x in enumerate(data):
+                    new_data.append(_rec_deserialize(x, path='/'.join([path, str(i)]), external_dict=external_dict))
+                data = new_data
+            elif v == path:
+                data = external_dict[path]
+            return data
+        from bionlp.util.io import read_obj
+        try:
+            pkl_obj = read_obj(pkl_fpath)
+        except Exception as e:
+            pkl_obj = {}
+        for k, v in _rec_deserialize(attributes, path='', external_dict=pkl_obj).items():
+            setattr(self, k, v)
+
+    @classmethod
+    def from_yaml(cls, fpath='config.yaml'):
+        from bionlp.util.io import read_yaml
+        attributes = read_yaml(fpath)
+        return cls(attributes)
+
+    @classmethod
+    def from_json(cls, fpath='config.json'):
+        from bionlp.util.io import read_json
+        attributes = read_json(fpath)
+        return cls(attributes)
 
 
 ### Unit Test ###

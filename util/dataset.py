@@ -131,7 +131,7 @@ class BaseDataset(DatasetInterface, Dataset):
         self.sample_weights = sampw
 
         # Construct the binary label mapping
-        binlb = config.task_ext_params['binlb'] if 'binlb' in config.task_ext_params else None
+        binlb = (config.task_ext_params['binlb'] if 'binlb' in config.task_ext_params else None) if 'binlb' not in kwargs else kwargs['binlb']
         if (binlb == 'rgrsn'): # regression tasks
             self.df[self.label_col] = self.df[self.label_col].astype('float')
             self.binlb = None

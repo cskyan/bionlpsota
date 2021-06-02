@@ -19,14 +19,12 @@ from allennlp.modules.conditional_random_field import ConditionalRandomField
 
 from transformers.models.bert.modeling_bert import BertOnlyMLMHead
 
-from util import func as H
-from . import reduction as R
-
 
 class BaseClfHead(nn.Module):
     """ All-in-one Classifier Head for the Basic Language Model """
 
     def __init__(self, config, lm_model, lm_config, num_lbs=1, mlt_trnsfmr=False, task_params={}, binlb={}, binlbr={}, **kwargs):
+        from . import reduction as R
         super(BaseClfHead, self).__init__()
         self.lm_model = lm_model
         self.lm_config = lm_config
@@ -77,6 +75,7 @@ class BaseClfHead(nn.Module):
         raise NotImplementedError
 
     def __default_pooler__(self):
+        from . import reduction as R
         return R.MaskedReduction(reduction=None, dim=1)
 
     def forward(self, input_ids, *extra_inputs, labels=None, past=None, weights=None, embedding_mode=False):
@@ -315,6 +314,8 @@ class BaseClfHead(nn.Module):
 class BERTClfHead(BaseClfHead):
     def __init__(self, config, lm_model, lm_config, iactvtn='relu', oactvtn='sigmoid', fchdim=0, extfc=False, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, do_drop=True, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, do_thrshld=False, constraints=[], initln=False, initln_mean=0., initln_std=0.02, task_params={}, output_layer=-1, pooler=None, layer_pooler='avg', **kwargs):
         from util import config as C
+        from util import func as H
+        from . import reduction as R
         super(BERTClfHead, self).__init__(config, lm_model, lm_config, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=config.task_type in ['entlmnt', 'sentsim'] and task_params.setdefault('sentsim_func', None) is not None, lm_loss=lm_loss, do_drop=do_drop, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, do_thrshld=do_thrshld, last_hdim=lm_config.hidden_size, constraints=constraints, task_params=task_params, **kwargs)
         self.vocab_size = lm_config.vocab_size
         self.num_hidden_layers = lm_config.num_hidden_layers
@@ -370,6 +371,7 @@ class BERTClfHead(BaseClfHead):
 class GPTClfHead(BaseClfHead):
     def __init__(self, config, lm_model, lm_config, iactvtn='relu', oactvtn='sigmoid', fchdim=0, extfc=False, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, do_drop=False, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         from util import config as C
+        from util import func as H
         super(GPTClfHead, self).__init__(config, lm_model, lm_config, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=config.task_type == 'sentsim', lm_loss=lm_loss, do_drop=do_drop, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         from transformers import GPT2Model
         if type(lm_model) is GPT2Model:self.kwprop['past_paramname'] = 'past'

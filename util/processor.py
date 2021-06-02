@@ -105,7 +105,7 @@ def _elmo_transform(sample, **kwargs):
     return [X, mask], y
 
 
-def sentvec_transform(sample, **kwargs):
+def _sentvec_transform(sample, **kwargs):
     X, y = sample
     import sent2vec
     sentvec_model = kwargs['sentvec_model'] if 'sentvec_model' in kwargs and kwargs['sentvec_model'] else sent2vec.Sent2vecModel()
@@ -126,7 +126,7 @@ def _embedding_transform(sample, **kwargs):
     return [X, masks[0]]+[inputs[x] for x in embed_types[1:]], y
 
 
-EMBED_TRANSFORM = {'w2v': _w2v_transform}
+EMBED_TRANSFORM = {'w2v': _w2v_transform, 'sentvec': _sentvec_transform}
 
 
 def _adjust_encoder(tokenizer, config):
