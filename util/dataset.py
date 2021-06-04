@@ -436,14 +436,14 @@ class EmbeddingPairDataset(BaseDataset):
 
 
 class OntoDataset(BaseDataset):
-    def __init__(self, csv_file, text_col, label_col, encode_func, tokenizer, config, onto_col='ontoid', sep='\t', index_col='id', binlb=None, transforms=[], transforms_args={}, transforms_kwargs=[], sampw=False, sampfrac=None, **kwargs):
-        super(OntoDataset, self).__init__(csv_file, text_col, label_col, encode_func, tokenizer, config, sep=sep, index_col=index_col, binlb=binlb, transforms=transforms, transforms_args=transforms_args, transforms_kwargs=transforms_kwargs, sampw=sampw, sampfrac=sampfrac, **kwargs)
+    def __init__(self, csv_file, tokenizer, config, onto_col='ontoid', sampw=False, sampfrac=None, **kwargs):
+        super(OntoDataset, self).__init__(csv_file, tokenizer, config, sampw=sampw, sampfrac=sampfrac, **kwargs)
         if hasattr(config, 'onto_df') and type(config.onto_df) is pd.DataFrame:
             self.onto = config.onto_df
         else:
             onto_fpath = config.onto if hasattr(config, 'onto') and os.path.exists(config.onto) else 'onto.csv'
             logging.info('Reading ontology dictionary file [%s]...' % onto_fpath)
-            self.onto = pd.read_csv(onto_fpath, sep=sep, index_col=index_col)
+            self.onto = pd.read_csv(onto_fpath, sep=config.dfsep, index_col=config.task_col['index'])
             setattr(config, 'onto_df', self.onto)
         logging.info('Ontology DataFrame size: %s' % str(self.onto.shape))
         self.onto2id = dict([(k, i+1) for i, k in enumerate(self.onto.index)])
@@ -453,7 +453,7 @@ class OntoDataset(BaseDataset):
         record = self.df.iloc[idx]
         sample = self.encode_func([record[sent_idx] for sent_idx in self.text_col], self.tokenizer, self.tknz_kwargs), record[self.label_col] if self.label_col in record and record[self.label_col] is not np.nan else [k for k in [0, '0', 'false', 'False', 'F'] if k in self.binlb][0]
         sample = self._transform_chain(sample)
-        return (self.df.index[idx], torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ()) + (torch.tensor(self.onto2id[record[self.onto_col]]),)
+        return (self.df.index[idx], torch.tensor(sample[0][0]), torch.tensor(sample[1])) + tuple([torch.tensor(x) for x in sample[0][1:]]) + (torch.tensor(self.onto2id[record[self.onto_col]]),) + ((torch.tensor(record['weight'] if 'weight' in record else 1.0),) if self.sample_weights else ())
 
 
 class BaseIterDataset(DatasetInterface, IterableDataset):

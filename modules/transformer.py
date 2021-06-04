@@ -78,7 +78,7 @@ class BaseClfHead(nn.Module):
         from . import reduction as R
         return R.MaskedReduction(reduction=None, dim=1)
 
-    def forward(self, input_ids, *extra_inputs, labels=None, past=None, weights=None, embedding_mode=False):
+    def forward(self, input_ids, *extra_inputs, labels=None, all_hidden_states=None, weights=None, embedding_mode=False):
         use_gpu = next(self.parameters()).is_cuda
         if self.sample_weights and len(extra_inputs) > 0:
             sample_weights = extra_inputs[-1]
@@ -95,18 +95,18 @@ class BaseClfHead(nn.Module):
         output_fields = set(['last_hidden_state', 'hidden_states'])
         if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim']:
             trnsfm_output = [self.transformer(input_ids[x], **extra_inputs_dict) for x in [0,1]]
-            hidden_states, past = zip(*[[trnsfm_output[x][k] for k in ['last_hidden_state', 'hidden_states']] for x in [0,1]])
-            hidden_states, past = list(hidden_states), list(past)
+            hidden_states, all_hidden_states = zip(*[[trnsfm_output[x][k] if k in trnsfm_output[x] else None for k in ['last_hidden_state', 'hidden_states']] for x in [0,1]])
+            hidden_states, all_hidden_states = list(hidden_states), list(all_hidden_states)
             extra_outputs = [dict([(k, v) for k, v in trnsfm_output[x].items() if k not in output_fields]) for x in [0,1]]
         else:
             trnsfm_output = self.transformer(input_ids, **extra_inputs_dict)
-            hidden_states, past = (trnsfm_output[k] if k in trnsfm_output else None for k in ['last_hidden_state', 'hidden_states'])
+            hidden_states, all_hidden_states = (trnsfm_output[k] if k in trnsfm_output else None for k in ['last_hidden_state', 'hidden_states'])
             extra_outputs = dict([(k, v) for k, v in trnsfm_output.items() if k not in output_fields])
         if self.debug: logging.debug(('after transformer', trnsfm_output[:5]))
 
         # Calculate language model loss
         if (self.lm_loss):
-            lm_logits, lm_target = self.lm_logit(input_ids, hidden_states, extra_inputs_dict, past=past)
+            lm_logits, lm_target = self.lm_logit(input_ids, extra_inputs_dict, hidden_states, all_hidden_states=all_hidden_states, extra_outputs=extra_outputs)
             lm_loss_func = nn.CrossEntropyLoss(ignore_index=-1, reduction='none')
             lm_loss = lm_loss_func(lm_logits.contiguous().view(-1, lm_logits.size(-1)), lm_target.contiguous().view(-1)).view(input_ids.size(0), -1)
             if sample_weights is not None: lm_loss *= sample_weights
@@ -115,9 +115,9 @@ class BaseClfHead(nn.Module):
 
         # Pooling
         if self.debug: logging.debug(('hdstat: ', [x.size() for x in hidden_states] if type(hidden_states) is list else hidden_states.size()))
-        clf_h, mask = self.clf_h(hidden_states, mask, past=past)
+        clf_h, mask = self.clf_h(hidden_states, mask, all_hidden_states=all_hidden_states, extra_outputs=extra_outputs)
         if self.debug: logging.debug(('after clf_h', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
-        clf_h = self.pool(input_ids, mask, clf_h, extra_inputs_dict)
+        clf_h = self.pool(input_ids, extra_inputs_dict, mask, clf_h, extra_outputs=extra_outputs)
         if self.debug: logging.debug(('after pool', [x.size() for x in clf_h] if type(clf_h) is list else clf_h.size()))
 
         # Other layers
@@ -186,7 +186,7 @@ class BaseClfHead(nn.Module):
         if sample_weights is not None: clf_loss *= sample_weights
         return clf_loss, lm_loss, extra_outputs
 
-    def pool(self, input_ids, mask, clf_h, extra_inputs):
+    def pool(self, input_ids, extra_inputs, mask, clf_h, extra_outputs={}):
         use_gpu = next(self.parameters()).is_cuda
         if self.task_type == 'nmt':
             if (hasattr(self, 'layer_pooler')):
@@ -194,8 +194,7 @@ class BaseClfHead(nn.Module):
             else:
                 clf_h = clf_h
         else:
-            if not hasattr(self, 'pooler'):
-                setattr(self, 'pooler', self.__default_pooler__())
+            if not hasattr(self, 'pooler'): setattr(self, 'pooler', self.__default_pooler__())
             if self.task_type in ['entlmnt', 'sentsim'] and self.mlt_trnsfmr:
                 if (hasattr(self, 'layer_pooler')):
                     lyr_h = [[self.pooler(h, mask[x]) for h in clf_h[x]] for x in [0,1]]
@@ -210,20 +209,20 @@ class BaseClfHead(nn.Module):
                     clf_h = self.pooler(clf_h, mask)
         return clf_h
 
-    def _clf_h(self, hidden_states, mask, past=None):
+    def _clf_h(self, hidden_states, mask, all_hidden_states=None, extra_outputs={}):
         return (hidden_states, torch.stack(mask).max(0)[0]) if type(hidden_states) is list else (hidden_states, mask)
 
-    def _mlt_clf_h(self, hidden_states, mask, past=None):
+    def _mlt_clf_h(self, hidden_states, mask, all_hidden_states=None, extra_outputs={}):
         return torch.stack(hidden_states).sum(0), torch.stack(pool_idx).max(0)[0]
 
     def transformer(self, input_ids, **extra_inputs):
         return self.lm_model(input_ids=input_ids, **extra_inputs, return_dict=True)
 
-    def _lm_logit(self, input_ids, hidden_states, extra_inputs, past=None):
+    def _lm_logit(self, input_ids, extra_inputs, hidden_states, all_hidden_states=None, extra_outputs={}):
         lm_h = hidden_states[:,:-1]
         return self.lm_head(lm_h), input_ids[:,1:]
 
-    def _mlt_lm_logit(self, input_ids, hidden_states, past=None):
+    def _mlt_lm_logit(self, input_ids, hidden_states, extra_inputs, all_hidden_states=None, extra_outputs={}):
         lm_h = hidden_states[:,:,:-1].contiguous().view(-1, self.n_embd)
         lm_target = input_ids[:,:,1:].contiguous().view(-1)
         return self.lm_model.lm_head(lm_h), lm_target.view(-1)
@@ -348,8 +347,8 @@ class BERTClfHead(BaseClfHead):
     def __lm_head__(self):
         return BertOnlyMLMHead(self.lm_config)
 
-    def _clf_h(self, hidden_states, pool_idx, past=None):
-        return hidden_states, pool_idx
+    def _clf_h(self, hidden_states, mask, all_hidden_states=None, extra_outputs={}):
+        return hidden_states, mask
 
     def transformer(self, input_ids, **extra_inputs):
         if (self.output_layer == -1 or self.output_layer == 11):
@@ -363,7 +362,7 @@ class BERTClfHead(BaseClfHead):
             return outputs
 
 
-    def _lm_logit(self, input_ids, hidden_states, extra_inputs, past=None):
+    def _lm_logit(self, input_ids, hidden_states, extra_inputs, all_hidden_states=None):
         masked_lm_ids = (extra_inputs[1] if len(extra_inputs) > 1 else input_ids) if self.sample_weights else (extra_inputs[0] if len(extra_inputs) > 0 else input_ids)
         return self.lm_head(*self.transformer(masked_lm_ids, *extra_inputs, pool_idx=pool_idx))[0], masked_lm_lbs
 
@@ -374,7 +373,6 @@ class GPTClfHead(BaseClfHead):
         from util import func as H
         super(GPTClfHead, self).__init__(config, lm_model, lm_config, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=config.task_type == 'sentsim', lm_loss=lm_loss, do_drop=do_drop, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
         from transformers import GPT2Model
-        if type(lm_model) is GPT2Model:self.kwprop['past_paramname'] = 'past'
         self.vocab_size = lm_config.vocab_size
         self.n_embd = lm_config.n_embd
         self.norm = C.NORM_TYPE_MAP[norm_type](lm_config.n_embd)
@@ -401,7 +399,6 @@ class TransformXLClfHead(BaseClfHead):
     def __init__(self, config, lm_model, lm_config, iactvtn='relu', oactvtn='sigmoid', fchdim=0, extfc=False, sample_weights=False, num_lbs=1, mlt_trnsfmr=False, lm_loss=False, do_drop=True, pdrop=0.2, do_norm=True, norm_type='batch', do_lastdrop=True, do_crf=False, initln=False, initln_mean=0., initln_std=0.02, task_params={}, **kwargs):
         from util import config as C
         super(TransformXLClfHead, self).__init__(config, lm_model, lm_config, sample_weights=sample_weights, num_lbs=num_lbs, mlt_trnsfmr=mlt_trnsfmr, lm_loss=lm_loss, do_drop=do_drop, pdrop=pdrop, do_norm=do_norm, do_lastdrop=do_lastdrop, do_crf=do_crf, task_params=task_params, **kwargs)
-        self.kwprop['past_paramname'] = 'mems'
         self.vocab_size = lm_config.n_token
         self.n_embd = lm_config.d_embed
         self.norm = C.NORM_TYPE_MAP[norm_type](lm_config.n_embd)
@@ -419,7 +416,7 @@ class TransformXLClfHead(BaseClfHead):
     def __lm_head__(self):
         pass
 
-    def _lm_logit(self, input_ids, hidden_states, extra_inputs, pool_idx=None, past=None):
+    def _lm_logit(self, input_ids, extra_inputs, hidden_states, all_hidden_states=None, extra_outputs={}):
         bsz, tgt_len = input_ids.size(0), input_ids.size(1)
         lm_h, lm_trgt = hidden_states[:, -tgt_len:], None
         if self.lm_model.sample_softmax > 0 and self.lm_model.training:
@@ -434,8 +431,8 @@ class TransformXLClfHead(BaseClfHead):
                 softmax_output = softmax_output.view(bsz, tgt_len)
         return softmax_output, input_ids
 
-    def _mlt_lm_logit(self, input_ids, hidden_states, extra_inputs, pool_idx=None, past=None):
-        return self._lm_logit(input_ids, hidden_states, extra_inputs, past=past, pool_idx=pool_idx)
+    def _mlt_lm_logit(self, input_ids, extra_inputs, hidden_states, all_hidden_states=None, extra_outputs={}):
+        return self._lm_logit(input_ids, hidden_states, extra_inputs, all_hidden_states=all_hidden_states, pool_idx=pool_idx)
 
     def transformer(self, input_ids, **extra_inputs):
         return self.lm_model.transformer(input_ids=input_ids.view(input_ids.size(0), -1))

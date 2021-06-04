@@ -9,7 +9,7 @@
 ###########################################################################
 #
 
-import copy, json, logging
+import os, copy, json, logging
 from collections import OrderedDict
 
 import numpy as np
@@ -30,7 +30,8 @@ from modules.constraint import HrchConstraint
 from modules.embedding import EmbeddingPool, EmbeddingSeq2Vec, EmbeddingSeq2Seq, SentVecEmbeddingSeq2Vec
 from modules.loss import MSELoss, ContrastiveLoss, HuberLoss, LogCoshLoss, XTanhLoss, XSigmoidLoss, QuantileLoss, PearsonCorrelationLoss
 from modules.transformer import BERTClfHead, GPTClfHead, TransformXLClfHead
-from .dataset import BaseDataset, SentSimDataset, EntlmntDataset, NERDataset
+from modules.varclf import OntoBERTClfHead
+from .dataset import BaseDataset, SentSimDataset, EntlmntDataset, NERDataset, OntoDataset
 from . import processor as P
 
 
@@ -159,14 +160,14 @@ class Configurable(object):
         'biolarkgsc_entilement': ['entlmnt-base', 'biolarkgsc.entlmnt', {'task_col':{'index':'id', 'X':['text1', 'onto'], 'y':'label', 'ontoid':'label2'}}]
     }
     PREDEFINED_TASK_CONFIG_EXPRESSION = {
+        'hpo_entilement': [('task_ds', lambda x: OntoDataset, {'x':None})]
     }
     PREDEFINED_TASK_CONFIG_UPDATES = {
         'ddi': [
             ('task_ext_params', lambda param, val: param.update({'ignored_label':'DDI-false'}), {})
         ],
         'hpo_entilement': [
-            ('ds_kwargs', lambda param, val: param.update({'onto_fpath':val['onto'] if val['onto'] and os.path.exists(val['onto']) else 'onto.csv'}), {'onto':'property'}),
-            ('ds_kwargs', lambda param, val: param.update({'onto_col':val['ontoid']}), {'task_col':'property'}),
+            ('ds_kwargs', lambda param, val: param.update({'onto_fpath':val['onto'] if val['onto'] and os.path.exists(val['onto']) else 'onto.csv', 'onto_col':val['task_col']['ontoid']}), {'onto':'property', 'task_col':'property'}),
             ('tknz_kwargs', lambda param, val: param.update({'truncation':'only_first'}), {})
         ],
         'biolarkgsc_entilement': [
@@ -213,9 +214,11 @@ class Configurable(object):
         # Transformer-based approach should not have embed_type attribute
         'elmo': ['nn-base', 'elmo', Elmo, elmo_config, 'ELMo', {'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}, None, {'embed_type':'elmo'}],
         'none': ['nn-base', 'embedding', None, None, 'Embedding', {'pool':EmbeddingPool, 's2v':EmbeddingSeq2Vec, 's2s':EmbeddingSeq2Seq, 'ss2v':SentVecEmbeddingSeq2Vec}, None, {'embed_type':'w2v', 'skip_paths':['/w2v_model', '/mdl_trsfm/1/0/w2v_model']}], # all the embedding-based approaches without ELMo
+        'bert_onto': ['transformer-base', 'bert-base-uncased', BertModel, BertConfig, 'BERT', OntoBERTClfHead, BertTokenizer, {}],
     }
     PREDEFINED_MODEL_CONFIG_EXPRESSION = {
         'bert': [('input_keys', P._bert_input_keys, {'task_type':'property'})],
+        'bert_onto': [('input_keys', P._bert_onto_input_keys, {'task_type':'property'})],
         'elmo': [('encoder', lambda encoder: encoder if encoder is not None and not encoder.isspace() else 'pool', {'encoder':'property'})],
         'none': [('input_keys', P._embed_input_keys, {'embed_type':'property'})]
     }
@@ -226,6 +229,7 @@ class Configurable(object):
         param[1][0].update({'embed_type':val['embed_type']})
     PREDEFINED_MODEL_CONFIG_UPDATES = {
         'bert': [('clf_ext_params', lambda param, val: param.update({'do_drop':val['do_drop']}), {'do_drop':'property'})],
+        'bert_onto': [('clf_ext_params', lambda param, val: param.update({'do_drop':val['do_drop']}), {'do_drop':'property'}), ('mdl_trsfm', lambda param, val: param[1][0].update({'input_keys':[x for x in val['input_keys'] if x != 'onto_id']}), {'input_keys':'property'})],
         'elmo': [('mdl_trsfm', set_elmo_transform, {'lm_config':'property'})],
         'none': [('mdl_trsfm', set_embed_transform, {'embed_type':'property'})]
     }
@@ -385,11 +389,11 @@ class Configurable(object):
         from bionlp.util.io import write_yaml
         # write_yaml(dict([(k,v) for k, v in self.__dict__.items() if not k.startswith('_') and not callable(v)]), fpath)
         # TODO: serialize object to pkl and replace the value with path, return the file path of the pkl
-        write_yaml(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else []), fpath=fpath)
+        write_yaml(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') and self.skip_paths is not None else []), fpath=fpath)
 
     def to_json(self, fpath='config.json', pkl_fpath='config.pkl'):
         from bionlp.util.io import write_json
-        write_json(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else []), fpath=fpath)
+        write_json(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') and self.skip_paths is not None else []), fpath=fpath)
 
 
     def serialize(self, pkl_fpath='config.pkl', skip_paths=[]):
@@ -403,11 +407,11 @@ class Configurable(object):
             except (TypeError, OverflowError):
                 if type(data) is dict:
                     for k, v in data.items():
-                        data[k] = _rec_serialize(v, path='/'.join([path, k]), external_dict=external_dict, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else [])
+                        data[k] = _rec_serialize(v, path='/'.join([path, k]), external_dict=external_dict, skip_paths=skip_paths)
                 elif type(data) is tuple or type(data) is list or type(data) is set:
                     new_data = []
                     for i, x in enumerate(data):
-                        new_data.append(_rec_serialize(x, path='/'.join([path, str(i)]), external_dict=external_dict, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') else []))
+                        new_data.append(_rec_serialize(x, path='/'.join([path, str(i)]), external_dict=external_dict, skip_paths=skip_paths))
                     data = new_data
                 else:
                     external_dict[path] = data

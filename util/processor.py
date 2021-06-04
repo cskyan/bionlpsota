@@ -40,6 +40,9 @@ def _base_transform(sample, input_keys=[]):
 def _bert_input_keys(task_type=None):
     return ['input_ids', 'attention_mask'] + ([] if task_type is None or task_type not in ['entlmnt', 'sentsim'] else ['token_type_ids'])
 
+def _bert_onto_input_keys(task_type=None):
+    return _bert_input_keys(task_type=None) + ['onto_id']
+
 
 def _gpt_input_keys(task_type=None):
     return ['input_ids', 'attention_mask']
