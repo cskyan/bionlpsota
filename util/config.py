@@ -97,8 +97,57 @@ CNSTRNT_PARAMS_MAP = {'hrch':'Hrch'}
 CNSTRNTS_MAP = {'hrch':(HrchConstraint, {('num_lbs','num_lbs'):1, ('hrchrel_path','hrchrel_path'):'hpo_ancrels.pkl', ('binlb','binlb'):{}})}
 
 
+### Serializable interface ###
+class Serializable(object):
+    def __init__(self):
+        raise NotImplementedError
+
+    def to_yaml(self, fpath='config.yaml', pkl_fpath='config.pkl'):
+        from bionlp.util.io import write_yaml
+        write_yaml(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') and self.skip_paths is not None else []), fpath=fpath)
+
+    def to_json(self, fpath='config.json', pkl_fpath='config.pkl'):
+        from bionlp.util.io import write_json
+        write_json(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') and self.skip_paths is not None else []), fpath=fpath)
+
+    def to_file(self, fpath='config.json', pkl_fpath='config.pkl'):
+        if fpath.endswith('.yaml') or fpath.endswith('.yml'):
+            self.to_yaml(fpath=fpath, pkl_fpath=pkl_fpath)
+        elif fpath.endswith('.json'):
+            self.to_json(fpath=fpath, pkl_fpath=pkl_fpath)
+
+
+    def serialize(self, pkl_fpath='config.pkl', skip_paths=[]):
+        def _rec_serialize(data, path='', external_dict={}, skip_paths=[]):
+            if path in skip_paths:
+                if self.verbose: logging.debug('Skip serializing attribute path [%s]' % path)
+                return ''
+            try:
+                json.dumps(data)
+                return data
+            except (TypeError, OverflowError):
+                if type(data) is dict:
+                    for k, v in data.items():
+                        data[k] = _rec_serialize(v, path='/'.join([path, k]), external_dict=external_dict, skip_paths=skip_paths)
+                elif type(data) is tuple or type(data) is list or type(data) is set:
+                    new_data = []
+                    for i, x in enumerate(data):
+                        new_data.append(_rec_serialize(x, path='/'.join([path, str(i)]), external_dict=external_dict, skip_paths=skip_paths))
+                    data = new_data
+                else:
+                    external_dict[path] = data
+                    data = path
+            return data
+        from bionlp.util.io import write_obj
+        attributes = dict([(k,copy.deepcopy(v)) for k, v in self.__dict__.items() if not k.startswith('_') and (not callable(v) or not hasattr(v, '__self__'))])
+        pkl_obj, skip_paths = {}, set(skip_paths)
+        serialized_attrs = _rec_serialize(attributes, path='', external_dict=pkl_obj, skip_paths=skip_paths)
+        if pkl_fpath is not None: write_obj(pkl_obj, fpath=pkl_fpath)
+        return serialized_attrs
+
+
 ### Universal Config Class ###
-class Configurable(object):
+class Configurable(Serializable):
     # Task related parameters
     TASK_CONFIG_TEMPLATE_KEYS = ['task_type', 'task_ds', 'task_col', 'task_trsfm', 'task_ext_params', 'ds_kwargs']
     TASK_CONFIG_TEMPLATE_VALUES = {
@@ -385,79 +434,76 @@ class Configurable(object):
                 func(self)
 
 
-    def to_yaml(self, fpath='config.yaml', pkl_fpath='config.pkl'):
-        from bionlp.util.io import write_yaml
-        # write_yaml(dict([(k,v) for k, v in self.__dict__.items() if not k.startswith('_') and not callable(v)]), fpath)
-        # TODO: serialize object to pkl and replace the value with path, return the file path of the pkl
-        write_yaml(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') and self.skip_paths is not None else []), fpath=fpath)
-
-    def to_json(self, fpath='config.json', pkl_fpath='config.pkl'):
-        from bionlp.util.io import write_json
-        write_json(self.serialize(pkl_fpath=pkl_fpath, skip_paths=self.skip_paths if hasattr(self, 'skip_paths') and self.skip_paths is not None else []), fpath=fpath)
-
-
-    def serialize(self, pkl_fpath='config.pkl', skip_paths=[]):
-        def _rec_serialize(data, path='', external_dict={}, skip_paths=[]):
-            if path in skip_paths:
-                if self.verbose: logging.debug('Skip serializing attribute path [%s]' % path)
-                return ''
-            try:
-                json.dumps(data)
-                return data
-            except (TypeError, OverflowError):
-                if type(data) is dict:
-                    for k, v in data.items():
-                        data[k] = _rec_serialize(v, path='/'.join([path, k]), external_dict=external_dict, skip_paths=skip_paths)
-                elif type(data) is tuple or type(data) is list or type(data) is set:
-                    new_data = []
-                    for i, x in enumerate(data):
-                        new_data.append(_rec_serialize(x, path='/'.join([path, str(i)]), external_dict=external_dict, skip_paths=skip_paths))
-                    data = new_data
-                else:
-                    external_dict[path] = data
-                    data = path
-            return data
-        from bionlp.util.io import write_obj
-        attributes = dict([(k,copy.deepcopy(v)) for k, v in self.__dict__.items() if not k.startswith('_') and (not callable(v) or not hasattr(v, '__self__'))])
-        pkl_obj, skip_paths = {}, set(skip_paths)
-        serialized_attrs = _rec_serialize(attributes, path='', external_dict=pkl_obj, skip_paths=skip_paths)
-        write_obj(pkl_obj, fpath=pkl_fpath)
-        return serialized_attrs
-
-
-class SimpleConfig():
-    def __init__(self, attributes, pkl_fpath='config.pkl'):
-        def _rec_deserialize(data, path='', external_dict={}):
+class SimpleConfig(Serializable):
+    def __init__(self, attributes, pkl_fpath='config.pkl', decouple=False, keep_obj=False, import_lib=False, import_map={}, skip_paths=[]):
+        def _rec_deserialize(data, path='', external_dict={}, decouple=False, keep_obj=False, output={}):
             if type(data) is dict:
                 for k, v in data.items():
-                    data[k] = _rec_deserialize(v, path='/'.join([path, k]), external_dict=external_dict)
+                    data[k] = _rec_deserialize(v, path='/'.join([path, k]), external_dict=external_dict, decouple=decouple, keep_obj=keep_obj, output=output)
             elif type(data) is tuple or type(data) is list or type(data) is set:
                 new_data = []
                 for i, x in enumerate(data):
-                    new_data.append(_rec_deserialize(x, path='/'.join([path, str(i)]), external_dict=external_dict))
+                    new_data.append(_rec_deserialize(x, path='/'.join([path, str(i)]), external_dict=external_dict, decouple=decouple, keep_obj=keep_obj, output=output))
                 data = new_data
-            elif v == path:
-                data = external_dict[path]
+            elif data == path:
+                if decouple: # decouple mode: convert non-literal values into object references or import string
+                    from bionlp.util.fs import get_import_path_obj
+                    data_details = get_import_path_obj(external_dict[path], keep_obj=keep_obj)
+                    data = path if keep_obj else 'import://%s/%s' % (data_details[0], '' if data_details[1] is None else data_details[1])
+                    if data.startswith('import://'): output.setdefault('import', []).append(data_details[0])
+                else:
+                    data = path if keep_obj else external_dict[path]
+                if import_lib and type(data) is str and data.startswith('import://'):
+                    import importlib
+                    module_str, cls_func = data[len('import://'):].split('/')
+                    module = importlib.import_module(import_map.setdefault(module_str, module_str))
+                    data = module if cls_func is None else getattr(module, cls_func)
             return data
         from bionlp.util.io import read_obj
         try:
-            pkl_obj = read_obj(pkl_fpath)
+            self.pkl_obj = read_obj(pkl_fpath)
         except Exception as e:
-            pkl_obj = {}
-        for k, v in _rec_deserialize(attributes, path='', external_dict=pkl_obj).items():
+            self.pkl_obj = {}
+        self.skip_paths = attributes.setdefault('skip_paths', [])
+        self.skip_paths = (self.skip_paths if type(self.skip_paths) is list else []) + ['/pkl_obj', '/importlibs', '/skip_paths'] + skip_paths
+        del attributes['skip_paths']
+        temp_output = {}
+        for k, v in _rec_deserialize(attributes, path='', external_dict=self.pkl_obj, decouple=decouple, keep_obj=keep_obj, output=temp_output).items():
             setattr(self, k, v)
+        self.importlibs = temp_output.setdefault('import', [])
+
+    def to_file(self, fpath='config.json'):
+        super(SimpleConfig, self).to_file(fpath=fpath, pkl_fpath=None)
+
+    def output_importmap(self, fpath='import.json'):
+        from bionlp.util.io import write_json
+        write_json(dict([(k, k) for k in self.importlibs]), fpath=fpath)
 
     @classmethod
-    def from_yaml(cls, fpath='config.yaml'):
+    def from_yaml(cls, fpath='config.yaml', pkl_fpath='config.pkl', decouple=False, keep_obj=False, import_lib=False, import_map={}, skip_paths=[], updates={}):
         from bionlp.util.io import read_yaml
         attributes = read_yaml(fpath)
-        return cls(attributes)
+        attributes.update(updates)
+        return cls(attributes, pkl_fpath=pkl_fpath, decouple=decouple, keep_obj=keep_obj, import_lib=import_lib, import_map=import_map, skip_paths=skip_paths)
 
     @classmethod
-    def from_json(cls, fpath='config.json'):
+    def from_json(cls, fpath='config.json', pkl_fpath='config.pkl', decouple=False, keep_obj=False, import_lib=False, import_map={}, skip_paths=[], updates={}):
         from bionlp.util.io import read_json
         attributes = read_json(fpath)
-        return cls(attributes)
+        attributes.update(updates)
+        return cls(attributes, pkl_fpath=pkl_fpath, decouple=decouple, keep_obj=keep_obj, import_lib=import_lib, import_map=import_map, skip_paths=skip_paths)
+
+    @classmethod
+    def from_file(cls, fpath='config.json', pkl_fpath='config.pkl', decouple=False, keep_obj=False, import_lib=False, import_map={}, skip_paths=[], updates={}):
+        if fpath.endswith('.yaml') or fpath.endswith('.yml'):
+            return cls.from_yaml(fpath, pkl_fpath=pkl_fpath, decouple=decouple, keep_obj=keep_obj, import_lib=import_lib, import_map=import_map, skip_paths=skip_paths, updates=updates)
+        elif fpath.endswith('.json'):
+            return cls.from_json(fpath, pkl_fpath=pkl_fpath, decouple=decouple, keep_obj=keep_obj, import_lib=import_lib, import_map=import_map, skip_paths=skip_paths, updates=updates)
+
+    @classmethod
+    def from_file_importmap(cls, fpath='config.json', pkl_fpath='config.pkl', decouple=False, keep_obj=False, import_lib=False, import_map_fpath='import_map.json', skip_paths=[], updates={}):
+        from bionlp.util.io import read_json
+        return cls.from_file(fpath=fpath, pkl_fpath=pkl_fpath, decouple=decouple, keep_obj=keep_obj, import_lib=import_lib, import_map=read_json(import_map_fpath), skip_paths=skip_paths, updates=updates)
 
 
 ### Unit Test ###

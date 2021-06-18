@@ -9,17 +9,15 @@
 ###########################################################################
 #
 
-import os, sys, time, logging
-from optparse import OptionParser
+import os, sys, ast, time, logging
+import argparse
 
 
+global FILE_DIR, PAR_DIR, CONFIG_FILE, cfgr, args
 FILE_DIR = os.path.dirname(os.path.realpath(__file__))
 PAR_DIR = os.path.abspath(os.path.join(FILE_DIR, os.path.pardir))
 CONFIG_FILE = os.path.join(PAR_DIR, 'etc', 'config.yaml')
-SEP=';;'
-
-opts, args = {}, []
-cfgr = None
+args, cfgr = {}, None
 
 
 def _convert_vocab(ifpath, ofpath):
@@ -36,7 +34,7 @@ def _convert_vocab(ifpath, ofpath):
 
 
 def convert_vocab():
-    _convert_vocab(ifpath=os.path.join(opts.loc, opts.input), ofpath=os.path.join(opts.loc, opts.output))
+    _convert_vocab(ifpath=os.path.join(args.loc, args.input), ofpath=os.path.join(args.loc, args.output))
 
 
 def _convert_vocabj(ifpath, ofpath):
@@ -49,12 +47,12 @@ def _convert_vocabj(ifpath, ofpath):
 
 
 def convert_vocabj():
-    _convert_vocabj(ifpath=os.path.join(opts.loc, opts.input), ofpath=os.path.join(opts.loc, opts.output))
+    _convert_vocabj(ifpath=os.path.join(args.loc, args.input), ofpath=os.path.join(args.loc, args.output))
 
 
 def merge_vocab():
     import json, operator
-    vocab_fpaths = [os.path.join(opts.loc, fname) for fname in opts.input.split(SEP)]
+    vocab_fpaths = [os.path.join(args.loc, fname) for fname in args.input.split(args.sep)]
     merged_vocab = {}
     for vocabf in vocab_fpaths:
         try:
@@ -71,15 +69,15 @@ def merge_vocab():
         except Exception as e:
             print(e)
     vocab_data = json.dumps(merged_vocab)
-    with open(opts.output if opts.output else 'merged_vocab.json', 'w') as f:
+    with open(args.output if args.output else 'merged_vocab.json', 'w') as f:
         f.write(vocab_data)
-    with open(opts.output if opts.output else 'merged_vocab.txt', 'w') as f:
+    with open(args.output if args.output else 'merged_vocab.txt', 'w') as f:
         f.write('\n'.join(['%s %s' % (k.encode('utf-8'), v) for k, v in sorted(merged_vocab.items(), key=operator.itemgetter(1), reverse=True)]))
 
 
 def merge_bpe():
     from collections import OrderedDict
-    bpe_fpaths = [os.path.join(opts.loc, fname) for fname in opts.input.split(SEP)]
+    bpe_fpaths = [os.path.join(args.loc, fname) for fname in args.input.split(args.sep)]
     merged_bpe = []
     for bpef in bpe_fpaths:
         try:
@@ -88,17 +86,34 @@ def merge_bpe():
         except Exception as e:
             print(e)
     bpe_data = ''.join(list(OrderedDict.fromkeys(merged_bpe)))
-    with open(opts.output if opts.output else 'merged_bpe.txt', 'w') as f:
+    with open(args.output if args.output else 'merged_bpe.txt', 'w') as f:
         f.write(bpe_data)
 
 
+def decouple_config():
+    sys.path.insert(0, PAR_DIR)
+    from util.config import SimpleConfig
+    config_fpath = os.path.join(args.loc, args.input)
+    pkl_fpath = args.cfg.setdefault('pkl_fpath', os.path.splitext(config_fpath)[0]+'.pkl')
+    keep_obj = args.cfg.setdefault('keepobj', False)
+    skip_paths = args.cfg.setdefault('skippaths', [])
+    config = SimpleConfig.from_file(config_fpath, pkl_fpath=pkl_fpath, decouple=True, keep_obj=keep_obj, skip_paths=skip_paths)
+    config.to_file(args.input)
+    config.output_importmap()
+    print(SimpleConfig.from_file(config_fpath, pkl_fpath=pkl_fpath, decouple=True, keep_obj=keep_obj, import_lib=True, skip_paths=skip_paths).__dict__)
+
+
 def main():
-    if (opts.method == 'cnvrt-vcb'):
+    if (args.method == 'cnvrt-vcb'):
         convert_vocab()
-    elif (opts.method == 'mrg-vcb'):
+    if (args.method == 'cnvrt-vcbj'):
+        convert_vocabj()
+    elif (args.method == 'mrg-vcb'):
         merge_vocab()
-    elif (opts.method == 'mrg-bpe'):
+    elif (args.method == 'mrg-bpe'):
         merge_bpe()
+    elif (args.method == 'decpl-cfg'):
+        decouple_config()
 
 
 if __name__ == '__main__':
@@ -106,19 +121,17 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(aSEPtime)s %(levelname)s %(message)s')
 
     # Parse commandline arguments
-    op = OptionParser()
-    op.add_option('-l', '--loc', default='.', help='the files in which location to be process')
-    op.add_option('-i', '--input', help='input file')
-    op.add_option('-o', '--output', help='output file')
-    op.add_option('--sep', help='the separator in the string')
-    op.add_option('-m', '--method', help='main method to run')
-    op.add_option('-v', '--verbose', action='store_true', dest='verbose', default=False, help='display detailed information')
+    parser = argparse.ArgumentParser(description='Helper script.')
+    parser.add_argument('-l', '--loc', default='.', help='the files in which location to be process')
+    parser.add_argument('-i', '--input', help='input file')
+    parser.add_argument('-o', '--output', help='output file')
+    parser.add_argument('--sep', default=';;', help='the separator in the string')
+    parser.add_argument('-c', '--cfg', help='config string used to update the settings, format: {\'param_name1\':param_value1[, \'param_name1\':param_value1]}')
+    parser.add_argument('-m', '--method', help='main method to run')
+    parser.add_argument('-v', '--verbose', action='store_true', dest='verbose', default=False, help='display detailed information')
+    args = parser.parse_args()
 
-    (opts, args) = op.parse_args()
-    if len(args) > 0:
-    	op.print_help()
-    	op.error('Please input options instead of arguments.')
-    	sys.exit(1)
-    if opts.sep: SEP=sep
+    cfg_kwargs = {} if args.cfg is None else ast.literal_eval(args.cfg)
+    args.cfg = cfg_kwargs
 
     main()

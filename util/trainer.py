@@ -24,13 +24,12 @@ from bionlp.util import system
 
 from modules.common import EarlyStopping
 from .dataset import DataParallel
-from .processor import nlp, _batch2ids_w2v
 from .func import _sprmn_cor, _prsn_cor, save_model
 
 
 def train(clf, optimizer, dataset, config, scheduler=None, weights=None, lmcoef=0.5, clipmaxn=0.25, epochs=1, earlystop=False, earlystop_delta=0.005, earlystop_patience=5, use_gpu=False, devq=None, distrb=False, resume={}, chckpnt_kwargs={}):
     if distrb: import horovod.torch as hvd
-    chckpnt_fname, model_fname = '%s_%s_checkpoint.pth' % (config.dataset, config.model), '%s_%s.pth' % (config.dataset, config.model)
+    chckpnt_fname, model_fname = '%s_%s_checkpoint.pth' % (config.task, config.model), '%s_%s.pth' % (config.task, config.model)
     earlystoper = EarlyStopping(mode='min', min_delta=earlystop_delta, patience=earlystop_patience)
     clf.train()
     clf.unfreeze_lm()
@@ -105,7 +104,7 @@ def train(clf, optimizer, dataset, config, scheduler=None, weights=None, lmcoef=
 def eval(clf, dataset, config, ds_name='', clipmaxn=0.25, use_gpu=False, devq=None, distrb=False, ignored_label=None):
     clf.eval()
     clf.freeze_lm()
-    total_loss, indices, preds, probs, all_logits, trues, config.dataset = 0, [], [], [], [], [], config.dataset.strip()
+    total_loss, indices, preds, probs, all_logits, trues, config.task = 0, [], [], [], [], [], config.task.strip()
     if config.task_type not in ['entlmnt', 'sentsim', 'mltl-clf']: dataset.dataset.remove_mostfrqlb()
     for step, batch in enumerate(tqdm(dataset, desc="%s batches" % ds_name.title() if ds_name else 'Evaluation')):
         # Obtain data
@@ -145,7 +144,7 @@ def eval(clf, dataset, config, ds_name='', clipmaxn=0.25, use_gpu=False, devq=No
         probs.append(prob.view(prob.size(0), -1).detach().cpu().numpy() if config.task_type == 'mltl-clf' else prob.view(-1).detach().cpu().numpy())
         all_logits.append(logits.view(_lb_tnsr.size(0), -1, logits.size(-1)).detach().cpu().numpy())
     total_loss = total_loss / (step + 1)
-    logging.info('Evaluation loss on %s dataset: %.2f' % (config.dataset, total_loss))
+    logging.info('Evaluation loss on %s dataset: %.2f' % (config.task, total_loss))
 
     # Save raw outputs
     all_logits = np.concatenate(all_logits, axis=0)
@@ -162,7 +161,7 @@ def eval(clf, dataset, config, ds_name='', clipmaxn=0.25, use_gpu=False, devq=No
         trues = np.concatenate(trues, axis=0)
         preds = np.concatenate(preds, axis=0)
         probs = np.concatenate(probs, axis=0)
-    resf_prefix = config.dataset.lower().replace(' ', '_')
+    resf_prefix = config.task.lower().replace(' ', '_')
     with open('%s_preds_trues.pkl' % resf_prefix, 'wb') as fd:
         pickle.dump((trues, preds, probs, all_logits), fd)
     # Calculate performance
@@ -189,7 +188,7 @@ def eval(clf, dataset, config, ds_name='', clipmaxn=0.25, use_gpu=False, devq=No
     else:
         labels = [x for x in (list(clf.binlbr.keys()-[clf.binlb[ignored_label]]) if ignored_label else list(clf.binlbr.keys())) if x in preds or x in trues] if len(clf.binlbr) > 1 else [0, 1]
         perf_df = pd.DataFrame(metrics.classification_report(trues, preds, labels=labels, target_names=[clf.binlbr[x] for x in labels], output_dict=True)).T[['precision', 'recall', 'f1-score', 'support']]
-    logging.info('Results for %s dataset is:\n%s' % (config.dataset.title(), perf_df))
+    logging.info('Results for %s dataset is:\n%s' % (config.task.title(), perf_df))
     perf_df.to_excel('perf_%s.xlsx' % resf_prefix)
 
     try:

@@ -103,7 +103,6 @@ class OntoBERTClfHead(T.BERTClfHead):
         return torch.cat([lyr_h[-1], torch.sum(clf_h.view(output_size[:-1]+(self.halflen, -1)) * mlthead_h.view(*((onto_ids.size()[0], -1)+(1,)*(len(output_size)-1))), 1)], dim=-1)
 
     def transformer(self, input_ids, **extra_inputs):
-        use_gpu = next(self.parameters()).is_cuda
         # root = OntoBERTClfHead._PyTorchModuleVertex.from_dict({'module':self.lm_model})
         # OntoBERTClfHead.stack_dfs(root, 'modify_config', shared_data={'config':{'output_attentions':True, 'output_hidden_states':True}})
         outputs = self.lm_model(input_ids=input_ids, **dict([(k,v) for k, v in extra_inputs.items() if k != 'onto_id']), return_dict=True, output_attentions=True, output_hidden_states=True)

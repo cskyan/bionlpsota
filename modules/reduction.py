@@ -50,12 +50,13 @@ class TransformerLayerWeightedReduce(nn.Module):
         self.reduction = reduction
 
     def forward(self, hidden_states, *extra_inputs):
+        use_gpu = hidden_states[0].is_cuda if type(hidden_states) is list else hidden_states.is_cuda
         if type(hidden_states) is list:
             hidden_states = torch.cat([x.unsqueeze(0) for x in hidden_states], dim=0)
         weights = extra_inputs[0]
         hidden_size, weight_size = hidden_states.size(), weights.size()
         lyr, bs = hidden_size[:2]
-        w = (torch.cat((weights, torch.zeros((weight_size[0], lyr-weight_size[1]))), dim=1) if lyr > weight_size[1] else weights[:,:lyr]).permute(1, 0).view((lyr, -1)+(1,)*(len(hidden_size)-2))
+        w = (torch.cat((weights, torch.cuda.FloatTensor(weight_size[0], lyr-weight_size[1]).fill_(0) if use_gpu else torch.zeros((weight_size[0], lyr-weight_size[1]))), dim=1) if lyr > weight_size[1] else weights[:,:lyr]).permute(1, 0).view((lyr, -1)+(1,)*(len(hidden_size)-2))
         wsum_hidden_states = torch.sum(hidden_states * w, 0) if self.reduction == 'sum' else torch.mean(hidden_states * w, 0)
         return wsum_hidden_states.view(bs, *hidden_size[2:])
 

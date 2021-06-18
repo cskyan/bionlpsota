@@ -335,7 +335,7 @@ def main():
 
 if __name__ == '__main__':
     # Parse commandline arguments
-    parser = argparse.ArgumentParser(description='Train or evaluate the re-ranking model.')
+    parser = argparse.ArgumentParser(description='Train or evaluate the model.')
     parser.add_argument('-k', '--kfold', default=10, type=int, help='indicate the K fold cross validation')
     parser.add_argument('-p', '--pid', default=0, type=int, help='indicate the process ID')
     parser.add_argument('-n', '--np', default=1, type=int, help='indicate the number of processes used for training')
@@ -439,10 +439,6 @@ if __name__ == '__main__':
     args.cfg = cfg_kwargs
     _update_cfgs(cfg_kwargs)
 
-    # Process config
-    if args.datapath is not None: DATA_PATH = args.datapath
-    SC = args.sc
-
     # GPU setting
     if (args.gpuq is not None and not args.gpuq.strip().isspace()):
     	args.gpuq = list(range(torch.cuda.device_count())) if (args.gpuq == 'auto' or args.gpuq == 'all') else [int(x) for x in args.gpuq.split(',') if x]
@@ -461,6 +457,10 @@ if __name__ == '__main__':
         hvd.init()
         DATA_PATH = os.path.join('/', 'data', 'bionlp')
         torch.cuda.set_device(hvd.local_rank())
+
+    # Process config
+    if args.datapath is not None: DATA_PATH = args.datapath
+    SC = args.sc
 
     # Random seed setting
     if args.seed is not None:

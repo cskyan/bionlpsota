@@ -79,7 +79,7 @@ class BaseClfHead(nn.Module):
         return R.MaskedReduction(reduction=None, dim=1)
 
     def forward(self, input_ids, *extra_inputs, labels=None, all_hidden_states=None, weights=None, embedding_mode=False):
-        use_gpu = next(self.parameters()).is_cuda
+        use_gpu = input_ids[0].is_cuda if type(input_ids) is list else input_ids.is_cuda
         if self.sample_weights and len(extra_inputs) > 0:
             sample_weights = extra_inputs[-1]
             extra_inputs = extra_inputs[:-1]
@@ -187,7 +187,6 @@ class BaseClfHead(nn.Module):
         return clf_loss, lm_loss, extra_outputs
 
     def pool(self, input_ids, extra_inputs, mask, clf_h, extra_outputs={}):
-        use_gpu = next(self.parameters()).is_cuda
         if self.task_type == 'nmt':
             if (hasattr(self, 'layer_pooler')):
                 clf_h = self.layer_pooler(clf_h)
@@ -244,7 +243,6 @@ class BaseClfHead(nn.Module):
         return self
 
     def add_linear(self, num_lbs, idx=0):
-        use_gpu = next(self.parameters()).is_cuda
         self.num_lbs = num_lbs
         self._total_num_lbs = num_lbs if idx==0 else self._total_num_lbs + num_lbs
         self.linear = self.__init_linear__()
@@ -263,7 +261,6 @@ class BaseClfHead(nn.Module):
         delattr(self, 'global_binlbr')
 
     def get_linear(self, binlb, idx=0):
-        use_gpu = next(self.parameters()).is_cuda
         self.num_lbs = len(binlb)
         self.binlb = binlb
         self.binlbr = dict([(v, k) for k, v in self.binlb.items()])
@@ -340,9 +337,8 @@ class BERTClfHead(BaseClfHead):
             self.pooler = R.MaskedReduction(reduction=pooler, dim=1)
 
     def __init_linear__(self):
-        use_gpu = next(self.parameters()).is_cuda
         linear = (nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), *([nn.Linear(self.fchdim, self.fchdim), self._int_actvtn()] if self.extfc else []), *([] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.fchdim, self.num_lbs), self._out_actvtn()])) if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else nn.Sequential(nn.Linear(self.hdim, self.fchdim), self._int_actvtn(), *([nn.Linear(self.fchdim, self.fchdim), self._int_actvtn()] if self.extfc else []), nn.Linear(self.fchdim, self.num_lbs))) if self.fchdim else (nn.Sequential(*([nn.Linear(self.hdim, self.hdim), self._int_actvtn()] if self.task_params.setdefault('sentsim_func', None) and self.task_params['sentsim_func'] != 'concat' else [nn.Linear(self.hdim, self.num_lbs), self._out_actvtn()])) if self.mlt_trnsfmr and self.task_type in ['entlmnt', 'sentsim'] else nn.Linear(self.hdim, self.num_lbs))
-        return linear.to('cuda') if use_gpu else linear
+        return linear
 
     def __lm_head__(self):
         return BertOnlyMLMHead(self.lm_config)
