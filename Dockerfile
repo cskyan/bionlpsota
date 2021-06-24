@@ -117,7 +117,7 @@ RUN pip install torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} 
 #    ninja install && \
 #    cd ../python && pip install -e . && \
 #    rm -rf /tmp/mxnet
-RUN pip install mxnet-cu111==${MXNET_VERSION}
+#RUN pip install mxnet-cu111==${MXNET_VERSION}
 
 # Install apex
 RUN git clone https://github.com/NVIDIA/apex /usr/local/apex && \
@@ -171,7 +171,7 @@ RUN mkdir /tmp/openmpi && \
 
 # Install Horovod
 RUN ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
-    HOROVOD_GPU_OPERATIONS=NCCL HOROVOD_ALLOW_MIXED_GPU_IMPL=0 HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 \
+    HOROVOD_GPU_OPERATIONS=NCCL HOROVOD_ALLOW_MIXED_GPU_IMPL=0 HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=0 \
     CFLAGS="-O2 -mavx -mfma" \
          pip install --no-cache-dir horovod && \
     ldconfig
