@@ -1,12 +1,20 @@
-FROM nvidia/cuda:10.1-devel-ubuntu18.04
+FROM nvidia/cuda:11.1.1-devel-ubuntu18.04
+
+# Configure build tools
+ENV CMAKE_MAJOR_VERSION=3.20
+ENV CMAKE_VERSION=3.20.0
 
 # Configure package versions of TensorFlow, PyTorch, MXNet, CUDA, cuDNN and NCCL
-ENV TENSORFLOW_VERSION=2.0.0
-ENV PYTORCH_VERSION=1.5.1+cu101
-ENV TORCHVISION_VERSION=0.6.1+cu101
-ENV CUDNN_VERSION=7.6.5.32-1+cuda10.1
-ENV NCCL_VERSION=2.5.6-1+cuda10.1
-ENV MXNET_VERSION=1.5.1
+ENV TENSORFLOW_VERSION=2.5.0
+ENV PYTORCH_VERSION=1.8.1+cu111
+ENV TORCHVISION_VERSION=0.9.1+cu111
+ENV TORCHAUDIO_VERSION=0.8.1
+ENV CUDA_VERSION=11.1
+ENV CUDNN_MAJOR_VERSION=8
+ENV CUDNN_VERSION=8.0.5.39-1+cuda11.1
+ENV NCLL_MAJOR_VERSION=2
+ENV NCCL_VERSION=2.8.4-1+cuda11.1
+ENV MXNET_VERSION=1.8.0
 
 # Configure Python version 2.7 or 3.6
 ARG python=3.6
@@ -15,30 +23,54 @@ ENV PYTHON_VERSION=${python}
 # Configure Java version 8 or 11
 ENV JAVA_VERSION=8
 
+# Configure OpenMPI version
+ENV OPENMPI_MAJOR_VERSION=4.1
+ENV OPENMPI_VERSION=4.1.1
+
 # Configure PyLucene version
-ENV PYLUCENE_VERSION=8.3.0
+ENV PYLUCENE_VERSION=8.8.1
 
 # Configure Spacy, SciSpacy and AllenNLP versions
-ENV SPACY_VERSION=2.2.4
-ENV SCISPACY_VERSION=0.2.4
-ENV ALLENNLP_VERSION=1.0.0rc4
+ENV SPACY_VERSION=3.0.6
+ENV SCISPACY_VERSION=0.4.0
+ENV ALLENNLP_VERSION=2.5.0
 
 # Set default shell to /bin/bash
 SHELL ["/bin/bash", "-cu"]
 
+# Get rid of the debconf messages
+RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+
+# Update repository
+ RUN apt-get update
+
+# Configure timezone
+RUN ln -fs /usr/share/zoneinfo/America/New_York /etc/localtime
+RUN DEBIAN_FRONTEND="noninteractive" apt-get -y install tzdata
+
+# Install and configure locales
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y locales
+RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
+    dpkg-reconfigure --frontend=noninteractive locales && \
+    update-locale LANG=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+
 # Install the essential packages
-RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
+RUN apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
         apt-utils \
         build-essential \
-        cmake \
+        ninja-build \
         g++-4.8 \
+        cmake \
         git \
         curl \
         vim \
         wget \
+        ccache \
         ca-certificates \
-        libcudnn7=${CUDNN_VERSION} \
-        libnccl2=${NCCL_VERSION} \
+        libcudnn${CUDNN_MAJOR_VERSION}=${CUDNN_VERSION} \
+        libcudnn${CUDNN_MAJOR_VERSION}-dev=${CUDNN_VERSION} \
+        libnccl${NCLL_MAJOR_VERSION}=${NCCL_VERSION} \
         libnccl-dev=${NCCL_VERSION} \
         libjpeg-dev \
         libpng-dev \
@@ -47,17 +79,12 @@ RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-
         librdmacm1 \
         libibverbs1 \
         ibverbs-providers \
-        libopenblas-dev
+        libopenblas-dev \
+        liblapack-dev \
+        libopencv-dev
 
-# Get rid of the debconf messages
-RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
-
-# Install and configure locales
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y locales
-RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
-    dpkg-reconfigure --frontend=noninteractive locales && \
-    update-locale LANG=en_US.UTF-8
-ENV LANG=en_US.UTF-8
+# Latest build tools
+RUN cd /tmp && wget https://cmake.org/files/v${CMAKE_MAJOR_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz && tar -zxf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz && mv cmake-${CMAKE_VERSION}-linux-x86_64 /usr/local/cmake
 
 # Install JDK
 RUN apt-get install -y openjdk-${JAVA_VERSION}-jdk ant
@@ -79,14 +106,23 @@ RUN pip install numpy \
         tensorflow-gpu==${TENSORFLOW_VERSION} \
         keras \
         h5py
-RUN pip install torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} -f https://download.pytorch.org/whl/torch_stable.html
-RUN pip install mxnet-cu101==${MXNET_VERSION}
+RUN pip install torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} torchaudio===${TORCHAUDIO_VERSION} -f https://download.pytorch.org/whl/torch_stable.html
+
+# Install MXNet
+#RUN git clone --depth 1 --branch ${MXNET_VERSION} https://github.com/apache/incubator-mxnet /tmp/mxnet && \
+#    cd /tmp/mxnet && git submodule update --init --recursive && \
+#    mkdir -p build && cd build && \
+#    /usr/local/cmake/bin/cmake -DUSE_BLAS=open -DUSE_LAPACK=ON -DUSE_MKL_IF_AVAILABLE=OFF -DUSE_MKLDNN=OFF -DUSE_CUDA=ON -DMXNET_CUDA_ARCH=5.2\;5.3\;6.0\;6.2\;7.0\;7.2\;7.5 -DUSE_CUDNN=ON -DUSE_NCCL=ON -DNCCL_LAUNCH_MODE=PARALLEL -DUSE_OPENCV=ON -DUSE_OPENMP=ON -DCMAKE_BUILD_TYPE=Release -G Ninja .. && \
+#    ninja -j$(nproc) && \
+#    ninja install && \
+#    cd ../python && pip install -e . && \
+#    rm -rf /tmp/mxnet
+RUN pip install mxnet-cu111==${MXNET_VERSION}
 
 # Install apex
 RUN git clone https://github.com/NVIDIA/apex /usr/local/apex && \
     cd /usr/local/apex && \
-    pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./ && \
-    cd /
+    pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
 
 # Install PyLucene, pysolr and ijson
 RUN mkdir /tmp/pylucene && \
@@ -110,23 +146,23 @@ RUN pip install allennlp==${ALLENNLP_VERSION}
 # Install NLP models
 RUN python -c "import nltk; nltk.download('popular')"
 RUN python -m spacy download en_core_web_sm
-RUN pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.2.4/en_core_sci_md-0.2.4.tar.gz
+RUN pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v${SCISPACY_VERSION}/en_core_sci_md-${SCISPACY_VERSION}.tar.gz
 RUN pip install pytorch_pretrained_bert transformers
 
 # Install Faiss
 RUN apt-get install -y swig
 RUN git clone https://github.com/facebookresearch/faiss.git /tmp/faiss && \
     cd /tmp/faiss && \
-    ./configure --with-cuda=/usr/local/cuda && make SWIG=/usr/bin/swig -j $(nproc) && make install && \
-    make -j $(nproc) -C python && make -C python install && \
+    /usr/local/cmake/bin/cmake -B build . -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON -DCUDAToolkit_ROOT=/usr/local/cuda && make -C build -j $(nproc) faiss && make -C build -j $(nproc) swigfaiss && \
+    cd build/faiss/python && python setup.py install && \
     rm -rf /tmp/faiss
 
 # Install Open MPI
 RUN mkdir /tmp/openmpi && \
     cd /tmp/openmpi && \
-    wget https://www.open-mpi.org/software/ompi/v4.0/downloads/openmpi-4.0.1.tar.gz -q && \
-    tar zxf openmpi-4.0.1.tar.gz && \
-    cd openmpi-4.0.1 && \
+    wget https://www.open-mpi.org/software/ompi/v${OPENMPI_MAJOR_VERSION}/downloads/openmpi-${OPENMPI_VERSION}.tar.gz -q && \
+    tar zxf openmpi-${OPENMPI_VERSION}.tar.gz && \
+    cd openmpi-${OPENMPI_VERSION} && \
     ./configure --enable-orterun-prefix-by-default && \
     make -j $(nproc) all && \
     make install && \
@@ -135,7 +171,7 @@ RUN mkdir /tmp/openmpi && \
 
 # Install Horovod
 RUN ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
-    HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL HOROVOD_GPU_ALLGATHER=MPI HOROVOD_ALLOW_MIXED_GPU_IMPL=1 HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 \
+    HOROVOD_GPU_OPERATIONS=NCCL HOROVOD_ALLOW_MIXED_GPU_IMPL=0 HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 \
     CFLAGS="-O2 -mavx -mfma" \
          pip install --no-cache-dir horovod && \
     ldconfig
