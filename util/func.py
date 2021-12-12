@@ -147,8 +147,7 @@ def _handle_model(model, dev_id=None, distrb=False):
     return model
 
 
-def _update_cfgs(cfgs):
-    global_vars = globals()
+def _update_cfgs(global_vars, cfgs):
     for glb, glbvs in cfgs.items():
         if glb in global_vars:
             if type(global_vars[glb]) is dict:

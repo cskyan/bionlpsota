@@ -84,7 +84,7 @@ class OntoBERTClfHead(T.BERTClfHead):
 
     def _clf_h(self, hidden_states, mask, all_hidden_states=None, extra_outputs={}):
         # The last element of past is the last_hidden_state
-        return (all_hidden_states, torch.stack(mask).max(0)[0]) if type(all_hidden_states) is list else (all_hidden_states, mask)
+        return (all_hidden_states, torch.stack(mask).max(0)[0]) if type(hidden_states) is list else (all_hidden_states, mask)
 
     def pool(self, input_ids, extra_inputs, mask, clf_h, extra_outputs={}):
         all_clf_h = clf_h

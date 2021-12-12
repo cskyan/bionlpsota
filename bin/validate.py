@@ -78,7 +78,8 @@ def classify(dev_id=None):
     else:
         class_weights = torch.Tensor(1.0 / class_count)
         class_weights /= class_weights.sum()
-        sampler = WeightedRandomSampler(weights=class_weights, num_samples=config.bsize, replacement=True)
+        sampler = None # WeightedRandomSampler does not work in new version
+        # sampler = WeightedRandomSampler(weights=class_weights, num_samples=config.bsize, replacement=True)
         if not config.distrb and type(dev_id) is list: class_weights = class_weights.repeat(len(dev_id))
 
     # Partition dataset among workers using DistributedSampler
@@ -122,7 +123,9 @@ def classify(dev_id=None):
         if (not config.distrb or config.distrb and hvd.rank() == 0): logging.info((optimizer, scheduler))
 
     config.execute_all_callback()
-    if config.verbose: logging.debug(config.__dict__)
+    if config.verbose:
+        logging.debug(config.__dict__)
+        torch.autograd.set_detect_anomaly(True)
     if config.configfmt == 'yaml':
         config.to_yaml()
     else:
@@ -435,9 +438,10 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # Update config
+    global_vars = globals()
     cfg_kwargs = {} if args.cfg is None else ast.literal_eval(args.cfg)
     args.cfg = cfg_kwargs
-    _update_cfgs(cfg_kwargs)
+    _update_cfgs(global_vars, cfg_kwargs)
 
     # GPU setting
     if (args.gpuq is not None and not args.gpuq.strip().isspace()):
@@ -456,6 +460,19 @@ if __name__ == '__main__':
         import horovod.torch as hvd
         hvd.init()
         DATA_PATH = os.path.join('/', 'data', 'bionlp')
+        if hvd.rank() == 0:
+            sync_vars = {}
+            for var in []:
+                sync_vars[var] = global_vars[var]
+            write_json(sync_vars, fpath='var.sync')
+            hvd.allreduce(torch.tensor(0), name='barrier')
+        else:
+            sync_vars = read_json('var.sync')
+            for k, v in sync_vars.items():
+                global_vars[k] = v
+            hvd.allreduce(torch.tensor(0), name='barrier')
+        if hvd.rank() == 0: os.remove('var.sync')
+        torch.cuda.set_device(hvd.local_rank())
         torch.cuda.set_device(hvd.local_rank())
 
     # Process config

@@ -101,7 +101,7 @@ def train(clf, optimizer, dataset, config, scheduler=None, weights=None, lmcoef=
         logging.warning(e)
 
 
-def eval(clf, dataset, config, ds_name='', clipmaxn=0.25, use_gpu=False, devq=None, distrb=False, ignored_label=None):
+def eval(clf, dataset, config, ds_name='', use_gpu=False, ignored_label=None):
     clf.eval()
     clf.freeze_lm()
     total_loss, indices, preds, probs, all_logits, trues, config.task = 0, [], [], [], [], [], config.task.strip()
