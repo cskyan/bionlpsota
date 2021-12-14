@@ -1,19 +1,20 @@
-FROM nvidia/cuda:11.1.1-devel-ubuntu18.04
+FROM nvidia/cuda:10.2-devel-ubuntu18.04
 
 # Configure build tools
 ENV CMAKE_MAJOR_VERSION=3.20
 ENV CMAKE_VERSION=3.20.0
 
 # Configure package versions of TensorFlow, PyTorch, MXNet, CUDA, cuDNN and NCCL
-ENV TENSORFLOW_VERSION=2.5.0
-ENV PYTORCH_VERSION=1.8.1+cu111
-ENV TORCHVISION_VERSION=0.9.1+cu111
-ENV TORCHAUDIO_VERSION=0.8.1
-ENV CUDA_VERSION=11.1
+ENV TENSORFLOW_VERSION=2.6.0
+ENV PYTORCH_MAJOR_VERSION=1.8
+ENV PYTORCH_VERSION=1.8.2+cu102
+ENV TORCHVISION_VERSION=0.9.2+cu102
+ENV TORCHAUDIO_VERSION=0.8.2
+ENV CUDA_VERSION=10.2
 ENV CUDNN_MAJOR_VERSION=8
-ENV CUDNN_VERSION=8.0.5.39-1+cuda11.1
+ENV CUDNN_VERSION=8.3.1.22-1+cuda10.2
 ENV NCLL_MAJOR_VERSION=2
-ENV NCCL_VERSION=2.8.4-1+cuda11.1
+ENV NCCL_VERSION=2.11.4-1+cuda10.2
 ENV MXNET_VERSION=1.8.0
 
 # Configure Python version 2.7 or 3.6
@@ -22,18 +23,6 @@ ENV PYTHON_VERSION=${python}
 
 # Configure Java version 8 or 11
 ENV JAVA_VERSION=8
-
-# Configure OpenMPI version
-ENV OPENMPI_MAJOR_VERSION=4.1
-ENV OPENMPI_VERSION=4.1.1
-
-# Configure PyLucene version
-ENV PYLUCENE_VERSION=8.8.1
-
-# Configure Spacy, SciSpacy and AllenNLP versions
-ENV SPACY_VERSION=3.0.6
-ENV SCISPACY_VERSION=0.4.0
-ENV ALLENNLP_VERSION=2.5.0
 
 # Set default shell to /bin/bash
 SHELL ["/bin/bash", "-cu"]
@@ -54,6 +43,9 @@ RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     dpkg-reconfigure --frontend=noninteractive locales && \
     update-locale LANG=en_US.UTF-8
 ENV LANG=en_US.UTF-8
+
+# Add repository for legacy packages
+RUN apt-get install -y software-properties-common && add-apt-repository ppa:deadsnakes/ppa && apt-get update
 
 # Install the essential packages
 RUN apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
@@ -100,62 +92,34 @@ RUN curl -O https://bootstrap.pypa.io/get-pip.py && \
     rm get-pip.py && \
     pip install --upgrade pip wheel
 
-# Install TensorFlow, Keras, PyTorch and MXNet
+# Install TensorFlow, Keras and PyTorch
 RUN pip install future typing
-RUN pip install numpy \
+RUN pip install --no-cache-dir numpy \
         tensorflow-gpu==${TENSORFLOW_VERSION} \
         keras \
         h5py
-RUN pip install torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} torchaudio===${TORCHAUDIO_VERSION} -f https://download.pytorch.org/whl/torch_stable.html
+RUN pip install --no-cache-dir torch===${PYTORCH_VERSION} torchvision===${TORCHVISION_VERSION} torchaudio===${TORCHAUDIO_VERSION} -f https://download.pytorch.org/whl/lts/${PYTORCH_MAJOR_VERSION}/torch_lts.html
 
 # Install MXNet
-#RUN git clone --depth 1 --branch ${MXNET_VERSION} https://github.com/apache/incubator-mxnet /tmp/mxnet && \
-#    cd /tmp/mxnet && git submodule update --init --recursive && \
-#    mkdir -p build && cd build && \
-#    /usr/local/cmake/bin/cmake -DUSE_BLAS=open -DUSE_LAPACK=ON -DUSE_MKL_IF_AVAILABLE=OFF -DUSE_MKLDNN=OFF -DUSE_CUDA=ON -DMXNET_CUDA_ARCH=5.2\;5.3\;6.0\;6.2\;7.0\;7.2\;7.5 -DUSE_CUDNN=ON -DUSE_NCCL=ON -DNCCL_LAUNCH_MODE=PARALLEL -DUSE_OPENCV=ON -DUSE_OPENMP=ON -DCMAKE_BUILD_TYPE=Release -G Ninja .. && \
-#    ninja -j$(nproc) && \
-#    ninja install && \
-#    cd ../python && pip install -e . && \
-#    rm -rf /tmp/mxnet
-#RUN pip install mxnet-cu111==${MXNET_VERSION}
+RUN git clone --depth 1 --branch ${MXNET_VERSION} https://github.com/apache/incubator-mxnet /tmp/mxnet && \
+    cd /tmp/mxnet && git submodule update --init --recursive && \
+    mkdir -p build && cd build && \
+    /usr/local/cmake/bin/cmake -DUSE_BLAS=open -DUSE_LAPACK=ON -DUSE_MKL_IF_AVAILABLE=OFF -DUSE_MKLDNN=OFF -DUSE_CUDA=ON -DMXNET_CUDA_ARCH=5.2\;5.3\;6.0\;6.2\;7.0\;7.2\;7.5 -DUSE_CUDNN=ON -DUSE_NCCL=ON -DNCCL_LAUNCH_MODE=PARALLEL -DUSE_OPENCV=ON -DUSE_OPENMP=ON -DCMAKE_BUILD_TYPE=Release -G Ninja .. && \
+    ninja -j$(nproc) && \
+    ninja install && \
+    cd ../python && pip install -e . && \
+    rm -rf /tmp/mxnet
+#RUN pip install mxnet-cu110==${MXNET_VERSION}
 
 # Install apex
-RUN git clone https://github.com/NVIDIA/apex /usr/local/apex && \
+RUN git clone https://github.com/cskyan/apex /usr/local/apex && \
     cd /usr/local/apex && \
+    git checkout tags/latest && \
     pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
 
-# Install PyLucene, pysolr and ijson
-RUN mkdir /tmp/pylucene && \
-    cd /tmp/pylucene && \
-    wget https://dist.apache.org/repos/dist/release/lucene/pylucene/pylucene-${PYLUCENE_VERSION}-src.tar.gz -q && \
-    tar zxf pylucene-${PYLUCENE_VERSION}-src.tar.gz && \
-    cd pylucene-${PYLUCENE_VERSION}/jcc && \
-    NO_SHARED=1 JCC_JDK=${JAVA_HOME} python setup.py install && \
-    cd .. && \
-    make all install JCC='python -m jcc' ANT=ant PYTHON=python NUM_FILES=8 && \
-    ldconfig && \
-    rm -rf /tmp/pylucene
-RUN pip install pysolr ijson
-
-# Install NLP packages
-RUN pip install textdistance tqdm openpyxl pandas scikit-learn && \
-    pip install nltk ftfy
-RUN pip install spacy==${SPACY_VERSION} scispacy==${SCISPACY_VERSION}
-RUN pip install allennlp==${ALLENNLP_VERSION}
-
-# Install NLP models
-RUN python -c "import nltk; nltk.download('popular')"
-RUN python -m spacy download en_core_web_sm
-RUN pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v${SCISPACY_VERSION}/en_core_sci_md-${SCISPACY_VERSION}.tar.gz
-RUN pip install pytorch_pretrained_bert transformers
-
-# Install Faiss
-RUN apt-get install -y swig
-RUN git clone https://github.com/facebookresearch/faiss.git /tmp/faiss && \
-    cd /tmp/faiss && \
-    /usr/local/cmake/bin/cmake -B build . -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON -DCUDAToolkit_ROOT=/usr/local/cuda && make -C build -j $(nproc) faiss && make -C build -j $(nproc) swigfaiss && \
-    cd build/faiss/python && python setup.py install && \
-    rm -rf /tmp/faiss
+# Configure OpenMPI version
+ENV OPENMPI_MAJOR_VERSION=4.1
+ENV OPENMPI_VERSION=4.1.1
 
 # Install Open MPI
 RUN mkdir /tmp/openmpi && \
@@ -184,6 +148,51 @@ RUN apt-get install -y --no-install-recommends openssh-client openssh-server && 
 RUN cat /etc/ssh/ssh_config | grep -v StrictHostKeyChecking > /etc/ssh/ssh_config.new && \
     echo "    StrictHostKeyChecking no" >> /etc/ssh/ssh_config.new && \
     mv /etc/ssh/ssh_config.new /etc/ssh/ssh_config
+
+# Configure PyLucene version
+ENV PYLUCENE_VERSION=8.8.1
+
+# Install PyLucene, pysolr and ijson
+RUN mkdir /tmp/pylucene && \
+    cd /tmp/pylucene && \
+    wget https://dist.apache.org/repos/dist/release/lucene/pylucene/pylucene-${PYLUCENE_VERSION}-src.tar.gz -q && \
+    tar zxf pylucene-${PYLUCENE_VERSION}-src.tar.gz && \
+    cd pylucene-${PYLUCENE_VERSION}/jcc && \
+    NO_SHARED=1 JCC_JDK=${JAVA_HOME} python setup.py install && \
+    cd .. && \
+    make all install JCC='python -m jcc' ANT=ant PYTHON=python NUM_FILES=8 && \
+    ldconfig && \
+    rm -rf /tmp/pylucene
+RUN pip install pysolr ijson
+
+# Configure Faiss version
+ENV FAISS_VERSION=1.7.1
+
+# Install Faiss
+RUN apt-get install -y swig
+RUN git clone https://github.com/facebookresearch/faiss.git /tmp/faiss && \
+    cd /tmp/faiss && \
+    git checkout v${FAISS_VERSION} && \
+    /usr/local/cmake/bin/cmake -B build . -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON -DCUDAToolkit_ROOT=/usr/local/cuda && make -C build -j $(nproc) faiss && make -C build -j $(nproc) swigfaiss && \
+    cd build/faiss/python && python setup.py install && \
+    rm -rf /tmp/faiss
+
+# Configure Spacy, SciSpacy and AllenNLP versions
+ENV SPACY_VERSION=3.0.6
+ENV SCISPACY_VERSION=0.4.0
+ENV ALLENNLP_VERSION=2.7.0
+
+# Install NLP packages
+RUN pip install textdistance tqdm openpyxl pandas scikit-learn && \
+    pip install nltk ftfy
+RUN pip install spacy==${SPACY_VERSION} scispacy==${SCISPACY_VERSION}
+RUN pip install allennlp==${ALLENNLP_VERSION}
+
+# Install NLP models
+RUN python -c "import nltk; nltk.download('popular')"
+RUN python -m spacy download en_core_web_sm
+RUN pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v${SCISPACY_VERSION}/en_core_sci_md-${SCISPACY_VERSION}.tar.gz
+RUN pip install pytorch_pretrained_bert transformers
 
 # Download source code
 RUN mkdir /source && \
